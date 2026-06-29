@@ -1,0 +1,355 @@
+# ours-tg-connector
+
+Bridge Telegram bots to the [ours](../ours-mcp) network. **One bot can proxy
+many chats — each chat (or forum topic) to its own agent** — over a single shared
+poll loop.
+
+```
+                       ┌──────── one bot token ────────┐
+ chat A ─┐             │   single getUpdates poll loop  │
+ chat B ─┤  Telegram   │        (demux by chat-key)     │
+ topic#7 ┘             └──┬──────────┬──────────┬───────┘
+                          ▼          ▼          ▼
+                    identity A  identity B  identity C   ← one packet per chat-key
+                          │          │          │  send_message
+                          ▼          ▼          ▼
+                      Agent X     Agent X     Agent Y    ← same agent can serve many
+```
+
+Two layers:
+
+- **Bot** — a Telegram bot token **registered once under a friendly name**
+  (`add_bot`). One token == one `getUpdates` poll loop (Telegram allows only one
+  consumer per token). The loop demultiplexes each update to a route by **chat-key**
+  (`chatId`, or `chatId:threadId` for a forum topic).
+- **Route** — one self-sovereign ADAPT identity (a packet) pinned to one chat-key,
+  bridged to one proxy agent. A route **references its bot by name**, so the token
+  lives in exactly one place; many routes share a bot. The invite a route emits is
+  byte-compatible with the ours `add_contact` tool.
+
+Because each identity is pinned to exactly one chat-key, **reverse delivery is
+structural**: an agent's reply arrives on the identity that *is* the chat, so it
+can only ever go back to its origin. The **same agent can serve several chats** by
+being a contact of several route identities — it tells them apart by which contact
+(name + **bio**) a message is on, never by parsing the text. Each route's bio
+carries the group/topic context the agent should know ("ACME #billing — paying
+customers; escalate refunds to a human").
+
+## How it works
+
+1. You run `add_bot` once per Telegram bot, giving it a name + its token. The
+   connector validates the token (`getMe`), captures the `@username`, and records
+   it in the bot registry (`bots.json`).
+2. You run `add_new_connection` referencing that bot by name (`--bot <name>`) plus a
+   chat id (+ optional `--thread-id` for a forum topic and `--bio` for the agent's
+   context). The connector mints a fresh identity, sets its name + bio, and prints
+   an **invite blob**.
+3. You paste that blob into your proxy agent via its `add_contact`. The connector
+   packet — already live on the broker — completes the encrypted-channel handshake.
+4. From then on:
+   - every message in that chat/topic is forwarded to its agent as a JSON
+     **message envelope** (sender + chat metadata, reply/forward context, and any
+     attached file via the core 3.1 file channel — see
+     [Message envelope](#message-envelope) and [File transfer](#file-transfer-core-31));
+   - every message the agent sends back is delivered to that same chat/topic, and
+     a file the agent sends is delivered with `sendDocument`.
+5. Re-run `add_new_connection` with the **same `--bot`** and a different
+   `--chat-id`/`--thread-id` to add more routes on the one bot. Point two routes at
+   the same agent and it sees two distinct contacts (distinct bios) — one per chat.
+
+Messages are end-to-end encrypted between the connector packet and the agent (ADAPT
+encrypted channels). The connector never persists message bodies to disk — only the
+bot registry (`bot name`, `token`, `@username`), the per-route seed + serialized
+packet state, and the route's Telegram side (`bot name`, `chat id`, `thread id`,
+`bio`, `peer cid`).
+
+### Routing rules
+
+- A **topic message** (in a forum supergroup) prefers an exact `chatId:threadId`
+  route; failing that it falls to a whole-chat `chatId` route, then the bot's
+  catch-all. A topic-pinned route always replies into its own topic.
+- A **whole-chat route** (no `--thread-id`) handles a non-forum group, or every
+  topic of a forum that has no topic-specific route; it replies into the topic the
+  message came from (best-effort — one route per topic is the unambiguous setup).
+- `--chat-id 0` makes a **catch-all** route: it handles any chat the bot sees that
+  no other route claims, replying to whichever chat last spoke.
+- A chat the bot is in with **no** matching route is ignored (a bot can sit in many
+  groups it doesn't serve). The classic denial reply is sent only when a bot serves
+  exactly one chat and that route set a denial message.
+
+> **Bot privacy mode:** to proxy *all* messages in a group, the bot must either be
+> a group **admin** or have privacy mode **disabled** via BotFather `/setprivacy`
+> (then removed and re-added to the group). Otherwise Telegram only delivers
+> commands, replies, and @mentions to the bot. Forum topic management
+> (`createForumTopic`, …) needs admin with `can_manage_topics`.
+
+### Discovering a chat id (`/id`)
+
+Every bot answers a built-in out-of-band command — send **`/id`** (or
+**`/id@<bot_username>`**) in any chat, group, or forum topic the bot is in and it
+replies immediately with that chat's identifiers: `chat id`, type, title/@username,
+the `message_thread_id` (in a forum topic), your user id, and a ready-to-paste
+`add_new_connection` line. A bot polls from the moment you `add_bot` it (no route
+required), and the probe is handled before routing — so the **normal first-run flow
+works**: `add_bot`, drop the bot in the group, send `/id`, then feed the returned
+`--chat-id`/`--thread-id` into `add_new_connection`. It never reaches an agent and
+bypasses normal processing entirely.
+
+In a **privacy-mode** group only the `/id@<bot_username>` form is delivered (see the
+note above); in DMs and privacy-off groups bare `/id` works too. In a group with
+several bots, only the one named in `/id@<bot_username>` answers.
+
+### Message envelope
+
+Each inbound Telegram message is forwarded to the agent as a single **JSON
+envelope** (it is the `text` of the underlying `send_message`). This gives the
+agent context it otherwise could not have: in a group chat every Telegram user
+arrives on the *same* ours contact, so the per-message `from`/`chat` metadata
+is the only way to tell who is speaking and where.
+
+```json
+{
+  "v": 2,
+  "source": "telegram",
+  "message_id": 4521,
+  "date": "2026-06-22T14:30:02Z",
+  "from":  { "id": 12345, "name": "Alice Smith", "username": "alice" },
+  "chat":  { "id": -1001234567890, "type": "supergroup",
+             "title": "ACME Support", "username": "acmesupport", "thread_id": 7 },
+  "reply_to": { "message_id": 678, "text": "earlier message excerpt…" },
+  "forwarded_from": { "type": "channel", "name": "ACME News",
+                      "username": "acmenews", "message_id": 99 },
+  "text": "Can you check my refund?",
+  "attachment": { "kind": "document", "filename": "receipt.pdf", "mime": "application/pdf",
+                  "size": 48211, "transport": "send_file", "wire_id": "ours-file-…" }
+}
+```
+
+- **Absent optional fields are omitted** (no `username` when the sender has none;
+  no `reply_to` / `forwarded_from` / `attachment` when not applicable). `text` is
+  always present (`""` for a caption-less media message). `v` versions the shape
+  (now **2** — see [File transfer](#file-transfer-core-31)).
+- **Attachments** carry only metadata under `attachment`; the file **bytes travel
+  separately** on the core 3.1 file channel (no more base64 inline). `kind` is one
+  of `photo · document · video · audio · voice · video_note · animation ·
+  sticker`. On a successful transfer the block carries `transport: "send_file"`
+  and the file's `wire_id`, which correlates the separately-arriving file to this
+  message. A file over the size cap (or one that fails to download) is still
+  announced — the `attachment` object is present with its metadata but **no
+  `wire_id`** (no file was sent), plus an `omitted` (over cap) or `error`
+  (download failed) note. The inbound cap is `attachmentMaxBytes` (default
+  **10 MB**; see [Configuration](#configuration)).
+
+### File transfer (core 3.1)
+
+Core 3.1 adds a first-class file-transfer pair (`send_file` / `receive_file`),
+distinct from `send_message`, so files and text are always separate messages.
+
+- **Inbound (Telegram → agent).** A media message's bytes are sent to the proxy
+  agent via **`send_file`** (raw bytes on the file channel); its caption + sender/
+  chat metadata ride the **v2 envelope** on `send_message`. The envelope's
+  `attachment.wire_id` is the `send_file` wire id, so the agent correlates the two.
+  This replaces the interim base64-in-`text` transport. **The proxy agent must
+  read files from the file channel and correlate by `attachment.wire_id`** — an
+  agent that still expects inline base64 will not see the bytes.
+- **Outbound (agent → Telegram).** A file the agent sends arrives via
+  `receive_file`, is stored in the packet's file inbox (same unread → processed →
+  gc lifecycle as messages, bytes included), and is delivered to the chat (and
+  forum topic, if pinned) with Telegram **`sendDocument`** — preserving the
+  original filename. Agent → Telegram file sending was previously unsupported.
+- **Caps.** Inbound media is bounded by `attachmentMaxBytes`
+  (`OURS_TG_ATTACHMENT_MAX_BYTES`, **10 MB**, under Telegram's 20 MB bot
+  download limit). A file a contact sends outbound is bounded by
+  `outboundFileMaxBytes` (`OURS_TG_OUTBOUND_FILE_MAX_BYTES`, **50 MB**,
+  Telegram's `sendDocument` upper bound); an over-cap outbound file is skipped and
+  logged.
+- **Monitoring.** File traffic is monitored exactly like messages: a bound control
+  plane receives a forced **metadata-only** copy (`[file] <name> (<mime>, <N> B)`)
+  — never the bytes.
+
+## Install
+
+```sh
+npm install
+npm run build
+```
+
+Requires Node ≥ 20. The native ADAPT SDK (`@adapt-toolkit/sdk` +
+`@adapt-toolkit/sdk-native`, pinned to the version matching the shipped
+`.muflo`) is resolved from `node_modules` at runtime.
+
+## Usage
+
+```sh
+# 1. register a bot ONCE under a name (validates the token via getMe)
+ours-tg-connector add_bot \
+  --name supportbot --bot-token 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+# positional form also works (order auto-detected by the token's «digits:rest» shape):
+ours-tg-connector add_bot supportbot 123456:ABC...
+
+ours-tg-connector list_bots             # name, @username, masked token, route count
+
+# 2. create a route on that bot (auto-starts the daemon if needed) and print an invite
+ours-tg-connector add_new_connection \
+  --name support \
+  --bot supportbot \
+  --chat-id -1001234567890 \
+  --bio "ACME support group — paying customers, reply concisely"
+# positional form also works:
+ours-tg-connector add_new_connection support supportbot -1001234567890
+
+# add MORE routes on the SAME bot — different chats/topics, their own identities:
+ours-tg-connector add_new_connection \
+  --name sales --bot supportbot --chat-id -1009876543210
+ours-tg-connector add_new_connection \
+  --name billing --bot supportbot --chat-id -1001234567890 --thread-id 42 \
+  --bio "ACME forum, #billing topic"
+
+ours-tg-connector list_connections     # routes grouped by bot
+ours-tg-connector remove_connection sales
+ours-tg-connector remove_bot supportbot   # refused while any route still uses it
+
+# daemon lifecycle
+ours-tg-connector start | stop | restart | status
+ours-tg-connector serve     # foreground (debugging)
+
+# boot-persistent service (survives reboots)
+ours-tg-connector install-service     # systemd (Linux) / launchd (macOS)
+ours-tg-connector uninstall-service
+
+# manage a bridge from the ours messenger control plane
+ours-tg-connector cp_invite supportbot              # invite to add the messenger as a contact
+ours-tg-connector bind_proxy supportbot <contact>   # start binding it (prints a 6-digit code)
+```
+
+`install-service` registers a **user-level** service running `serve`, bakes the
+resolved config into the unit, and (on Linux) enables linger so it starts at boot
+with no active login session. Inspect/follow it with
+`systemctl --user status ours-telegram.service` /
+`journalctl --user -u ours-telegram.service -f`.
+
+`add_bot` registers a bot under a name and is a prerequisite for any route — the
+token is given here and nowhere else. `remove_bot` deletes a registered bot but is
+refused while any route still references it (remove those routes first).
+
+For `add_new_connection`: `--name` is both the on-disk route name and the display
+name the agent sees. `--bot` is the **name of a registered bot** (from `add_bot`).
+`--chat-id` is the chat this route bridges (get it from the bot's updates, e.g.
+message a group the bot is in and read `getUpdates`); only messages from that chat
+are forwarded, and replies go back to it. `--thread-id` pins the route to one forum
+topic within that chat. `--bio` is the context the agent reads about this chat
+(embedded in the invite, visible when it accepts). `--chat-id 0` makes a catch-all
+route for any chat the bot sees that no other route claims. Reuse the same `--bot`
+across routes to multiplex one bot over many chats/topics.
+
+## Configuration
+
+Precedence per field: **env var > `config.json` > default**. The config file is
+`OURS_TG_CONFIG`, else `~/.ours-telegram/config.json`.
+
+| field          | env var                   | default                                         |
+|----------------|---------------------------|-------------------------------------------------|
+| broker URL     | `OURS_TG_BROKER_URL`   | `wss://ours.network/broker` |
+| control port   | `OURS_TG_CONTROL_PORT` | `3040` (localhost only)                         |
+| state dir      | `OURS_TG_STATE_DIR`    | `~/.ours-telegram`                            |
+| poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
+| attachment cap | `OURS_TG_ATTACHMENT_MAX_BYTES` | `10485760` (10 MB; larger inbound media forwarded as a metadata-only stub) |
+| outbound file cap | `OURS_TG_OUTBOUND_FILE_MAX_BYTES` | `52428800` (50 MB; a larger file from a contact is skipped + logged — Telegram's `sendDocument` limit) |
+
+The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
+tokens, so do not expose the control port off-host.
+
+## Control plane (ours messenger)
+
+Each bridge is a self-sovereign ours node that can be **managed from the
+[ours messenger](../messenger) control plane** over the encrypted a2a_control
+channel — no extra ports. The connector advertises an app manifest
+(`network.ours.telegram-connector`) with a `core.configuration` capability, so the
+messenger renders its generic config form for it. Two fields are configurable
+live (no restart):
+
+- **Allowed chat ID** — only this chat is proxied to the agent.
+- **Denial message** — what any other chat is told.
+
+(The bot token is *not* CP-configurable: the messenger strips secret-field values
+on save, so the token stays set at connection creation.)
+
+Bind it once:
+
+```sh
+# 1. add the messenger as a contact of the bridge node
+ours-tg-connector cp_invite supportbot
+#    → paste the invite into the messenger (add contact / add node)
+
+# 2. start the bind ceremony for that contact; read out the 6-digit code
+ours-tg-connector bind_proxy supportbot <messenger-contact-name-or-cid>
+#    → enter the code in the messenger Control Panel (out-of-band, 5 min, 3 tries)
+```
+
+Once bound, the messenger can pull the manifest, render the config form, and push
+changes (`get_manifest` / `get_config` / `set_config`). Config verbs are gated:
+only the bound control plane may read or write the configuration.
+
+## Architecture
+
+| file                | role                                                                    |
+|---------------------|-------------------------------------------------------------------------|
+| `src/adapt.ts`      | ADAPT host: wrapper boot, per-packet transaction driving, invite pack   |
+| `src/telegram.ts`   | Telegram Bot API client (long-poll `getUpdates`, topic-aware `sendMessage`) |
+| `src/routing.ts`    | pure demux: chat-key, forward/reverse resolution, bot-token shape test  |
+| `src/connector.ts`  | the daemon: bot registry, bots (one poll each) fanned out to route packets, control HTTP API |
+| `src/control.ts`    | control-plane verb dispatch (bind/get_manifest/get_config/set_config)   |
+| `src/cli.ts`        | CLI / daemon manager + control-API client                               |
+| `mufl_code/`        | the compiled messenger packet (`.muflo`) + source (shared with ours) |
+
+The **bot registry** lives at `STATE_DIR/bots.json` (`{ name: { name, token,
+username, createdAt } }`, mode `0600` — it holds tokens). Per-route state lives
+under `STATE_DIR/<name>/`: `identity.seed`, `state_data.bin`, `connection.json`
+(carries `botName`, `chatId`, `threadId`, `bio`, …). Routes naming the same bot
+share one poll loop at runtime; a registered bot polls **from the moment it is
+registered, even with zero routes**, so the `/id` probe answers in any chat it is
+in (the poll stops only when the bot is removed). Updates for chats with no route
+are simply ignored beyond `/id`.
+
+## Testing
+
+`test-routing.mjs` unit-tests the pure helpers in `src/routing.ts` — chat-key
+normalization, topic→whole-chat→catch-all resolution, reverse-delivery target, and
+the bot-token shape test (`looksLikeBotToken`, used to order `add_bot` positionals)
+— with no broker or Telegram:
+
+```sh
+node_modules/.bin/tsx test-routing.mjs
+```
+
+A round-trip e2e (no Telegram needed) drives the ADAPT layer with two packets — a
+connector and a stand-in proxy — over a local broker:
+
+```sh
+# terminal 1: a local test-mode broker (from the sibling ours-mcp repo)
+node ../ours-mcp/scripts/dev-broker.mjs --host 127.0.0.1 --port 9000 --test_mode
+# terminal 2:
+OURS_TG_UNIT_DIR=./mufl_code OURS_TG_BROKER_URL=ws://localhost:9000 \
+  node_modules/.bin/tsx test-roundtrip.mjs
+```
+
+`test-config.mjs` (same broker) covers the control-plane path: it stands up a
+connector + a stand-in control plane, runs the bind ceremony (wrong then right
+code), and asserts the authorization gate plus the `get_manifest` /
+`get_config` / `set_config` round-trip:
+
+```sh
+OURS_TG_UNIT_DIR=./mufl_code OURS_TG_BROKER_URL=ws://localhost:9000 \
+  node_modules/.bin/tsx test-config.mjs
+```
+
+It exercises invite generation + packing, the `add_contact` handshake, messaging
+both directions, and state export/import (restart safety).
+
+## Donate
+
+We build free, FSL source-available software and run the broker/relay services
+that connect agents at our own cost. Every dollar helps keep it free and open.
+Thank you for chipping in.
+
+Donate: https://ours.network/donate

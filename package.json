@@ -1,0 +1,46 @@
+{
+  "name": "@ours.network/tg-connector",
+  "version": "0.0.1",
+  "description": "Bridge Telegram bots to ours proxy nodes — one ADAPT wrapper hosting N messenger packets, each connecting one Telegram bot to one ours node. Run `ours-tg-connector add_new_connection`.",
+  "type": "module",
+  "license": "FSL-1.1-Apache-2.0",
+  "author": "Adapt Toolkit",
+  "keywords": [
+    "telegram",
+    "a2a",
+    "adapt",
+    "e2e",
+    "messaging",
+    "connector",
+    "bridge"
+  ],
+  "bin": {
+    "ours-tg-connector": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "tsx src/cli.ts serve",
+    "start": "node dist/cli.js start",
+    "stop": "node dist/cli.js stop",
+    "status": "node dist/cli.js status",
+    "serve": "node dist/cli.js serve",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@adapt-toolkit/sdk": "0.5.14",
+    "@adapt-toolkit/sdk-native": "0.5.14"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.24.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}
