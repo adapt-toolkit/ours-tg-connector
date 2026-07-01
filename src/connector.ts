@@ -178,14 +178,12 @@ function hasSavedState(dir: string): boolean {
 }
 
 // Export the root SIGN secret (adapt #77) so it can be persisted to identity.key
-// and later injected as init_arg to reseed a recreated packet onto the same
-// container id. Hex-encoded to match the JSON string createPacket's
-// --init_trn_argument sends the wrapper.
+// and later reparsed + injected to reseed a recreated packet onto the same
+// container id. secretkey_sign is a domain-typed leaf: GetBinary() throws
+// "Invalid domain", so we Serialize() it (self-contained, reparses cross-host)
+// and hex-encode the bytes.
 function exportSigningSecret(pkt: Packet): string {
-  // RUNTIME-VERIFY(#77): confirm secretkey_sign's native leaf exposes GetBinary()
-  // (like the bin fields decoded elsewhere in this file) rather than needing
-  // Visualize(); adjust the hex encoding here if not.
-  return withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_signing_secret', lt).GetBinary()).toString('hex'));
+  return withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_signing_secret', lt).Serialize()).toString('hex'));
 }
 
 function saveState(pkt: Packet, dir: string): void {
