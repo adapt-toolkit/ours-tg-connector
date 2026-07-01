@@ -240,13 +240,18 @@ export class AdaptHost {
     this.wrapper.start();
   }
 
-  createPacket(name: string, seed: string): Promise<Packet> {
+  createPacket(name: string, seed: string, signingSecret?: string): Promise<Packet> {
     const config = new PacketWrapperConfigurator();
-    config.process_arguments([
+    const args = [
       '--unit_hash', this.unit.hash,
       '--seed_phrase', seed,
       '--unit_dir_path', this.unit.dir,
-    ]);
+    ];
+    // RUNTIME-VERIFY(#77): confirm secretkey_sign round-trips as a JSON hex string
+    // through --init_trn_argument (wrapper does object_to_adapt_value(JSON.parse(...)));
+    // if it needs a typed-bytes object instead, change JSON.stringify(signingSecret).
+    if (signingSecret) args.push('--init_trn_argument', JSON.stringify(signingSecret));
+    config.process_arguments(args);
     return new Promise<Packet>((resolveCreate, rejectCreate) => {
       const timer = setTimeout(
         () => rejectCreate(new Error(`packet creation for "${name}" timed out`)),

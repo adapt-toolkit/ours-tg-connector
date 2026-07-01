@@ -34,7 +34,10 @@
 // Persistence:
 //   STATE_DIR/bots.json          { name: { name, token, username, createdAt } }
 //   STATE_DIR/<route-name>/      one dir per route:
-//     identity.seed     the packet seed (stable id + keys across restarts)
+//     identity.key      the exported root SIGN secret (adapt #77) — recreating
+//                        the packet and reseeding from this keeps the container
+//                        id stable across restarts, regardless of the (ephemeral,
+//                        unpersisted) seed phrase used to recreate the packet
 //     state_data.bin    serialized packet state (contacts + encrypted channels)
 //     connection.json   { botName, chatId, threadId, bio, label, peerCid, ... }
 //
@@ -136,7 +139,7 @@ const bots = new Map<string, Bot>(); // bot name -> bot
 
 // ----- per-route paths --------------------------------------------------------
 const connDir = (name: string) => join(STATE_DIR, name);
-const seedPath = (dir: string) => join(dir, 'identity.seed');
+const keyPath = (dir: string) => join(dir, 'identity.key');
 const dataPath = (dir: string) => join(dir, 'state_data.bin');
 const metaPath = (dir: string) => join(dir, 'connection.json');
 const botsPath = () => join(STATE_DIR, 'bots.json');
@@ -172,6 +175,17 @@ function hasSavedState(dir: string): boolean {
   } catch {
     return false;
   }
+}
+
+// Export the root SIGN secret (adapt #77) so it can be persisted to identity.key
+// and later injected as init_arg to reseed a recreated packet onto the same
+// container id. Hex-encoded to match the JSON string createPacket's
+// --init_trn_argument sends the wrapper.
+function exportSigningSecret(pkt: Packet): string {
+  // RUNTIME-VERIFY(#77): confirm secretkey_sign's native leaf exposes GetBinary()
+  // (like the bin fields decoded elsewhere in this file) rather than needing
+  // Visualize(); adjust the hex encoding here if not.
+  return withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_signing_secret', lt).GetBinary()).toString('hex'));
 }
 
 function saveState(pkt: Packet, dir: string): void {
@@ -613,9 +627,9 @@ async function createConnection(args: {
 
     const dir = connDir(args.name);
     fs.mkdirSync(dir, { recursive: true });
-    const seed = randomBytes(24).toString('hex');
-    fs.writeFileSync(seedPath(dir), seed, { mode: 0o600 });
+    const seed = randomBytes(24).toString('hex'); // ephemeral entropy, not persisted
     const pkt = await host.createPacket(args.name, seed);
+    fs.writeFileSync(keyPath(dir), exportSigningSecret(pkt), { mode: 0o600 });
     const cfg: ConnectionFile = {
       v: 1,
       name: args.name,
@@ -666,8 +680,10 @@ async function restoreConnection(name: string): Promise<void> {
     log(`[${name}] references unknown bot "${cfg.botName}" — skipping (add_bot then restart)`);
     return;
   }
-  const seed = fs.readFileSync(seedPath(dir), 'utf8').trim();
-  const pkt = await host.createPacket(name, seed);
+  // Reseed from the persisted SIGN secret (adapt #77) — the seed phrase is
+  // irrelevant once reseed_identity_from_secret overwrites the container id.
+  const secret = fs.readFileSync(keyPath(dir), 'utf8').trim();
+  const pkt = await host.createPacket(name, '', secret);
   const conn: Connection = { pkt, dir, cfg, bot, lastChat: null };
   connections.set(name, conn);
   activateRoute(conn);
