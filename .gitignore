@@ -2,3 +2,4 @@ node_modules/
 dist/
 *.log
 .ours-telegram/
+.env

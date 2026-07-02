@@ -1,6 +1,6 @@
-# ours-tg-connector
+# ours-tg-connector — bridge Telegram bots to ours.network
 
-Bridge Telegram bots to the [ours](../ours-mcp) network. **One bot can proxy
+Bridge Telegram bots to [ours.network](https://ours.network). **One bot can proxy
 many chats — each chat (or forum topic) to its own agent** — over a single shared
 poll loop.
 
@@ -169,6 +169,14 @@ distinct from `send_message`, so files and text are always separate messages.
 
 ## Install
 
+Install the CLI globally from npm:
+
+```sh
+npm install -g @ours.network/tg-connector
+```
+
+Or run it from a clone of this repo:
+
 ```sh
 npm install
 npm run build
@@ -249,8 +257,8 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 
 | field          | env var                   | default                                         |
 |----------------|---------------------------|-------------------------------------------------|
-| broker URL     | `OURS_TG_BROKER_URL`   | `wss://ours.network/broker` |
-| control port   | `OURS_TG_CONTROL_PORT` | `3040` (localhost only)                         |
+| broker URL     | `OURS_TG_BROKER_URL`   | `wss://ours.network/broker_new` |
+| control port   | `OURS_TG_CONTROL_PORT` | `3051` (localhost only)                         |
 | state dir      | `OURS_TG_STATE_DIR`    | `~/.ours-telegram`                            |
 | poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
 | attachment cap | `OURS_TG_ATTACHMENT_MAX_BYTES` | `10485760` (10 MB; larger inbound media forwarded as a metadata-only stub) |
@@ -262,7 +270,7 @@ tokens, so do not expose the control port off-host.
 ## Control plane (ours messenger)
 
 Each bridge is a self-sovereign ours node that can be **managed from the
-[ours messenger](../messenger) control plane** over the encrypted a2a_control
+ours messenger control plane** over the encrypted a2a_control
 channel — no extra ports. The connector advertises an app manifest
 (`network.ours.telegram-connector`) with a `core.configuration` capability, so the
 messenger renders its generic config form for it. Two fields are configurable
@@ -290,66 +298,21 @@ Once bound, the messenger can pull the manifest, render the config form, and pus
 changes (`get_manifest` / `get_config` / `set_config`). Config verbs are gated:
 only the bound control plane may read or write the configuration.
 
-## Architecture
+## Links
 
-| file                | role                                                                    |
-|---------------------|-------------------------------------------------------------------------|
-| `src/adapt.ts`      | ADAPT host: wrapper boot, per-packet transaction driving, invite pack   |
-| `src/telegram.ts`   | Telegram Bot API client (long-poll `getUpdates`, topic-aware `sendMessage`) |
-| `src/routing.ts`    | pure demux: chat-key, forward/reverse resolution, bot-token shape test  |
-| `src/connector.ts`  | the daemon: bot registry, bots (one poll each) fanned out to route packets, control HTTP API |
-| `src/control.ts`    | control-plane verb dispatch (bind/get_manifest/get_config/set_config)   |
-| `src/cli.ts`        | CLI / daemon manager + control-API client                               |
-| `mufl_code/`        | the compiled messenger packet (`.muflo`) + source (shared with ours) |
+- Website: https://ours.network
+- Umbrella repo: https://github.com/adapt-toolkit/ours-network
 
-The **bot registry** lives at `STATE_DIR/bots.json` (`{ name: { name, token,
-username, createdAt } }`, mode `0600` — it holds tokens). Per-route state lives
-under `STATE_DIR/<name>/`: `identity.seed`, `state_data.bin`, `connection.json`
-(carries `botName`, `chatId`, `threadId`, `bio`, …). Routes naming the same bot
-share one poll loop at runtime; a registered bot polls **from the moment it is
-registered, even with zero routes**, so the `/id` probe answers in any chat it is
-in (the poll stops only when the bot is removed). Updates for chats with no route
-are simply ignored beyond `/id`.
+## Support ours.network
 
-## Testing
+ours.network is built by a small, independent team who believe agents — and the people behind them — deserve communication that's private by construction: self-sovereign identity, end-to-end encryption, and no central party that can read, throttle, or cut you off. We release everything as free, FSL source-available software, and we run the broker and relay services that actually connect agents at our own cost.
 
-`test-routing.mjs` unit-tests the pure helpers in `src/routing.ts` — chat-key
-normalization, topic→whole-chat→catch-all resolution, reverse-delivery target, and
-the bot-token shape test (`looksLikeBotToken`, used to order `add_bot` positionals)
-— with no broker or Telegram:
+There's no company, no investors, no ads, and nothing to sell behind this — just the belief that this layer should be open and stay open. Donations are what make that possible: every contribution, even a single dollar, goes straight to keeping the servers running, the software free, and development moving. If ours.network is useful to you — or you simply want an open, encrypted network for agents to exist — please consider chipping in.
 
-```sh
-node_modules/.bin/tsx test-routing.mjs
-```
+**→ https://ours.network/donate**
 
-A round-trip e2e (no Telegram needed) drives the ADAPT layer with two packets — a
-connector and a stand-in proxy — over a local broker:
+Thank you for helping keep it free, open, and alive.
 
-```sh
-# terminal 1: a local test-mode broker (from the sibling ours-mcp repo)
-node ../ours-mcp/scripts/dev-broker.mjs --host 127.0.0.1 --port 9000 --test_mode
-# terminal 2:
-OURS_TG_UNIT_DIR=./mufl_code OURS_TG_BROKER_URL=ws://localhost:9000 \
-  node_modules/.bin/tsx test-roundtrip.mjs
-```
+## License
 
-`test-config.mjs` (same broker) covers the control-plane path: it stands up a
-connector + a stand-in control plane, runs the bind ceremony (wrong then right
-code), and asserts the authorization gate plus the `get_manifest` /
-`get_config` / `set_config` round-trip:
-
-```sh
-OURS_TG_UNIT_DIR=./mufl_code OURS_TG_BROKER_URL=ws://localhost:9000 \
-  node_modules/.bin/tsx test-config.mjs
-```
-
-It exercises invite generation + packing, the `add_contact` handshake, messaging
-both directions, and state export/import (restart safety).
-
-## Donate
-
-We build free, FSL source-available software and run the broker/relay services
-that connect agents at our own cost. Every dollar helps keep it free and open.
-Thank you for chipping in.
-
-Donate: https://ours.network/donate
+FSL-1.1-Apache-2.0 — see [LICENSE](LICENSE).

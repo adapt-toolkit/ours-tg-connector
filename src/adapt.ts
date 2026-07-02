@@ -16,8 +16,7 @@ import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } 
 import { adapt_wrapper } from '@adapt-toolkit/sdk/executables';
 import { PacketWrapperConfigurator } from '@adapt-toolkit/sdk/wrappers';
 import type { AdaptWrapper, AdaptPacketWrapper } from '@adapt-toolkit/sdk/wrappers';
-import type { AdaptValue, AdaptPacketContext } from '@adapt-toolkit/sdk/backend';
-import { AdaptEnvironment, AdaptEvaluationUnit } from '@adapt-toolkit/sdk/backend';
+import type { AdaptValue } from '@adapt-toolkit/sdk/backend';
 import { object_to_adapt_value } from '@adapt-toolkit/sdk/wrapper';
 import { AdaptObjectLifetime } from '@adapt-toolkit/sdk/common';
 
@@ -243,29 +242,20 @@ export class AdaptHost {
 
   createPacket(name: string, seed: string, signingSecret?: string): Promise<Packet> {
     const config = new PacketWrapperConfigurator();
-    config.process_arguments([
+    const args = [
       '--unit_hash', this.unit.hash,
       '--seed_phrase', seed,
       '--unit_dir_path', this.unit.dir,
-    ]);
-    // A persisted SIGN secret (adapt #77) cannot travel through the wrapper's JSON
-    // --init_trn_argument channel: the wrapper builds it via
-    // object_to_adapt_value(JSON.parse(init_arg)), which only makes JSON
-    // primitives/dicts — never a domain-typed secretkey_sign leaf — and feeding a
-    // hex string into `arg SAFE(secretkey_sign)` aborts the native runtime. So we
-    // reparse the Serialize()-hex back into a raw AdaptValue and pre-create the
-    // packet exactly as the wrapper does internally (Seed phrase: <seed>, empty
-    // entropy — irrelevant here, since ::actor::__init reseeds the identity from the
-    // secret and overwrites the container-id-deriving key), then hand it in as the
-    // 4th `_packet` arg so the wrapper skips its own CreatePacket/init_arg path.
-    const prePacket: AdaptPacketContext | undefined = signingSecret
-      ? withScope((lt) => {
-          const unit = AdaptEvaluationUnit.LoadFromContents(lt, this.unit.contents);
-          const host = AdaptEnvironment.EmptyPacket(lt, true).Attach(lt);
-          const initArg = host.ParseValue(Buffer.from(signingSecret, 'hex')).Attach(lt);
-          return AdaptEnvironment.CreatePacket(lt, unit, `Seed phrase: ${seed}`, '', false, initArg).Detach();
-        })
-      : undefined;
+    ];
+    // A persisted SIGN secret (adapt #77) is the Serialize()-hex of the secretkey_sign
+    // (see exportSigningSecret). Deliver it through the wrapper's normal init_arg
+    // channel: actor.mu's __init deserializes it (_hex_string_to_binary ->
+    // _read_or_abort) and reseeds, restoring the container address — no pre-created
+    // packet, so the wrapper still runs its own protocol/attestation setup.
+    if (signingSecret) {
+      args.push('--init_trn_argument', JSON.stringify(signingSecret));
+    }
+    config.process_arguments(args);
     return new Promise<Packet>((resolveCreate, rejectCreate) => {
       const timer = setTimeout(
         () => rejectCreate(new Error(`packet creation for "${name}" timed out`)),
@@ -280,7 +270,6 @@ export class AdaptHost {
           resolveCreate(new Packet(name, cid, pw));
         },
         this.unit.contents,
-        prePacket,
       );
     });
   }

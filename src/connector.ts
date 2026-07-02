@@ -56,6 +56,7 @@ import { join } from 'node:path';
 import * as fs from 'node:fs';
 
 import { loadConfig } from './config';
+import type { AdaptValue } from './adapt';
 import {
   AdaptHost,
   Packet,
@@ -195,6 +196,78 @@ function saveState(pkt: Packet, dir: string): void {
     fs.renameSync(tmp, dataPath(dir));
   } catch (err) {
     log(`[${pkt.name}] failed to save state:`, String(err));
+  }
+}
+
+// ----- contact restore (host driving) ------------------------------------
+// The packet self-heals degraded contacts (known cid, no encryption keys —
+// the outcome of a breaking-change migration that dropped peer_ads) through
+// the signed request_contact_restore handshake. The host's jobs: fire the
+// sweep on boot + the periodic restore-retry timer, and drain deferred queues
+// once a contact heals ($contact_restored notify, or the sweep for a flush
+// lost to a crash).
+function renderDegraded(av: AdaptValue): Array<{ cid: string; name: string; attempts: number; queued: number }> {
+  const out: Array<{ cid: string; name: string; attempts: number; queued: number }> = [];
+  const arr = av.Reduce('degraded');
+  if (arr.IsNil()) return out;
+  for (let i = 0; ; i++) {
+    const e = arr.Reduce(i);
+    if (e.IsNil()) break;
+    out.push({
+      cid: e.Reduce('container_id').Visualize(),
+      name: e.Reduce('name').Visualize(),
+      attempts: Number(e.Reduce('attempts').Visualize()),
+      queued: Number(e.Reduce('queued').Visualize()),
+    });
+  }
+  return out;
+}
+
+function renderDeferredQueues(av: AdaptValue): Array<{ cid: string; queued: number; degraded: boolean }> {
+  const out: Array<{ cid: string; queued: number; degraded: boolean }> = [];
+  const arr = av.Reduce('queues');
+  if (arr.IsNil()) return out;
+  for (let i = 0; ; i++) {
+    const e = arr.Reduce(i);
+    if (e.IsNil()) break;
+    out.push({
+      cid: e.Reduce('container_id').Visualize(),
+      queued: Number(e.Reduce('queued').Visualize()),
+      degraded: e.Reduce('degraded').GetBoolean(),
+    });
+  }
+  return out;
+}
+
+// Drain messages queued while a contact was degraded. Idempotent (empty or
+// still-degraded queue → flushed 0), so re-firing is always safe.
+async function flushDeferredFor(pkt: Packet, contactCid: string): Promise<void> {
+  try {
+    const flushed = await withScopeAsync(async (lt) => {
+      const r = await pkt.mutatingTx('::a2a_messaging::flush_deferred', { contact: contactCid }, lt);
+      return Number(r.Reduce('flushed').Visualize());
+    });
+    if (flushed > 0) log(`[${pkt.name}] flushed ${flushed} deferred message(s) to ${contactCid.slice(0, 12)}…`);
+  } catch (err) {
+    log(`[${pkt.name}] deferred flush to ${contactCid.slice(0, 12)}… failed:`, String(err));
+  }
+}
+
+// Boot + periodic sweep: (re)request restores for degraded contacts and flush any
+// healed-but-still-queued contact (a crash between restore and flush).
+async function contactRestoreSweep(pkt: Packet): Promise<void> {
+  try {
+    const requested = await withScopeAsync(async (lt) => {
+      const r = await pkt.mutatingTx('::a2a_messaging::restore_degraded_contacts', {}, lt);
+      return Number(r.Reduce('requested').Visualize());
+    });
+    if (requested > 0) log(`[${pkt.name}] contact restore requested for ${requested} degraded contact(s)`);
+    const queues = withScope((lt) => renderDeferredQueues(pkt.readonlyTx('::a2a_messaging::list_deferred_queues', lt)));
+    for (const q of queues) {
+      if (!q.degraded) await flushDeferredFor(pkt, q.cid);
+    }
+  } catch (err) {
+    log(`[${pkt.name}] contact-restore sweep failed:`, String(err));
   }
 }
 
@@ -376,7 +449,17 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     }
     const body = buildEnvelope(m, resolved, fileWireId);
     try {
-      await withScopeAsync((lt) => pkt.mutatingTx('::a2a_messaging::send_message', { contact: target, text: body }, lt));
+      const { deferred, queued } = await withScopeAsync(async (lt) => {
+        const sent = await pkt.mutatingTx('::a2a_messaging::send_message', { contact: target, text: body }, lt);
+        const defAv = sent.Reduce('deferred');
+        return {
+          deferred: !defAv.IsNil(),
+          queued: defAv.IsNil() ? 0 : Number(sent.Reduce('queued').Visualize()),
+        };
+      });
+      if (deferred) {
+        log(`[${cfg.name}] message to ${target} queued — contact restore in progress (${queued} queued)`);
+      }
     } catch (err) {
       log(`[${cfg.name}] send_message to ${target} failed:`, String(err));
     }
@@ -544,6 +627,13 @@ function activateRoute(conn: Connection): void {
           } else {
             log(`[${cfg.name}] contact added: "${name}" (${cid})`);
           }
+        } else if (event === 'contact_restored') {
+          // A degraded contact (post-upgrade re-key) finished the signed
+          // restore handshake. Drain anything queued toward it; content-free log line.
+          const name = payload.Reduce('name').Visualize();
+          const cid = payload.Reduce('container_id').Visualize();
+          log(`[${cfg.name}] contact "${name}" restored (re-keyed)`);
+          process.nextTick(() => void flushDeferredFor(pkt, String(cid)));
         }
       },
     },
@@ -695,11 +785,20 @@ async function restoreConnection(name: string): Promise<void> {
         await pkt.mutatingTx('::actor::import_state', adaptData, lt);
       });
     } catch (err) {
-      log(`[${name}] failed to import saved state (continuing fresh):`, String(err));
+      log(`[${name}] FAILED TO IMPORT SAVED STATE — continuing with the reseeded identity; ` +
+        `surviving contacts (if the blob was partially migrated) self-heal via contact restore:`, String(err));
+      try {
+        fs.renameSync(dataPath(dir), `${dataPath(dir)}.failed-${Date.now()}`);
+        log(`[${name}] unreadable state blob preserved as state_data.bin.failed-*`);
+      } catch {
+        /* best effort */
+      }
     }
   }
   const key = isCatchAll(cfg.chatId) ? 'any chat' : chatKey(cfg.chatId, cfg.threadId || undefined);
   log(`[${name}] restored (bot ${botLabel(bot)}, ${key}${cfg.peerCid ? `, peer ${cfg.peerCid}` : ', awaiting proxy'})`);
+  // Eager restore: re-key degraded contacts + flush queues orphaned by a crash.
+  await contactRestoreSweep(pkt);
   // Drain any control requests queued by the control plane while we were down.
   process.nextTick(() => void processControlRequests(conn));
 }
@@ -915,6 +1014,31 @@ function startControlServer(): void {
   process.on('SIGTERM', shutdown);
 }
 
+// ----- contact restore retry timer ---------------------------------------
+// A periodic backstop for contactRestoreSweep (already run on boot per route,
+// and again once a contact heals via the 'contact_restored' notify): retries
+// restore requests for contacts still degraded, and flushes anything queued
+// by a heal whose notify was lost to a crash. The reentrancy guard skips a
+// tick if the previous sweep still runs.
+const RESTORE_SWEEP_INTERVAL_MS = 3_600_000;
+let restoreSweepRunning = false;
+function startRestoreSweepTimer(): void {
+  setInterval(() => {
+    if (restoreSweepRunning) return;
+    restoreSweepRunning = true;
+    void (async () => {
+      try {
+        for (const conn of connections.values()) {
+          await contactRestoreSweep(conn.pkt);
+        }
+      } finally {
+        restoreSweepRunning = false;
+      }
+    })();
+  }, RESTORE_SWEEP_INTERVAL_MS).unref();
+  log(`contact restore-retry timer armed (every ${RESTORE_SWEEP_INTERVAL_MS}ms)`);
+}
+
 // ----- startup ----------------------------------------------------------------
 async function main(): Promise<void> {
   log(`booting (state ${STATE_DIR}, broker ${CONFIG.brokerUrl})`);
@@ -954,6 +1078,7 @@ async function main(): Promise<void> {
   }
 
   startControlServer();
+  startRestoreSweepTimer();
   log(`ready (bots=${bots.size}, routes=${connections.size})`);
 }
 

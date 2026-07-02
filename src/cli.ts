@@ -20,7 +20,7 @@
 // Config precedence per field: env var > config.json (OURS_TG_CONFIG, else
 // ~/.ours-telegram/config.json) > default:
 //   OURS_TG_BROKER_URL    broker to connect to (default: public broker)
-//   OURS_TG_CONTROL_PORT  localhost control API port (default 3040)
+//   OURS_TG_CONTROL_PORT  localhost control API port (default 3051)
 //   OURS_TG_STATE_DIR     state + pid/log dir (default ~/.ours-telegram)
 //   OURS_TG_POLL_TIMEOUT  Telegram long-poll seconds (default 30)
 
@@ -669,7 +669,7 @@ function usage(): void {
   out('');
   out('Config precedence (per field): env var > config.json > default.');
   out('  config.json: OURS_TG_CONFIG, else ~/.ours-telegram/config.json');
-  out('  env: OURS_TG_BROKER_URL, OURS_TG_CONTROL_PORT (3040), OURS_TG_STATE_DIR, OURS_TG_POLL_TIMEOUT (30)');
+  out('  env: OURS_TG_BROKER_URL, OURS_TG_CONTROL_PORT (3051), OURS_TG_STATE_DIR, OURS_TG_POLL_TIMEOUT (30)');
 }
 
 async function main(): Promise<void> {

@@ -18,8 +18,8 @@ export interface ConnectorConfig {
 }
 
 export const DEFAULT_CONFIG: ConnectorConfig = {
-  brokerUrl: 'wss://ours.network/broker',
-  controlPort: 3040,
+  brokerUrl: 'wss://ours.network/broker_new',
+  controlPort: 3051,
   stateDir: resolve(homedir(), '.ours-telegram'),
   pollTimeoutSec: 30,
   attachmentMaxBytes: 10 * 1024 * 1024, // 10 MB (encoded ≈ 13.5 MB; under Telegram's 20 MB bot-API download limit)

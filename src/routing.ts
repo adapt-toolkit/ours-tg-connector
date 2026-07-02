@@ -7,7 +7,7 @@
 // the chat-key it is pinned to, so a reply can only ever go back to its origin.
 //
 // Kept dependency-free (no ADAPT, no Telegram) so the demux logic is unit-tested
-// in isolation — see test-routing.mjs.
+// in isolation.
 
 export const CATCH_ALL = ''; // a route whose chatId is '' or '0' catches anything unmatched
 

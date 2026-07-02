@@ -12,7 +12,7 @@
 //
 // Pure: message (+ optionally the resolved attachment outcome + the send_file
 // wire_id) → string. No network, no disk — so the JSON shaping is unit-tested in
-// isolation (test-envelope.mjs). Absent optional fields are left `undefined`,
+// isolation. Absent optional fields are left `undefined`,
 // which JSON.stringify drops, keeping the envelope compact.
 
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
