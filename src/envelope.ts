@@ -25,6 +25,18 @@ export type ResolvedAttachment =
   | { ok: true; bytes: Buffer }
   | { ok: false; reason: 'too_large' | 'error'; detail: string };
 
+// The outcome of a speech-to-text attempt on a voice/audio attachment. The
+// connector produces this (network, src/stt.ts) and hands it to buildEnvelope
+// (pure). Additive to the v:2 envelope — absent when STT was not attempted.
+export interface TranscriptionResult {
+  status: 'ok' | 'error';
+  text?: string;   // the transcript (present on ok)
+  engine?: string; // best-effort provider label
+  model?: string;
+  lang?: string;   // only if the provider returned it
+  error?: string;  // present on status:'error'
+}
+
 // How far we excerpt the replied-to message's text into reply_to.text.
 const REPLY_EXCERPT_MAX = 200;
 
@@ -89,8 +101,23 @@ function buildAttachment(m: TelegramMessage, resolved?: ResolvedAttachment, file
 // Build the JSON envelope for one inbound Telegram message. `resolved` is the
 // attachment fetch outcome; `fileWireId` is the wire_id returned by send_file
 // when the bytes were sent on the file channel (present only on a successful
-// transfer).
-export function buildEnvelope(m: TelegramMessage, resolved?: ResolvedAttachment, fileWireId?: string): string {
+// transfer). `transcription` is an optional STT result: on a successful
+// transcription of a caption-less message (always true for voice notes) its
+// text folds into the top-level `text`, so a bridged agent reads a spoken
+// message as ordinary text with zero agent-side changes.
+export function buildEnvelope(
+  m: TelegramMessage,
+  resolved?: ResolvedAttachment,
+  fileWireId?: string,
+  transcription?: TranscriptionResult,
+): string {
+  const transcribed = transcription?.status === 'ok' && typeof transcription.text === 'string';
+  // Voice notes have no caption (m.text === ''); only then does the transcript
+  // become text — this protects a captioned audio file from being overwritten.
+  const text = transcribed && m.text === '' ? (transcription!.text as string) : m.text;
+  // Audio bytes are only announced when they were actually sent: the connector
+  // omits `resolved` to deliver a text-only transcript (no attachment block).
+  const attachment = resolved ? buildAttachment(m, resolved, fileWireId) : undefined;
   const envelope = {
     v: ENVELOPE_VERSION,
     source: 'telegram',
@@ -106,8 +133,9 @@ export function buildEnvelope(m: TelegramMessage, resolved?: ResolvedAttachment,
     },
     reply_to: buildReply(m),
     forwarded_from: m.forwarded_from,
-    text: m.text,
-    attachment: buildAttachment(m, resolved, fileWireId),
+    text,
+    attachment,
+    transcription: transcription ?? undefined,
   };
   return JSON.stringify(envelope);
 }
