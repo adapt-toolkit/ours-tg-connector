@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 #
-# Auto-bumps website/package.json version and commits + pushes the result with
-# [skip ci]. Designed to run after gates on pushes to main. Mirrors
-# adapt-toolkit's bump-ts-versions.sh, scoped to the website package in this
-# monorepo (override the target with PKG_PATH).
+# Auto-bumps package.json version and commits + pushes the result with
+# [skip ci]. Designed to run after gates on pushes to main. Override the
+# target manifest with PKG_PATH (defaults to the repo-root package.json).
 #
 # Bump level is derived from the HEAD commit's subject using Conventional
 # Commits (https://www.conventionalcommits.org):
@@ -21,7 +20,7 @@
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
-PKG="${PKG_PATH:-website/package.json}"
+PKG="${PKG_PATH:-package.json}"
 
 emit() {
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then

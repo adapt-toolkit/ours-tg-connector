@@ -1,5 +1,14 @@
 name: CI
 
+# Canonical publish workflow for single-package ours.network repos.
+# On apply, replace @ours.network/tg-connector with the repo's npm package.
+#
+# Prerequisites (one-time, GitHub repo settings → secrets):
+#   - NPM_TOKEN: npm automation token with publish rights to the scope.
+#   - VERSION_BUMP_APP_ID / VERSION_BUMP_APP_PRIVATE_KEY: the version-bump
+#     GitHub App (must be installed on this repo) so the bump commit can push
+#     past branch protection.
+
 on:
   push:
     branches: [main]
@@ -16,7 +25,7 @@ concurrency:
 jobs:
   gates:
     runs-on: ubuntu-latest
-    name: Gates (typecheck · build)
+    name: Gates (typecheck · build · test)
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -27,12 +36,13 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: npm run typecheck
+      - run: npm run typecheck --if-present
       - run: npm run build
+      - run: npm test --if-present
 
   # Conventional-Commits → semver bump of package.json, committed with [skip ci]
-  # and pushed back to main. Pushes via a GitHub App token so the bot commit
-  # isn't blocked by branch protection. Gated on gates going green.
+  # and pushed back to main via a GitHub App token (so the bot commit isn't
+  # blocked by branch protection). Gated on gates going green.
   version-bump:
     needs: gates
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -62,11 +72,11 @@ jobs:
           PKG_PATH: package.json
         run: bash .github/workflows/scripts/bump-version.sh
 
-  # Publishes @ours.network/tg-connector to npm. Gates on `gates` passing
-  # (bump-agnostic) so a manual version edit still ships and a down bump-bot
-  # doesn't block releases. Reads from the post-bump checkout so the published
-  # version always matches package.json.
-  publish:
+  # Publishes the package to npm. Gates on gates passing (bump-agnostic) so a
+  # manual version edit still ships and a down bump-bot doesn't block releases.
+  # Checks out the post-bump SHA so the published version always matches
+  # package.json.
+  npm-publish:
     needs: [gates, version-bump]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.gates.result == 'success'
     runs-on: ubuntu-latest
