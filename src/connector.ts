@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 //
-// a2adapt Telegram connector — daemon.
+// ours.network Telegram connector — daemon.
 //
 // One process == one native ADAPT wrapper hosting N messenger packets. Two layers:
 //
 //   BOT   — one Telegram bot token == one getUpdates poll loop (Telegram allows
 //           only ONE consumer per token). A bot fans its updates out to many
 //           routes by chat-key.
-//   ROUTE — one a2adapt identity (packet) pinned to one chat-key. A chat-key is a
+//   ROUTE — one ours.network identity (packet) pinned to one chat-key. A chat-key is a
 //           whole chat (`chatId`) or a single forum topic (`chatId:threadId`). The
 //           route bridges that chat-key to one proxy agent:
 //
@@ -79,7 +79,7 @@ import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatC
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
 
-const log = (...parts: unknown[]) => process.stderr.write(`a2adapt-tg: ${parts.join(' ')}\n`);
+const log = (...parts: unknown[]) => process.stderr.write(`ours-tg: ${parts.join(' ')}\n`);
 
 // Route names double as on-disk directory names and peer-visible display names,
 // so keep them simple and path-safe.
@@ -649,7 +649,7 @@ function activateBot(bot: Bot): void {
   bot.pollHandle = bot.tg.poll((m) => onBotMessage(bot, m));
 }
 
-// ----- control plane (a2adapt messenger) --------------------------------------
+// ----- control plane (ours messenger) --------------------------------------
 // Each route is itself a self-sovereign node bound + configured from the messenger
 // control plane over the a2a_control channel. Verb dispatch lives in control.ts
 // (shared with the e2e test); here we just drain the queue and supply the
