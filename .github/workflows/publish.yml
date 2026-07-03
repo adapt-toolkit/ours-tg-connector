@@ -28,9 +28,10 @@ jobs:
     name: Gates (typecheck · build · test)
     timeout-minutes: 15
     steps:
+      # No submodules: the compiled MUFL packet is committed prebuilt. Re-enable
+      # (submodules: recursive + an org-readable token while repos are private)
+      # once packet compilation moves into CI.
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -86,7 +87,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version-bump.outputs.new-sha || github.sha }}
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
