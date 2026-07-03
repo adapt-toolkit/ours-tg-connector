@@ -39,6 +39,7 @@
     "@adapt-toolkit/sdk-native": "0.6.2"
   },
   "devDependencies": {
+    "@adapt-toolkit/mufl": "0.8.0",
     "@types/node": "^20.14.0",
     "esbuild": "^0.24.2",
     "tsx": "^4.19.0",

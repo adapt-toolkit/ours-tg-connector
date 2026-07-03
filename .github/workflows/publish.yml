@@ -22,21 +22,26 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Both jobs check out with `submodules: recursive` — repos with MUFL sources
+# pull their mufl_code/core submodule that way. The submodule repo is public
+# today; if the org's repos ever go private, these checkouts will need an
+# org-readable token for the submodule fetch.
 jobs:
   gates:
     runs-on: ubuntu-latest
     name: Gates (typecheck · build · test)
     timeout-minutes: 15
     steps:
-      # No submodules: the compiled MUFL packet is committed prebuilt. Re-enable
-      # (submodules: recursive + an org-readable token while repos are private)
-      # once packet compilation moves into CI.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
       - run: npm ci
+      - name: Compile MUFL packet (repos with mufl sources only)
+        run: if [ -x scripts/compile-mufl.sh ]; then scripts/compile-mufl.sh; fi
       - run: npm run typecheck --if-present
       - run: npm run build
       - run: npm test --if-present
@@ -73,25 +78,29 @@ jobs:
           PKG_PATH: package.json
         run: bash .github/workflows/scripts/bump-version.sh
 
-  # Publishes from the post-bump SHA, so the published version always matches
-  # package.json. Only runs when the bump produced a new version —
-  # re-publishing an existing version would 403.
+  # Publishes the package to npm. Gates on gates passing (bump-agnostic) so a
+  # manual version edit still ships and a down bump-bot doesn't block releases.
+  # Checks out the post-bump SHA so the published version always matches
+  # package.json.
   npm-publish:
     needs: [gates, version-bump]
-    if: needs.version-bump.outputs.bumped == 'true'
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.gates.result == 'success'
     runs-on: ubuntu-latest
     name: Publish to npm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version-bump.outputs.new-sha }}
+          ref: ${{ needs.version-bump.outputs.new-sha || github.sha }}
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      - name: Compile MUFL packet (repos with mufl sources only)
+        run: if [ -x scripts/compile-mufl.sh ]; then scripts/compile-mufl.sh; fi
       - run: npm run build
       - name: Publish @ours.network/tg-connector
         run: npm publish --access public
