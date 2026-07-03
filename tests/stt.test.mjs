@@ -1,11 +1,16 @@
 #!/usr/bin/env node
-// Unit test for src/stt.ts — the speech-to-text client. Pure: stubbed
-// globalThis.fetch, no network. Covers success, HTTP error, unparseable body,
-// abort/timeout, and the keyless short-circuit.
+// Unit test for src/stt.ts — the speech-to-text client — plus a DoD-7 secret
+// hygiene guard for src/config.ts writeConfig(). Pure: stubbed globalThis.fetch,
+// no network, no broker. Covers STT success, HTTP error, unparseable body,
+// abort/timeout, the keyless short-circuit, and that writeConfig masks sttApiKey.
 //
-// Run: node_modules/.bin/tsx test-stt.mjs
+// Run: node_modules/.bin/tsx tests/stt.test.mjs
 
-import { transcribe } from './src/stt.ts';
+import { transcribe } from '../src/stt.ts';
+import { DEFAULT_CONFIG, writeConfig } from '../src/config.ts';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import { join } from 'node:path';
 
 let failures = 0;
 function assert(cond, msg) {
@@ -75,6 +80,27 @@ try {
   }
 } finally {
   globalThis.fetch = realFetch;
+}
+
+// ---- DoD 7: writeConfig() masks the STT secret (regression guard) ----
+// The old broker-backed test-config.mjs was removed on main; this pure guard
+// keeps the secret-hygiene invariant covered without a broker.
+console.log('=== config secret hygiene ===');
+{
+  const SECRET = 'sk-livekey-abcdef0123456789';
+  const tmp = join(fs.mkdtempSync(join(os.tmpdir(), 'ours-cfg-')), 'config.json');
+  const prev = process.env.OURS_TG_CONFIG;
+  process.env.OURS_TG_CONFIG = tmp;
+  try {
+    const path = writeConfig({ ...DEFAULT_CONFIG, sttEnabled: true, sttApiKey: SECRET });
+    const raw = fs.readFileSync(path, 'utf8');
+    assert(!raw.includes(SECRET), 'writeConfig never persists the full sttApiKey');
+    assert(raw.includes('set via env'), 'writeConfig writes a masked placeholder for a non-empty sttApiKey');
+    assert((fs.statSync(path).mode & 0o777) === 0o600, 'config.json is written mode 0600');
+    fs.rmSync(path, { force: true });
+  } finally {
+    if (prev === undefined) delete process.env.OURS_TG_CONFIG; else process.env.OURS_TG_CONFIG = prev;
+  }
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');

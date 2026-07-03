@@ -31,7 +31,8 @@
     "stop": "node dist/cli.js stop",
     "status": "node dist/cli.js status",
     "serve": "node dist/cli.js serve",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "for f in tests/*.test.mjs; do echo \"# $f\"; node_modules/.bin/tsx \"$f\" || exit 1; done"
   },
   "dependencies": {
     "@adapt-toolkit/sdk": "0.6.2",

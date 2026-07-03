@@ -9,15 +9,20 @@
 // This exercises the real src/stt.ts transcribe() and src/envelope.ts
 // buildEnvelope() over a real encrypted channel; only the STT provider HTTP call
 // and Telegram download are stubbed (globalThis.fetch / fixed bytes), so it needs
-// no Telegram bot and no real STT key. The send block below is a faithful mirror
-// of connector.ts forwardToNode — the repo tests the wire path by driving packets
-// directly because connector.ts auto-runs main() on import (see test-sendfile.mjs).
+// no Telegram bot and no real STT key. The send block below (forwardVoice) is a
+// faithful mirror of the STT + send-decision in connector.ts forwardToNode — the
+// `let transcription …` block through `buildEnvelope(m, sendAudio ? resolved : …,
+// fileWireId, transcription)`. The repo tests the wire path by driving packets
+// directly because connector.ts auto-runs main() on import, so forwardToNode
+// cannot be imported (see test-sendfile.mjs). If forwardToNode's STT/sendAudio
+// logic changes, update forwardVoice() below to match.
 //
-// Run: node_modules/.bin/tsx test-voice.mjs
+// Run: OURS_TG_UNIT_DIR=./mufl_code OURS_TG_BROKER_URL=ws://localhost:9000 \
+//        node_modules/.bin/tsx tests/voice.test.mjs
 
-import { AdaptHost, wireHandlers, packInvite, unpackInvite, renderInbox, renderFiles, withScope, withScopeAsync } from './src/adapt.ts';
-import { buildEnvelope, attachmentMeta } from './src/envelope.ts';
-import { transcribe } from './src/stt.ts';
+import { AdaptHost, wireHandlers, packInvite, unpackInvite, renderInbox, renderFiles, withScope, withScopeAsync } from '../src/adapt.ts';
+import { buildEnvelope, attachmentMeta } from '../src/envelope.ts';
+import { transcribe } from '../src/stt.ts';
 
 const BROKER = process.env.OURS_TG_BROKER_URL ?? 'ws://localhost:9000';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
