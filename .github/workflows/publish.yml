@@ -73,20 +73,19 @@ jobs:
           PKG_PATH: package.json
         run: bash .github/workflows/scripts/bump-version.sh
 
-  # Publishes the package to npm. Gates on gates passing (bump-agnostic) so a
-  # manual version edit still ships and a down bump-bot doesn't block releases.
-  # Checks out the post-bump SHA so the published version always matches
-  # package.json.
+  # Publishes from the post-bump SHA, so the published version always matches
+  # package.json. Only runs when the bump produced a new version —
+  # re-publishing an existing version would 403.
   npm-publish:
     needs: [gates, version-bump]
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.gates.result == 'success'
+    if: needs.version-bump.outputs.bumped == 'true'
     runs-on: ubuntu-latest
     name: Publish to npm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version-bump.outputs.new-sha || github.sha }}
+          ref: ${{ needs.version-bump.outputs.new-sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
