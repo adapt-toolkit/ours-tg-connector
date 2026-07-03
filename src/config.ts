@@ -15,6 +15,16 @@ export interface ConnectorConfig {
   pollTimeoutSec: number; // Telegram long-poll timeout per getUpdates call
   attachmentMaxBytes: number; // max media size forwarded inline (base64) before degrading to a metadata-only stub
   outboundFileMaxBytes: number; // max size of a received file we will upload to Telegram (bot upload limit is 50 MB)
+  // Speech-to-text for inbound voice notes (opt-in; off ⇒ byte-identical to today).
+  sttEnabled: boolean;
+  sttApiKey: string;        // secret; env-preferred, masked on config.json rewrite
+  sttBaseUrl: string;       // OpenAI-compatible endpoint root
+  sttModel: string;         // transcription model
+  sttLanguage: string;      // '' => provider auto-detects
+  sttKinds: string[];       // attachment kinds to transcribe
+  sttMaxBytes: number;      // skip STT above this (cost/latency guard)
+  sttTimeoutMs: number;     // per-call abort deadline
+  forwardVoiceAudio: boolean; // also send_file the transcribed audio
 }
 
 export const DEFAULT_CONFIG: ConnectorConfig = {
@@ -24,6 +34,15 @@ export const DEFAULT_CONFIG: ConnectorConfig = {
   pollTimeoutSec: 30,
   attachmentMaxBytes: 10 * 1024 * 1024, // 10 MB (encoded ≈ 13.5 MB; under Telegram's 20 MB bot-API download limit)
   outboundFileMaxBytes: 50 * 1024 * 1024, // Telegram bot sendDocument upper bound
+  sttEnabled: false,
+  sttApiKey: '',
+  sttBaseUrl: 'https://api.openai.com/v1',
+  sttModel: 'whisper-1',
+  sttLanguage: '',
+  sttKinds: ['voice'],
+  sttMaxBytes: 5 * 1024 * 1024, // 5 MB
+  sttTimeoutMs: 60000,
+  forwardVoiceAudio: false,
 };
 
 export function configPath(): string {
@@ -56,6 +75,15 @@ function readFileConfig(): Partial<ConnectorConfig> {
   if (typeof parsed.outboundFileMaxBytes === 'number' && Number.isFinite(parsed.outboundFileMaxBytes)) {
     out.outboundFileMaxBytes = parsed.outboundFileMaxBytes;
   }
+  if (typeof parsed.sttEnabled === 'boolean') out.sttEnabled = parsed.sttEnabled;
+  if (typeof parsed.sttApiKey === 'string') out.sttApiKey = parsed.sttApiKey;
+  if (typeof parsed.sttBaseUrl === 'string') out.sttBaseUrl = parsed.sttBaseUrl;
+  if (typeof parsed.sttModel === 'string') out.sttModel = parsed.sttModel;
+  if (typeof parsed.sttLanguage === 'string') out.sttLanguage = parsed.sttLanguage;
+  if (Array.isArray(parsed.sttKinds)) out.sttKinds = parsed.sttKinds.filter((k): k is string => typeof k === 'string');
+  if (typeof parsed.sttMaxBytes === 'number' && Number.isFinite(parsed.sttMaxBytes)) out.sttMaxBytes = parsed.sttMaxBytes;
+  if (typeof parsed.sttTimeoutMs === 'number' && Number.isFinite(parsed.sttTimeoutMs)) out.sttTimeoutMs = parsed.sttTimeoutMs;
+  if (typeof parsed.forwardVoiceAudio === 'boolean') out.forwardVoiceAudio = parsed.forwardVoiceAudio;
   return out;
 }
 
@@ -64,6 +92,12 @@ function envInt(name: string): number | undefined {
   if (v === undefined) return undefined;
   const n = parseInt(v, 10);
   return Number.isNaN(n) ? undefined : n;
+}
+
+function envBool(name: string): boolean | undefined {
+  const v = process.env[name];
+  if (v === undefined) return undefined;
+  return v === '1' || v.toLowerCase() === 'true';
 }
 
 export function loadConfig(): ConnectorConfig {
@@ -75,13 +109,25 @@ export function loadConfig(): ConnectorConfig {
     pollTimeoutSec: envInt('OURS_TG_POLL_TIMEOUT') ?? file.pollTimeoutSec ?? DEFAULT_CONFIG.pollTimeoutSec,
     attachmentMaxBytes: envInt('OURS_TG_ATTACHMENT_MAX_BYTES') ?? file.attachmentMaxBytes ?? DEFAULT_CONFIG.attachmentMaxBytes,
     outboundFileMaxBytes: envInt('OURS_TG_OUTBOUND_FILE_MAX_BYTES') ?? file.outboundFileMaxBytes ?? DEFAULT_CONFIG.outboundFileMaxBytes,
+    sttEnabled: envBool('OURS_TG_STT_ENABLED') ?? file.sttEnabled ?? DEFAULT_CONFIG.sttEnabled,
+    sttApiKey: process.env.OURS_TG_STT_API_KEY ?? file.sttApiKey ?? DEFAULT_CONFIG.sttApiKey,
+    sttBaseUrl: process.env.OURS_TG_STT_BASE_URL ?? file.sttBaseUrl ?? DEFAULT_CONFIG.sttBaseUrl,
+    sttModel: process.env.OURS_TG_STT_MODEL ?? file.sttModel ?? DEFAULT_CONFIG.sttModel,
+    sttLanguage: process.env.OURS_TG_STT_LANGUAGE ?? file.sttLanguage ?? DEFAULT_CONFIG.sttLanguage,
+    sttKinds: process.env.OURS_TG_STT_KINDS?.split(',').map((s) => s.trim()).filter(Boolean) ?? file.sttKinds ?? DEFAULT_CONFIG.sttKinds,
+    sttMaxBytes: envInt('OURS_TG_STT_MAX_BYTES') ?? file.sttMaxBytes ?? DEFAULT_CONFIG.sttMaxBytes,
+    sttTimeoutMs: envInt('OURS_TG_STT_TIMEOUT_MS') ?? file.sttTimeoutMs ?? DEFAULT_CONFIG.sttTimeoutMs,
+    forwardVoiceAudio: envBool('OURS_TG_FORWARD_VOICE_AUDIO') ?? file.forwardVoiceAudio ?? DEFAULT_CONFIG.forwardVoiceAudio,
   };
 }
 
 export function writeConfig(cfg: ConnectorConfig): string {
   const path = configPath();
   fs.mkdirSync(dirname(path), { recursive: true });
-  fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+  // Never persist the STT secret in clear — operators supply it via
+  // OURS_TG_STT_API_KEY. Mirror the token-at-rest hygiene used for bots.json.
+  const onDisk: ConnectorConfig = { ...cfg, sttApiKey: cfg.sttApiKey ? `${cfg.sttApiKey.slice(0, 4)}…(set via env)` : '' };
+  fs.writeFileSync(path, JSON.stringify(onDisk, null, 2) + '\n', { mode: 0o600 });
   try {
     fs.chmodSync(path, 0o600);
   } catch {

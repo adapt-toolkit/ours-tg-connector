@@ -167,6 +167,59 @@ distinct from `send_message`, so files and text are always separate messages.
   plane receives a forced **metadata-only** copy (`[file] <name> (<mime>, <N> B)`)
   — never the bytes.
 
+### Voice transcription (speech-to-text)
+
+A Telegram **voice note** carries no caption, so a bridged agent (a text LLM)
+would otherwise receive an empty `text` and an unreadable audio blob. With STT
+enabled, the connector transcribes the voice note and delivers the transcript
+**through the normal envelope as ordinary `text`**, so any agent understands a
+spoken message with **zero agent-side changes**. A small `transcription` block is
+added for provenance:
+
+```jsonc
+{
+  "v": 2,
+  "text": "let's ship it friday",        // the transcript (voice notes have no caption)
+  "transcription": {
+    "text":   "let's ship it friday",
+    "engine": "openai",                    // best-effort label from the provider host
+    "model":  "whisper-1",
+    "lang":   "en",                        // only if the provider returns it
+    "status": "ok"                         // "ok" | "error"  (on error: "error":"<reason>", no text)
+  }
+}
+```
+
+- **Opt-in.** Off by default (`sttEnabled:false`) — behaviour is then byte-identical
+  to today. Turn it on and supply a key (see [Configuration](#configuration)).
+- **No transcoding.** Telegram voice is **OGG/Opus**, which OpenAI-compatible
+  transcription endpoints accept directly — the connector adds **no ffmpeg** and no
+  new dependency (just built-in `fetch`).
+- **Provider-agnostic.** The endpoint is `{sttBaseUrl}/audio/transcriptions` with a
+  `Bearer` key — point it at OpenAI (`whisper-1`), Groq
+  (`whisper-large-v3-turbo`, faster/cheaper), or a **self-hosted** `whisper.cpp`
+  server. One config switch, no lock-in.
+- **Audio forwarding.** By default a successfully transcribed voice note is
+  delivered as **text only** (no `send_file`, no `attachment` block — the
+  `transcription` block already signals it came from voice). Set
+  `forwardVoiceAudio:true` to also `send_file` the `.ogg` alongside the transcript.
+- **Graceful degradation.** If STT is disabled, fails, times out, or the audio is
+  over `sttMaxBytes`, the bridge falls back to **today's exact behaviour** — the
+  `.ogg` is still forwarded via `send_file` and nothing the user sent is lost. When
+  STT was attempted and failed, the envelope adds `transcription.status:"error"`
+  (e.g. `error:"too_large"` for the size guard); the daemon logs a single line
+  **without the key** and keeps polling.
+- **Cost & data egress.** Transcription bills to the configured provider
+  (whisper-1 ≈ **$0.006/min**, billed to the nearest second; operators pick the
+  provider and bear the cost). **Audio bytes leave the host** for that provider —
+  point `sttBaseUrl` at a self-hosted server to keep audio local. Per-message cost
+  and latency are bounded by `sttMaxBytes` and `sttTimeoutMs`.
+
+**Secret handling.** Supply the key via `OURS_TG_STT_API_KEY` (preferred). If it
+is placed in `config.json` instead, the file stays mode `0600` and the key is
+**masked** whenever the daemon rewrites config — it is never persisted in clear
+and never written to logs.
+
 ## Install
 
 Install the CLI globally from npm:
@@ -263,6 +316,15 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
 | attachment cap | `OURS_TG_ATTACHMENT_MAX_BYTES` | `10485760` (10 MB; larger inbound media forwarded as a metadata-only stub) |
 | outbound file cap | `OURS_TG_OUTBOUND_FILE_MAX_BYTES` | `52428800` (50 MB; a larger file from a contact is skipped + logged — Telegram's `sendDocument` limit) |
+| STT enabled    | `OURS_TG_STT_ENABLED`     | `false` (master switch for voice transcription; off ⇒ byte-identical to today) |
+| STT API key    | `OURS_TG_STT_API_KEY`     | `''` (secret; env preferred — masked if placed in `config.json`, never logged) |
+| STT base URL   | `OURS_TG_STT_BASE_URL`    | `https://api.openai.com/v1` (OpenAI-compatible endpoint root; e.g. `https://api.groq.com/openai/v1` or a self-hosted whisper server) |
+| STT model      | `OURS_TG_STT_MODEL`       | `whisper-1` (e.g. `whisper-large-v3-turbo` on Groq) |
+| STT language   | `OURS_TG_STT_LANGUAGE`    | *(unset)* (optional ISO-639-1 hint; omit ⇒ provider auto-detects) |
+| STT kinds      | `OURS_TG_STT_KINDS`       | `voice` (comma-list of attachment kinds to transcribe; e.g. `voice,audio`) |
+| STT size guard | `OURS_TG_STT_MAX_BYTES`   | `5242880` (5 MB; audio over this skips STT and is forwarded as a file — cost/latency guard) |
+| STT timeout    | `OURS_TG_STT_TIMEOUT_MS`  | `60000` (per-transcription abort deadline, ms) |
+| forward voice audio | `OURS_TG_FORWARD_VOICE_AUDIO` | `false` (also `send_file` the `.ogg` alongside a successful transcript) |
 
 The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
 tokens, so do not expose the control port off-host.

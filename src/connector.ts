@@ -73,7 +73,8 @@ import { DEFAULT_DENIED, monitoringStatus, dispatchControlRequest } from './cont
 import { TelegramClient } from './telegram';
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 import { buildEnvelope, attachmentMeta } from './envelope';
-import type { ResolvedAttachment } from './envelope';
+import type { ResolvedAttachment, TranscriptionResult } from './envelope';
+import { transcribe } from './stt';
 import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply } from './routing';
 
 const CONFIG = loadConfig();
@@ -407,6 +408,13 @@ async function resolveAttachment(conn: Connection, d: AttachmentDescriptor): Pro
   }
 }
 
+// Best-effort provider label from the STT base URL host (e.g.
+// https://api.openai.com/v1 -> "openai", https://api.groq.com/openai/v1 ->
+// "groq"). Cosmetic only — recorded in the envelope's transcription block.
+function sttEngineLabel(baseUrl: string): string {
+  try { return new URL(baseUrl).hostname.replace(/^api\./, '').split('.')[0]; } catch { return 'stt'; }
+}
+
 // ----- the bridge -------------------------------------------------------------
 // Telegram → agent: forward an inbound message to the route's proxy as a JSON
 // envelope (sender/chat/reply/forward metadata + the text, plus the file inline
@@ -416,6 +424,33 @@ async function resolveAttachment(conn: Connection, d: AttachmentDescriptor): Pro
 async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void> {
   const { pkt, cfg } = conn;
   const resolved = m.attachment ? await resolveAttachment(conn, m.attachment) : undefined;
+
+  // Speech-to-text for voice (and any other configured kinds). Only when
+  // enabled, the kind opted in, and the bytes resolved within the STT size
+  // guard. Failures degrade to the file-forward path — never crash the poll
+  // loop (mirrors resolveAttachment).
+  let transcription: TranscriptionResult | undefined;
+  const kind = m.attachment?.kind;
+  if (CONFIG.sttEnabled && kind && CONFIG.sttKinds.includes(kind) && resolved?.ok) {
+    const engine = sttEngineLabel(CONFIG.sttBaseUrl);
+    if (resolved.bytes.length > CONFIG.sttMaxBytes) {
+      transcription = { status: 'error', error: 'too_large', engine, model: CONFIG.sttModel };
+    } else {
+      const meta = attachmentMeta(m.attachment!, m.message_id);
+      const r = await transcribe(resolved.bytes, meta.filename, meta.mime, {
+        baseUrl: CONFIG.sttBaseUrl, apiKey: CONFIG.sttApiKey, model: CONFIG.sttModel,
+        language: CONFIG.sttLanguage || undefined, timeoutMs: CONFIG.sttTimeoutMs,
+      });
+      transcription = r.ok
+        ? { status: 'ok', text: r.text, engine, model: CONFIG.sttModel, lang: r.lang }
+        : { status: 'error', error: r.error, engine, model: CONFIG.sttModel };
+      if (!r.ok) log(`[${cfg.name}] STT failed for ${kind} from ${m.from}: ${r.error}`); // never logs the key
+    }
+  }
+  // Whether to still send the audio bytes: yes unless we successfully
+  // transcribed AND the operator did not ask to keep the audio.
+  const sendAudio = !!(resolved?.ok) && !(transcription?.status === 'ok' && !CONFIG.forwardVoiceAudio);
+
   const targets: string[] = [];
   if (cfg.peerCid) {
     targets.push(cfg.peerCid);
@@ -434,7 +469,7 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     // then references it so the agent correlates the two. Over-cap/failed
     // downloads send no file — the envelope still announces it (omitted/error).
     let fileWireId: string | undefined;
-    if (m.attachment && resolved?.ok) {
+    if (m.attachment && resolved?.ok && sendAudio) {
       const meta = attachmentMeta(m.attachment, m.message_id);
       const fileBytes = resolved.bytes;
       try {
@@ -447,7 +482,9 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
         log(`[${cfg.name}] send_file to ${target} failed:`, String(err));
       }
     }
-    const body = buildEnvelope(m, resolved, fileWireId);
+    // Omit `resolved` from the envelope when we are not announcing the audio, so
+    // no attachment block is emitted for a text-only transcript (SPEC §4.5).
+    const body = buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId, transcription);
     try {
       const { deferred, queued } = await withScopeAsync(async (lt) => {
         const sent = await pkt.mutatingTx('::a2a_messaging::send_message', { contact: target, text: body }, lt);
