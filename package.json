@@ -1,6 +1,6 @@
 {
   "name": "@ours.network/tg-connector",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Bridge Telegram bots to ours proxy nodes — one ADAPT wrapper hosting N messenger packets, each connecting one Telegram bot to one ours node. Run `ours-tg-connector add_new_connection`.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
