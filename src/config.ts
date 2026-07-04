@@ -28,7 +28,7 @@ export interface ConnectorConfig {
 }
 
 export const DEFAULT_CONFIG: ConnectorConfig = {
-  brokerUrl: 'wss://ours.network/broker_new',
+  brokerUrl: 'wss://broker1.ours.network',
   controlPort: 3051,
   stateDir: resolve(homedir(), '.ours-telegram'),
   pollTimeoutSec: 30,

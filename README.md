@@ -310,7 +310,7 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 
 | field          | env var                   | default                                         |
 |----------------|---------------------------|-------------------------------------------------|
-| broker URL     | `OURS_TG_BROKER_URL`   | `wss://ours.network/broker_new` |
+| broker URL     | `OURS_TG_BROKER_URL`   | `wss://broker1.ours.network` |
 | control port   | `OURS_TG_CONTROL_PORT` | `3051` (localhost only)                         |
 | state dir      | `OURS_TG_STATE_DIR`    | `~/.ours-telegram`                            |
 | poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
