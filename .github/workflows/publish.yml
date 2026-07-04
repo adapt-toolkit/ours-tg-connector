@@ -22,21 +22,26 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Both jobs check out with `submodules: recursive` — repos with MUFL sources
+# pull their mufl_code/core submodule that way. The submodule repo is public
+# today; if the org's repos ever go private, these checkouts will need an
+# org-readable token for the submodule fetch.
 jobs:
   gates:
     runs-on: ubuntu-latest
     name: Gates (typecheck · build · test)
     timeout-minutes: 15
     steps:
-      # No submodules: the compiled MUFL packet is committed prebuilt. Re-enable
-      # (submodules: recursive + an org-readable token while repos are private)
-      # once packet compilation moves into CI.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
       - run: npm ci
+      - name: Compile MUFL packet (repos with mufl sources only)
+        run: if [ -x scripts/compile-mufl.sh ]; then scripts/compile-mufl.sh; fi
       - run: npm run typecheck --if-present
       - run: npm run build
       - run: npm test --if-present
@@ -86,12 +91,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version-bump.outputs.new-sha }}
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      - name: Compile MUFL packet (repos with mufl sources only)
+        run: if [ -x scripts/compile-mufl.sh ]; then scripts/compile-mufl.sh; fi
       - run: npm run build
       - name: Publish @ours.network/tg-connector
         run: npm publish --access public

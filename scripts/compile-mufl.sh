@@ -3,32 +3,46 @@
 # .muflo and install it into mufl_code/ (replacing the old one — build.mjs
 # copies whatever single .muflo it finds via locateUnit).
 #
-#   ADAPT_TOOLKIT=/path/to/adapt-toolkit scripts/compile-mufl.sh
+# Needs the mufl toolchain (`mufl-compile` plus the mufl_stdlib / meta /
+# transactions trees). Resolution order: an explicit ADAPT_TOOLKIT checkout wins;
+# otherwise the npm-installed @adapt-toolkit/mufl package is used:
 #
-# The compiler binary is NOT in @adapt-toolkit/sdk (that package only loads an
-# existing .muflo). Build it once from the toolkit checkout:
-#   python3 build.py --compiler_release   # -> build/mufl-compile
+#   ADAPT_TOOLKIT=/path/to/adapt-toolkit scripts/compile-mufl.sh   # local checkout
+#   scripts/compile-mufl.sh                                        # npm i already done
+#
+# To (re)build mufl-compile inside a checkout: `python3 build.py --compiler_release`.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 src_dir="$here/mufl_code"
 
-toolkit="${ADAPT_TOOLKIT:-/home/shakhvit/work/adapt/adapt-toolkit}"
-if [ ! -d "$toolkit" ]; then
-  echo "error: ADAPT toolkit not found at '$toolkit' (set ADAPT_TOOLKIT)." >&2
-  exit 1
+# Toolkit resolution: explicit checkout wins; else the npm-installed toolchain.
+if [ -n "${ADAPT_TOOLKIT:-}" ]; then
+  toolkit="$ADAPT_TOOLKIT"
+  if [ ! -d "$toolkit" ]; then
+    echo "error: ADAPT toolkit not found at '$toolkit' (set ADAPT_TOOLKIT)." >&2
+    exit 1
+  fi
+  platform="$(uname | tr '[:upper:]' '[:lower:]')"
+  mufl_compile=""
+  for cand in \
+    "$toolkit/build/mufl-compile" \
+    "$toolkit/build.$platform.release/mufl-compile" \
+    "$toolkit/build.$platform.debug/mufl-compile"; do
+    if [ -x "$cand" ]; then mufl_compile="$cand"; break; fi
+  done
+  if [ -z "$mufl_compile" ]; then
+    echo "error: mufl-compile not found under '$toolkit' — build it with 'python3 build.py --compiler_release'." >&2
+    exit 1
+  fi
+else
+  pkg_root="$(cd "$here" && node -p "path.dirname(require.resolve('@adapt-toolkit/mufl/package.json'))" 2>/dev/null)" \
+    || { echo "error: set ADAPT_TOOLKIT or npm-install @adapt-toolkit/mufl." >&2; exit 1; }
+  toolkit="$pkg_root"
+  mufl_compile="$pkg_root/prebuilds/linux-x64/mufl-compile"
 fi
-
-platform="$(uname | tr '[:upper:]' '[:lower:]')"
-mufl_compile=""
-for cand in \
-  "$toolkit/build/mufl-compile" \
-  "$toolkit/build.$platform.release/mufl-compile" \
-  "$toolkit/build.$platform.debug/mufl-compile"; do
-  if [ -x "$cand" ]; then mufl_compile="$cand"; break; fi
-done
-if [ -z "$mufl_compile" ]; then
-  echo "error: mufl-compile not found under '$toolkit' — build it with 'python3 build.py --compiler_release'." >&2
+if [ ! -x "$mufl_compile" ]; then
+  echo "error: mufl-compile not found/executable at '$mufl_compile'." >&2
   exit 1
 fi
 
