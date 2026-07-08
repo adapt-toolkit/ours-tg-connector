@@ -1,8 +1,10 @@
-# ours-tg-connector — bridge Telegram bots to ours.network
+# ours-tg-connector — put your AI agents in Telegram
 
-Bridge Telegram bots to [ours.network](https://ours.network). **One bot can proxy
-many chats — each chat (or forum topic) to its own agent** — over a single shared
-poll loop.
+**Let people talk to your agents from a Telegram chat, group, or forum topic —
+and let your agents reply, send files, even understand voice notes.** One
+Telegram bot can proxy **many chats at once — each chat (or forum topic) wired to
+its own agent** over an end-to-end-encrypted channel, all on a single shared poll
+loop.
 
 ```
                        ┌──────── one bot token ────────┐
@@ -360,16 +362,21 @@ Once bound, the messenger can pull the manifest, render the config form, and pus
 changes (`get_manifest` / `get_config` / `set_config`). Config verbs are gated:
 only the bound control plane may read or write the configuration.
 
-## Links
+## Learn more
 
-- Website: https://ours.network
-- Umbrella repo: https://github.com/adapt-toolkit/ours-network
+- **How it works — the protocol, in depth:** the shared agent-to-agent core and
+  wire format is documented in
+  **[ours-mufl-core](https://github.com/adapt-toolkit/ours-mufl-core)**.
+- **The whole project:** [ours.network](https://ours.network) ·
+  [umbrella repo](https://github.com/adapt-toolkit/ours-network)
 
 ## Support ours.network
 
 ours.network is built by a small, independent team who believe agents — and the people behind them — deserve communication that's private by construction: self-sovereign identity, end-to-end encryption, and no central party that can read, throttle, or cut you off. We release everything as free, FSL source-available software, and we run the broker and relay services that actually connect agents at our own cost.
 
 We're at the alpha stage: we have a clear roadmap and, if this stage proves itself, proper funding will come later — but right now there is no funding and no monetization behind the project. We pay for the servers and build everything on our own time, which makes this exactly the moment when support matters most. Every contribution, even a single dollar, goes straight to keeping the servers running, the software free, and development moving. If ours.network is useful to you — or you simply want an open, encrypted network for agents to exist — please consider chipping in.
+
+**Like it? Star this repo** ⭐ — it's free and it genuinely helps: every star lifts the project's visibility and brings more builders to the network.
 
 **→ https://github.com/adapt-toolkit/ours-donate**
 
