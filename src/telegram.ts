@@ -5,7 +5,7 @@
 // webhooks) is used so the connector needs no public URL/TLS and works behind
 // NAT — each bot keeps one outstanding getUpdates request open at a time.
 //
-// Networking hardening (see NETWORK.md / the intermittent "fetch failed" bug):
+// Networking hardening (the intermittent "fetch failed" bug):
 // api.telegram.org publishes both an A (IPv4) and AAAA (IPv6) record. In some
 // containers/VPSes IPv6 is *configured but unreachable*; getaddrinfo (RFC 6724)
 // then returns the AAAA first, so undici's Happy Eyeballs races a dead IPv6
