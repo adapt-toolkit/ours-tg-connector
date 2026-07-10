@@ -13,6 +13,12 @@ export interface ConnectorConfig {
   controlPort: number; // localhost JSON control API (add/list/remove connections)
   stateDir: string;    // one subdir per connection: stateDir/<name>/
   pollTimeoutSec: number; // Telegram long-poll timeout per getUpdates call
+  // Telegram network path hardening (see src/telegram.ts). Default is the robust
+  // path: force IPv4 so a configured-but-unreachable IPv6 can't stall/fail fetch.
+  tgForceIpv4: boolean;        // pin Telegram requests to the IPv4 A record
+  tgConnectTimeoutMs: number;  // bound a stalled connect (fail fast, not ~30s)
+  tgFetchRetries: number;      // transient-error retries for transactional calls
+  tgFetchRetryBaseMs: number;  // base backoff between those retries (ms)
   attachmentMaxBytes: number; // max media size forwarded inline (base64) before degrading to a metadata-only stub
   outboundFileMaxBytes: number; // max size of a received file we will upload to Telegram (bot upload limit is 50 MB)
   // Speech-to-text for inbound voice notes (opt-in; off ⇒ byte-identical to today).
@@ -32,6 +38,10 @@ export const DEFAULT_CONFIG: ConnectorConfig = {
   controlPort: 3051,
   stateDir: resolve(homedir(), '.ours-telegram'),
   pollTimeoutSec: 30,
+  tgForceIpv4: true,
+  tgConnectTimeoutMs: 10_000,
+  tgFetchRetries: 3,
+  tgFetchRetryBaseMs: 300,
   attachmentMaxBytes: 10 * 1024 * 1024, // 10 MB (encoded ≈ 13.5 MB; under Telegram's 20 MB bot-API download limit)
   outboundFileMaxBytes: 50 * 1024 * 1024, // Telegram bot sendDocument upper bound
   sttEnabled: false,
@@ -68,6 +78,16 @@ function readFileConfig(): Partial<ConnectorConfig> {
   if (typeof parsed.stateDir === 'string') out.stateDir = resolve(parsed.stateDir);
   if (typeof parsed.pollTimeoutSec === 'number' && Number.isFinite(parsed.pollTimeoutSec)) {
     out.pollTimeoutSec = parsed.pollTimeoutSec;
+  }
+  if (typeof parsed.tgForceIpv4 === 'boolean') out.tgForceIpv4 = parsed.tgForceIpv4;
+  if (typeof parsed.tgConnectTimeoutMs === 'number' && Number.isFinite(parsed.tgConnectTimeoutMs)) {
+    out.tgConnectTimeoutMs = parsed.tgConnectTimeoutMs;
+  }
+  if (typeof parsed.tgFetchRetries === 'number' && Number.isFinite(parsed.tgFetchRetries)) {
+    out.tgFetchRetries = parsed.tgFetchRetries;
+  }
+  if (typeof parsed.tgFetchRetryBaseMs === 'number' && Number.isFinite(parsed.tgFetchRetryBaseMs)) {
+    out.tgFetchRetryBaseMs = parsed.tgFetchRetryBaseMs;
   }
   if (typeof parsed.attachmentMaxBytes === 'number' && Number.isFinite(parsed.attachmentMaxBytes)) {
     out.attachmentMaxBytes = parsed.attachmentMaxBytes;
@@ -107,6 +127,10 @@ export function loadConfig(): ConnectorConfig {
     controlPort: envInt('OURS_TG_CONTROL_PORT') ?? file.controlPort ?? DEFAULT_CONFIG.controlPort,
     stateDir: resolve(process.env.OURS_TG_STATE_DIR ?? file.stateDir ?? DEFAULT_CONFIG.stateDir),
     pollTimeoutSec: envInt('OURS_TG_POLL_TIMEOUT') ?? file.pollTimeoutSec ?? DEFAULT_CONFIG.pollTimeoutSec,
+    tgForceIpv4: envBool('OURS_TG_FORCE_IPV4') ?? file.tgForceIpv4 ?? DEFAULT_CONFIG.tgForceIpv4,
+    tgConnectTimeoutMs: envInt('OURS_TG_CONNECT_TIMEOUT_MS') ?? file.tgConnectTimeoutMs ?? DEFAULT_CONFIG.tgConnectTimeoutMs,
+    tgFetchRetries: envInt('OURS_TG_FETCH_RETRIES') ?? file.tgFetchRetries ?? DEFAULT_CONFIG.tgFetchRetries,
+    tgFetchRetryBaseMs: envInt('OURS_TG_FETCH_RETRY_BASE_MS') ?? file.tgFetchRetryBaseMs ?? DEFAULT_CONFIG.tgFetchRetryBaseMs,
     attachmentMaxBytes: envInt('OURS_TG_ATTACHMENT_MAX_BYTES') ?? file.attachmentMaxBytes ?? DEFAULT_CONFIG.attachmentMaxBytes,
     outboundFileMaxBytes: envInt('OURS_TG_OUTBOUND_FILE_MAX_BYTES') ?? file.outboundFileMaxBytes ?? DEFAULT_CONFIG.outboundFileMaxBytes,
     sttEnabled: envBool('OURS_TG_STT_ENABLED') ?? file.sttEnabled ?? DEFAULT_CONFIG.sttEnabled,

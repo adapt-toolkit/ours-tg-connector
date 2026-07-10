@@ -36,7 +36,8 @@
   },
   "dependencies": {
     "@adapt-toolkit/sdk": "0.9.1",
-    "@adapt-toolkit/sdk-native": "0.9.1"
+    "@adapt-toolkit/sdk-native": "0.9.1",
+    "undici": "^7.28.0"
   },
   "devDependencies": {
     "@adapt-toolkit/mufl": "0.9.1",
