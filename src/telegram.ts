@@ -1,11 +1,122 @@
-// Minimal Telegram Bot API client (no external deps — plain fetch).
+// Minimal Telegram Bot API client (fetch + a dedicated undici dispatcher).
 //
 // One TelegramClient per connection/bot. It long-polls getUpdates for inbound
 // messages and sends outbound messages via sendMessage. Long polling (not
 // webhooks) is used so the connector needs no public URL/TLS and works behind
 // NAT — each bot keeps one outstanding getUpdates request open at a time.
+//
+// Networking hardening (see NETWORK.md / the intermittent "fetch failed" bug):
+// api.telegram.org publishes both an A (IPv4) and AAAA (IPv6) record. In some
+// containers/VPSes IPv6 is *configured but unreachable*; getaddrinfo (RFC 6724)
+// then returns the AAAA first, so undici's Happy Eyeballs races a dead IPv6
+// attempt against the single IPv4 one and the whole fetch intermittently fails
+// with `TypeError: fetch failed` (AggregateError ETIMEDOUT + ENETUNREACH). We
+// pin every Telegram request to a dedicated undici Agent that forces IPv4
+// (family:4 => only the A record is resolved), disables Happy Eyeballs, and
+// fails a bad connect fast; transactional calls also retry transient errors.
+
+import { Agent, type Dispatcher } from 'undici';
 
 const API_BASE = 'https://api.telegram.org';
+
+// Init accepted by Node's global fetch plus undici's non-standard `dispatcher`
+// (the @types/node fetch RequestInit already carries `dispatcher`, but we spell
+// the type out so it is explicit and survives lib changes).
+type FetchInit = RequestInit & { dispatcher?: Dispatcher };
+export type FetchLike = (input: string, init?: FetchInit) => Promise<Response>;
+
+// Tunables for the Telegram network path. Defaults are the robust path; the
+// connector wires these from config.ts (env-overridable) — see loadConfig().
+export interface TelegramNetOptions {
+  forceIpv4: boolean;       // pin resolution to the IPv4 A record (default true)
+  connectTimeoutMs: number; // fail a stalled connect fast instead of ~30s hang
+  retries: number;          // extra attempts for transactional calls on transient errors
+  retryBaseMs: number;      // base backoff; grows exponentially with jitter
+}
+
+export const DEFAULT_NET_OPTIONS: TelegramNetOptions = {
+  forceIpv4: true,
+  connectTimeoutMs: 10_000,
+  retries: 3,
+  retryBaseMs: 300,
+};
+
+// The undici `connect` options for the Telegram dispatcher. `family: 4` makes
+// getaddrinfo return only the IPv4 A record so the unreachable IPv6 is never
+// attempted; `autoSelectFamily: false` disables Happy Eyeballs entirely (belt +
+// suspenders); `timeout` bounds the TCP/TLS connect. When forceIpv4 is off we
+// leave family/Happy-Eyeballs at Node defaults and only bound the connect.
+export function telegramConnectOptions(opts: TelegramNetOptions): Record<string, unknown> {
+  if (opts.forceIpv4) {
+    return { family: 4, autoSelectFamily: false, timeout: opts.connectTimeoutMs };
+  }
+  return { timeout: opts.connectTimeoutMs };
+}
+
+// A dedicated dispatcher for one Telegram client. Scoped (not a global
+// dispatcher) so it can't affect the ADAPT SDK or STT calls. Keep-alive is
+// short so a socket to a flaky path is recycled rather than reused half-open.
+export function buildTelegramDispatcher(opts: TelegramNetOptions): Agent {
+  return new Agent({
+    connect: telegramConnectOptions(opts),
+    connectTimeout: opts.connectTimeoutMs,
+    keepAliveTimeout: 10_000,
+    keepAliveMaxTimeout: 30_000,
+    connections: 8,
+  });
+}
+
+// undici/Node transport error codes worth retrying (connection-level, not HTTP).
+const RETRIABLE_CODES = new Set([
+  'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH',
+  'EAI_AGAIN', 'EPIPE', 'ENOTFOUND',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED', 'UND_ERR_DESTROYED',
+]);
+
+// Whether a thrown fetch error is a transient transport failure worth retrying.
+// Node's global fetch wraps every transport failure as `TypeError: fetch failed`
+// with the real error on `.cause`; undici's own fetch throws coded errors. HTTP
+// status errors are never thrown by fetch (they come back as a Response), so a
+// 4xx/5xx is *not* retried here — the caller decides. A caller-driven
+// AbortError is never retried.
+export function isRetriableFetchError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: string; code?: string; message?: string; cause?: { code?: string } };
+  if (e.name === 'AbortError') return false;
+  if (e.name === 'AggregateError') return true; // Happy Eyeballs all-attempts-failed
+  if (e.name === 'TypeError' && /fetch failed/i.test(e.message ?? '')) return true;
+  const code = e.code ?? e.cause?.code;
+  return code !== undefined && RETRIABLE_CODES.has(code);
+}
+
+// Strip the bot token from a Telegram URL before it reaches a log line.
+function sanitizeUrl(url: string): string {
+  return url.replace(/\/bot[^/]+\//, '/bot***/');
+}
+
+// Call fetch with bounded retries + exponential backoff (jittered) on transient
+// transport errors. Returns the Response for the caller to inspect status; only
+// thrown network errors are retried, so an HTTP error is surfaced immediately.
+export async function fetchWithRetry(
+  fetchImpl: FetchLike,
+  input: string,
+  init: FetchInit,
+  opts: Pick<TelegramNetOptions, 'retries' | 'retryBaseMs'>,
+  log?: (msg: string) => void,
+): Promise<Response> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fetchImpl(input, init);
+    } catch (err) {
+      if (attempt >= opts.retries || !isRetriableFetchError(err)) throw err;
+      const delay = opts.retryBaseMs * 2 ** attempt + Math.floor(Math.random() * opts.retryBaseMs);
+      attempt += 1;
+      log?.(`${sanitizeUrl(input)} failed (${(err as Error).message}); retry ${attempt}/${opts.retries} in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+}
 
 // One supported piece of Telegram media, distilled from the raw update into a
 // transport-neutral descriptor (envelope.ts turns it into the `attachment`
@@ -200,20 +311,40 @@ export class TelegramClient {
   private offset = 0;
   private aborter: AbortController | null = null;
   private stopped = false;
+  private readonly net: TelegramNetOptions;
+  private readonly dispatcher: Agent;
+  private readonly fetchImpl: FetchLike;
 
   constructor(
     private readonly token: string,
     private readonly pollTimeoutSec: number,
     private readonly log: (msg: string) => void,
-  ) {}
+    net: Partial<TelegramNetOptions> = {},
+    // Injectable for tests; defaults to Node's global fetch.
+    fetchImpl: FetchLike = fetch as FetchLike,
+  ) {
+    this.net = { ...DEFAULT_NET_OPTIONS, ...net };
+    this.dispatcher = buildTelegramDispatcher(this.net);
+    this.fetchImpl = fetchImpl;
+  }
 
   private url(method: string): string {
     return `${API_BASE}/bot${this.token}/${method}`;
   }
 
+  // Every Telegram fetch goes through here so it uses the IPv4-forced dispatcher.
+  // Transactional calls set retry=true so a transient "fetch failed" is retried
+  // rather than dropping a message; the getUpdates long-poll passes retry=false
+  // (it runs its own backoff loop and owns the abort signal).
+  private tgFetch(url: string, init: FetchInit = {}, retry = true): Promise<Response> {
+    const withDispatcher: FetchInit = { ...init, dispatcher: this.dispatcher };
+    if (!retry) return this.fetchImpl(url, withDispatcher);
+    return fetchWithRetry(this.fetchImpl, url, withDispatcher, this.net, this.log);
+  }
+
   // Validate the token and return the bot's @username (throws on a bad token).
   async getMe(): Promise<{ id: number; username: string }> {
-    const resp = await fetch(this.url('getMe'));
+    const resp = await this.tgFetch(this.url('getMe'));
     const body = (await resp.json()) as { ok: boolean; result?: { id: number; username: string }; description?: string };
     if (!body.ok || !body.result) {
       throw new Error(`getMe failed: ${body.description ?? `HTTP ${resp.status}`}`);
@@ -228,7 +359,7 @@ export class TelegramClient {
     const thread = threadId === undefined || threadId === '' ? undefined : Number(threadId);
     // Telegram caps a single text message at 4096 chars; split conservatively.
     for (const chunk of chunkText(text, 4000)) {
-      const resp = await fetch(this.url('sendMessage'), {
+      const resp = await this.tgFetch(this.url('sendMessage'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text: chunk, ...(thread !== undefined ? { message_thread_id: thread } : {}) }),
@@ -260,7 +391,7 @@ export class TelegramClient {
     // ArrayBuffer-backed view and preserves the bytes exactly.
     const blob = new Blob([new Uint8Array(bytes)], mime ? { type: mime } : {});
     form.set('document', blob, filename);
-    const resp = await fetch(this.url('sendDocument'), { method: 'POST', body: form });
+    const resp = await this.tgFetch(this.url('sendDocument'), { method: 'POST', body: form });
     if (!resp.ok) {
       const body = await resp.text();
       throw new Error(`sendDocument failed (HTTP ${resp.status}): ${body}`);
@@ -270,7 +401,7 @@ export class TelegramClient {
   // Resolve a file_id to its temporary download path (and size, when Telegram
   // reports it). getFile is required before a media file can be fetched.
   async getFile(fileId: string): Promise<{ filePath: string; fileSize?: number }> {
-    const resp = await fetch(this.url('getFile'), {
+    const resp = await this.tgFetch(this.url('getFile'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ file_id: fileId }),
@@ -288,7 +419,7 @@ export class TelegramClient {
   // by the caller, not here.
   async downloadFile(fileId: string): Promise<Buffer> {
     const { filePath } = await this.getFile(fileId);
-    const resp = await fetch(`${API_BASE}/file/bot${this.token}/${filePath}`);
+    const resp = await this.tgFetch(`${API_BASE}/file/bot${this.token}/${filePath}`);
     if (!resp.ok) {
       throw new Error(`file download failed: HTTP ${resp.status}`);
     }
@@ -304,7 +435,7 @@ export class TelegramClient {
       this.aborter = new AbortController();
       const timer = setTimeout(() => this.aborter?.abort(), (this.pollTimeoutSec + 10) * 1000);
       try {
-        const resp = await fetch(this.url('getUpdates'), {
+        const resp = await this.tgFetch(this.url('getUpdates'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -313,7 +444,7 @@ export class TelegramClient {
             allowed_updates: ['message'],
           }),
           signal: this.aborter.signal,
-        });
+        }, false);
         clearTimeout(timer);
         if (!resp.ok) {
           this.log(`getUpdates HTTP ${resp.status}; backing off`);

@@ -80,6 +80,14 @@ import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatC
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
 
+// Telegram network hardening, shared by every TelegramClient (see src/telegram.ts).
+const TG_NET = {
+  forceIpv4: CONFIG.tgForceIpv4,
+  connectTimeoutMs: CONFIG.tgConnectTimeoutMs,
+  retries: CONFIG.tgFetchRetries,
+  retryBaseMs: CONFIG.tgFetchRetryBaseMs,
+};
+
 const log = (...parts: unknown[]) => process.stderr.write(`ours-tg: ${parts.join(' ')}\n`);
 
 // Route names double as on-disk directory names and peer-visible display names,
@@ -302,7 +310,7 @@ function saveBotRegistry(): void {
 // Build the runtime Bot (one TelegramClient) and index it by name. Does NOT poll —
 // activateBot starts the loop once the bot has a route.
 function instantiateBot(rec: BotFile): Bot {
-  const tg = new TelegramClient(rec.token, CONFIG.pollTimeoutSec, (m) => log(`[bot ${rec.name}] tg: ${m}`));
+  const tg = new TelegramClient(rec.token, CONFIG.pollTimeoutSec, (m) => log(`[bot ${rec.name}] tg: ${m}`), TG_NET);
   const bot: Bot = { name: rec.name, token: rec.token, tg, username: rec.username, createdAt: rec.createdAt, exact: new Map(), catchAll: null, pollHandle: null };
   bots.set(rec.name, bot);
   return bot;
@@ -314,7 +322,7 @@ function instantiateBot(rec: BotFile): Bot {
 async function addBot(name: string, token: string): Promise<{ name: string; username: string }> {
   if (bots.has(name)) throw new Error(`a bot named "${name}" already exists`);
   for (const b of bots.values()) if (b.token === token) throw new Error(`that token is already registered as bot "${b.name}"`);
-  const tg = new TelegramClient(token, CONFIG.pollTimeoutSec, (m) => log(`[bot ${name}] tg: ${m}`));
+  const tg = new TelegramClient(token, CONFIG.pollTimeoutSec, (m) => log(`[bot ${name}] tg: ${m}`), TG_NET);
   const me = await tg.getMe(); // throws on a bad token — nothing persisted yet
   const bot: Bot = { name, token, tg, username: me.username, createdAt: new Date().toISOString(), exact: new Map(), catchAll: null, pollHandle: null };
   bots.set(name, bot);

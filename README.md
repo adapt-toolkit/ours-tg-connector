@@ -314,6 +314,10 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | control port   | `OURS_TG_CONTROL_PORT` | `3051` (localhost only)                         |
 | state dir      | `OURS_TG_STATE_DIR`    | `~/.ours-telegram`                            |
 | poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
+| force IPv4     | `OURS_TG_FORCE_IPV4`   | `true` (pin Telegram requests to the IPv4 A record via a dedicated undici dispatcher — avoids the intermittent `fetch failed` when IPv6 is configured but unreachable; set `0`/`false` to restore Node default resolution) |
+| connect timeout | `OURS_TG_CONNECT_TIMEOUT_MS` | `10000` (bound a stalled TCP/TLS connect so a bad address fails fast, not after ~30s) |
+| fetch retries  | `OURS_TG_FETCH_RETRIES` | `3` (transient-error retries for transactional calls — `sendMessage`/`sendDocument`/`getFile`/download — so one `fetch failed` doesn't drop a message; `getUpdates` runs its own backoff) |
+| retry backoff  | `OURS_TG_FETCH_RETRY_BASE_MS` | `300` (base delay between those retries; grows exponentially with jitter) |
 | attachment cap | `OURS_TG_ATTACHMENT_MAX_BYTES` | `10485760` (10 MB; larger inbound media forwarded as a metadata-only stub) |
 | outbound file cap | `OURS_TG_OUTBOUND_FILE_MAX_BYTES` | `52428800` (50 MB; a larger file from a contact is skipped + logged — Telegram's `sendDocument` limit) |
 | STT enabled    | `OURS_TG_STT_ENABLED`     | `false` (master switch for voice transcription; off ⇒ byte-identical to today) |
