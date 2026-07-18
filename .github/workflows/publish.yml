@@ -9,11 +9,17 @@ name: CI
 #     GitHub App (must be installed on this repo) so the bump commit can push
 #     past branch protection.
 
+# Two mutually-exclusive release channels (mirrors ours-mcp):
+#   main       → stable: Conventional-Commits semver bump, committed, published @latest.
+#   prerelease → nightly: EPHEMERAL <patch-bump>-nightly.N version (never committed),
+#                published to the npm `nightly` tag ONLY. By semver every X.Y.Z-nightly.N
+#                sorts BELOW the clean X.Y.Z, and the fail-closed publish guard hardcodes
+#                --tag nightly — so a nightly can NEVER move @latest.
 on:
   push:
-    branches: [main]
+    branches: [main, prerelease]
   pull_request:
-    branches: [main]
+    branches: [main, prerelease]
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref so a burst of pushes doesn't queue a
@@ -101,7 +107,47 @@ jobs:
       - name: Compile MUFL packet (repos with mufl sources only)
         run: if [ -x scripts/compile-mufl.sh ]; then scripts/compile-mufl.sh; fi
       - run: npm run build
+      # FAIL-CLOSED before the stable publish: asserts we are on main and the version is a
+      # clean X.Y.Z (no pre-release suffix). A nightly build can never reach this job
+      # (branch-gated), and if one somehow did, the guard refuses to publish to @latest.
+      - name: Fail-closed stable guard (branch=main, clean version, @latest)
+        run: bash .github/workflows/scripts/publish-guard.sh stable package.json latest
       - name: Publish @ours.network/tg-connector
         run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # NIGHTLY channel — prerelease branch ONLY. Every push to `prerelease` that
+  # passes gates computes an EPHEMERAL <patch-bump>-nightly.N version in the
+  # working tree (never committed), then publishes it to the npm `nightly` tag
+  # via publish-nightly.sh (which hardcodes --tag nightly + runs the fail-closed
+  # guard in-process). Branch-exclusive with the stable path above, so a nightly
+  # can never touch @latest.
+  nightly-publish:
+    needs: gates
+    if: github.event_name == 'push' && github.ref == 'refs/heads/prerelease'
+    runs-on: ubuntu-latest
+    name: Publish nightly to npm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Compute ephemeral -nightly.N version (working tree only, not committed)
+        run: bash .github/workflows/scripts/bump-nightly.sh
+      - name: Compile MUFL packet (migration core)
+        run: if [ -x scripts/compile-mufl.sh ]; then scripts/compile-mufl.sh; fi
+      - run: npm run build
+      # publish-nightly.sh runs the fail-closed guard then `npm publish --tag nightly`
+      # atomically — there is no path from here to @latest.
+      - name: Publish nightly (guard + --tag nightly, hardcoded)
+        run: bash .github/workflows/scripts/publish-nightly.sh
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
