@@ -1,0 +1,7 @@
+=== INTEROP MATRIX (all over wss://broker1.ours.network, all units run under connector SDK @adapt-toolkit 0.10.7) ===
+connector(d152aa8b) <-> connector(d152aa8b) : DR OK  (route e2e both ways, migration_active, delivered) [S2]
+mcp.7(51BC8D01)      <-> mcp.7(51BC8D01)      : DR OK  (route e2e both ways, e2e_app_send/recv, delivered)
+connector(d152aa8b) <-> mcp.7(51BC8D01)       : BROKEN (pre-route downgrade_refused; migrating stuck; SAFE cast to record failed value is not a dictionary; 0 migration_active, 0 delivered)
+connector(d152aa8b) <-> mcp.4(AF0D689C)       : BROKEN (same downgrade_refused + SAFE-cast x25)
+mcp nightly units: .4=AF0D689C  .6=.7=51BC8D01
+Introduction (pairing) SUCCEEDS connector<->mcp (AD-v2 compatible); the break is in e2e_bundle parse / migration handshake => AD-bundle or migration-wire shape differs between connector core d152aa8b and published mcp nightly cores.

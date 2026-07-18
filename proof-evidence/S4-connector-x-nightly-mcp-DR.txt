@@ -1,0 +1,8 @@
+Connector unit=BD0FABB92203  Agent(mcp.7) unit=51BC8D01F5A9
+paired = true
+pre-migration route Connector->Agent = downgrade_refused
+=== RESULT ===
+route Connector->Agent = downgrade_refused  Agent->Connector = migrating (expect e2e/e2e)
+migration_active: []
+e2e_app_send: 0  e2e_app_recv(ok): 0
+delivered: Connector got 0  Agent got 0

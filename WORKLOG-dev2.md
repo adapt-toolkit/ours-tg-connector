@@ -61,3 +61,12 @@ A. actor.mu: add $advertise + describe caps. B. connector.ts: migrationSweep + n
   - OUTSTANDING: case 2 mixed with a GENUINELY-old (no-DR-core, no bundle) peer — my OLD unit 7518511B carries the DR core so it triggers the asymmetry edge instead of a clean box. Requested an old @ours.network/mcp from FC to capture the clean mixed-box envelope. Structurally guaranteed regardless.
 
 ## Status: DONE (case 3a/3b live-proven) pending FC review + old-mcp for the mixed-box envelope. Branch NOT pushed/merged (FC opens PR; republish owner-gated).
+
+## 2026-07-18 late — INTEROP FINDING (flagged to FC, blocker-level for real deploy)
+- Installed real published @ours.network/mcp nightlies to test case-2 old-peer + real owner topology.
+- nightly.2/.3 = stable-0.11.2 packet (AD-v1) → "Invalid address document version" intro break with AD-v2 DR connector (known 0.11↔0.12 boundary, separate issue).
+- nightly.4/.6/.7 = AD-v2 + migration. mcp.7↔mcp.7 = DR OK via BORN-DR (migration_active=0, route e2e) — published mcp core HAS born-DR that connector core d152aa8b lacks.
+- connector(d152aa8b) ↔ mcp .4/.6/.7 = BROKEN: intro ok, but downgrade_refused (connector can't parse mcp $e2e_bundle → SAFE cast to record failed) + migrating stuck, 0 delivered. Under identical SDK, connector↔connector + mcp↔mcp both work → genuine CORE AD-bundle skew. Connector's pinned d152aa8b is OLDER/incompatible with published mcp nightly cores.
+- Evidence: proof-evidence/INTEROP-MATRIX.txt, S4-connector-x-mcp7-BROKEN.err.txt.
+- Sent FC the finding + questions: (1) deployed agent's exact core? (2) re-pin connector submodule to the deployed/published core (Dev-10/core owner)? Offered to re-pin+rebuild+re-prove connector↔agent once target core known.
+- STATE: host/manifest gap fix DONE + proven for connector's core (S2/S3). BLOCKED on core-version confirmation for connector↔real-agent DR proof. Awaiting FC.

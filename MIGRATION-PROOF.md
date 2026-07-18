@@ -88,7 +88,37 @@ enable migrate (the runtime analog of upgrading + restarting on the NEW build):
    advertise together, and my connector change advertises. A genuinely-old peer (no
    DR core, no `$e2e_bundle`) boxes cleanly both ways with no asymmetry.
 
+## ⚠️ INTEROP FINDING — connector core d152aa8b vs the PUBLISHED mcp nightlies (BLOCKER-level for real deploy)
+Tested my connector against the actual published `@ours.network/mcp` nightlies over
+broker1 (all units run under the connector SDK @adapt-toolkit 0.10.7). Matrix
+(`proof-evidence/INTEROP-MATRIX.txt`, `S4-connector-x-mcp7-BROKEN.err.txt`):
+- connector(d152aa8b) ↔ connector(d152aa8b): **DR OK** (via migration FSM).
+- mcp 0.12.0-nightly.7 ↔ nightly.7: **DR OK** — but `migration_active=0`, i.e. via
+  **born-DR** (DR from msg#1). So the PUBLISHED mcp core has born-DR (what the owner
+  asked for) that the connector's pinned core d152aa8b lacks → d152aa8b is OLDER.
+- connector(d152aa8b) ↔ mcp nightly **.4 / .6 / .7**: **BROKEN.** Introduction
+  succeeds (AD-v2), but migration never completes: connector→agent pre-route =
+  `downgrade_refused` (connector has `e2e_pinned(agent)` but CANNOT parse the agent's
+  `$e2e_bundle` → `SAFE cast to record failed: value is not a dictionary`),
+  agent→connector stuck `migrating`. 0 delivered.
+
+Because connector↔connector AND mcp↔mcp both work under the identical SDK, this is a
+genuine CORE-level AD-bundle/wire incompatibility — the connector's pinned core
+`d152aa8b` (Dev-9's reconstruction of the deployed mcp's uncommitted working tree,
+WORKLOG 527/544) is OLDER than and incompatible with the published mcp nightly cores.
+
+**Consequence:** the host/manifest gap fix is correct and proven FOR the connector's
+core, but if the owner's deployed AGENT runs a published/current nightly core, the
+connector will NOT do DR with it. Resolution (core-release coordination, Dev-10/core
+owner): confirm the deployed agent's exact core, re-pin the connector submodule to
+that core, rebuild, and re-run the connector↔agent live proof. Flagged to FC.
+
 ## Still to verify against a genuinely-old daemon (case 2 mixed)
+NOTE: the case-2 "genuinely-old" test also surfaced the AD-version boundary — mcp
+0.12.0-nightly.2/.3 ship the stable-0.11.2 packet (AD-v1) and fail to introduce with
+the AD-v2 DR connector ("Invalid address document version"). That is the known
+0.11↔0.12 back-compat boundary (a separate issue from this migration gap), not a
+connector bug.
 The mixed old↔new = legacy-box envelope is structurally guaranteed for a genuinely
 pre-DR peer (no `$e2e_bundle` → `e2e_route`=legacy → box; the old peer has no e2e
 crypto → boxes). I did not have a genuinely-old (no-DR-core) unit on hand — my "OLD"
