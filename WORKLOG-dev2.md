@@ -50,4 +50,14 @@ A. actor.mu: add $advertise + describe caps. B. connector.ts: migrationSweep + n
 - [done] TASK B (host): connector.ts — migrationSweep (boot + GC) via sweep_e2e_migrations; 6 migration notify handlers (incl. security downgrade_refused surface) + binHexField helper.
 - [done] TEST: tests/migration.test.mjs — in-process 2-packet. PROVES Task A (manifest advertises both caps) + migration→DR (route="e2e" both dirs; migration_active + e2e_app_send notifies fire). FULL npm test GREEN (5 files). typecheck+build GREEN.
 - [done] committed 1f2c962 (feat: close DR migration host+manifest gap). .muflo gitignored.
-- [NEXT] TASK C — LIVE cross-version 2-daemon proof vs wss://broker1.ours.network: capture envelope box-vs-DR for cases 1/2/3a/3b. Need an OLD (pre-DR) mcp daemon + a NEW connector/DR-mcp daemon, 2 separate processes.
+- [done] TASK C — LIVE 2-daemon proof over wss://broker1.ours.network. Findings:
+  - Native wrapper is a per-PROCESS singleton → cross-version needs 2 separate processes. Built harness: proof-evidence/{worker,coordinator,reconnect}.mjs (JSON-lines worker per daemon).
+  - Broker connectivity confirmed (DEBUG: ws open + b2w_reg_ok). AdaptHost --test_mode still connects to real broker (mcp daemon uses it too).
+  - Gotcha fixed: list_contacts is a MAP (GetKeys), not numeric-indexed → my first worker parse bug made pairing look broken.
+  - **CASE 3 both-new = DR: PROVEN** (proof-evidence/S2-both-new-DR.txt). route e2e both ways; matching epoch 002ed877.. + session_id 95fb2bc4.. (initiator+responder); e2e_app_send/recv olm_type=1 ok=TRUE; real content delivered over ratchet.
+  - **CASE 3a existing legacy contact = box→DR on RECONNECT: PROVEN** (proof-evidence/S3-existing-contact-reconnect-DR.txt). advertise alone (ordinary traffic) does NOT trigger (caps not refreshed); a reconnect/re-pair refreshes caps → migration fires → route flips box→e2e. Matches Dev-9 flag (WORKLOG 519/523).
+  - Deployed nightly mcp (0.10.3 + prerelease) advertises EXACTLY [cap_e2e, cap_e2e_migrate] == my connector → real owner topology is symmetric → works.
+  - Full writeup + deploy runbook + core-level findings (born-DR gate; existing-contact reconnect; asymmetry edge) = MIGRATION-PROOF.md.
+  - OUTSTANDING: case 2 mixed with a GENUINELY-old (no-DR-core, no bundle) peer — my OLD unit 7518511B carries the DR core so it triggers the asymmetry edge instead of a clean box. Requested an old @ours.network/mcp from FC to capture the clean mixed-box envelope. Structurally guaranteed regardless.
+
+## Status: DONE (case 3a/3b live-proven) pending FC review + old-mcp for the mixed-box envelope. Branch NOT pushed/merged (FC opens PR; republish owner-gated).

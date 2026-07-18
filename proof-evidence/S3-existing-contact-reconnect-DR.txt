@@ -1,0 +1,6 @@
+paired. pre-route A->B = box
+after advertise (no reconnect), driving sweep 6 rounds...
+route after advertise+sweep (ordinary traffic) = box (expect box — caps not refreshed)
+RE-PAIRING (fresh invite exchange to refresh caps)...
+route after RE-PAIR+sweep = e2e (expect e2e if reconnect refreshes caps)
+migration_active: 2 e2e_app_send: 1

@@ -1,0 +1,75 @@
+
+===== S2 — Case 3 (both NEW): auto-migrate to DOUBLE RATCHET =====
+  A(new) unit=BD0FABB92203 cid=7B15F0CD4303
+  B(new) unit=BD0FABB92203 cid=CF3F209EED69
+  route A->B=e2e  B->A=e2e  (expect e2e/e2e)
+  migration_active: 2, e2e_app_send: 2, e2e_app_recv: 2
+  delivered over DR: B got 1, A got 1
+
+===== EVIDENCE (JSON) =====
+{
+  "S2_case3_both_new": {
+    "route_a_to_b": "e2e",
+    "route_b_to_a": "e2e",
+    "b_received": [
+      {
+        "text": "probe-0",
+        "sender": "A_new"
+      }
+    ],
+    "a_received": [
+      {
+        "text": "dr-back",
+        "sender": "B_new"
+      }
+    ],
+    "migration_active": [
+      {
+        "event": "migration_active",
+        "cid": "CF3F209EED69EBC1A8C2E4A8F3821CAAF290AFF39A1EF425C8D5B2DC2752760A",
+        "role": "initiator",
+        "epoch": "83379bca4a69c09a9bcdac88f086a4f4a78f0ec8f147b20a99f8244fd169f203",
+        "session_id": "1c246b604d9e9afcd8544dd0134c8d6da29c6f05bc47bece8c2d0e4b6b1c230b"
+      },
+      {
+        "event": "migration_active",
+        "cid": "7B15F0CD43035D6BE3DEFEEB0AF1153D95589997D47D6A8386432485E549C37A",
+        "role": "responder",
+        "epoch": "83379bca4a69c09a9bcdac88f086a4f4a78f0ec8f147b20a99f8244fd169f203",
+        "session_id": "1c246b604d9e9afcd8544dd0134c8d6da29c6f05bc47bece8c2d0e4b6b1c230b"
+      }
+    ],
+    "e2e_app_send": [
+      {
+        "event": "e2e_app_send",
+        "cid": "CF3F209EED69EBC1A8C2E4A8F3821CAAF290AFF39A1EF425C8D5B2DC2752760A",
+        "session_id": "1c246b604d9e9afcd8544dd0134c8d6da29c6f05bc47bece8c2d0e4b6b1c230b",
+        "olm_type": "1",
+        "wire_id": "F4D5BAA1342628E4BD1D8B642EE388C3D864FFADCCDECD3D26F5E9E2A50DFA6A"
+      },
+      {
+        "event": "e2e_app_send",
+        "cid": "7B15F0CD43035D6BE3DEFEEB0AF1153D95589997D47D6A8386432485E549C37A",
+        "session_id": "1c246b604d9e9afcd8544dd0134c8d6da29c6f05bc47bece8c2d0e4b6b1c230b",
+        "olm_type": "1",
+        "wire_id": "90263081AE9DF15CB3578C711DD5D76A170E0A16454492F13793580A6C90EFC5"
+      }
+    ],
+    "e2e_app_recv": [
+      {
+        "event": "e2e_app_recv",
+        "cid": "CF3F209EED69EBC1A8C2E4A8F3821CAAF290AFF39A1EF425C8D5B2DC2752760A",
+        "session_id": "1c246b604d9e9afcd8544dd0134c8d6da29c6f05bc47bece8c2d0e4b6b1c230b",
+        "wire_id": "90263081AE9DF15CB3578C711DD5D76A170E0A16454492F13793580A6C90EFC5",
+        "ok": "%%TRUE"
+      },
+      {
+        "event": "e2e_app_recv",
+        "cid": "7B15F0CD43035D6BE3DEFEEB0AF1153D95589997D47D6A8386432485E549C37A",
+        "session_id": "1c246b604d9e9afcd8544dd0134c8d6da29c6f05bc47bece8c2d0e4b6b1c230b",
+        "wire_id": "F4D5BAA1342628E4BD1D8B642EE388C3D864FFADCCDECD3D26F5E9E2A50DFA6A",
+        "ok": "%%TRUE"
+      }
+    ]
+  }
+}
