@@ -497,6 +497,25 @@ application actor loads libraries
                     $secrets -> (,)
                 ).
             }
+            // core 0.8.0/0.9.0 — end-to-end double-ratchet + its migration FSM. The
+            // connector runs the DR-routing core unconditionally, so it always speaks
+            // the e2e_signed_message envelope (core.e2e) and participates in the
+            // per-connection migration handshake (core.e2e.migrate). Advertised here so
+            // a controller's get_manifest / self_supports sees them; the peer-facing
+            // auto-migration trigger is driven by the $advertise wire piggyback below
+            // (self_advertises reads init's $advertise, not this describe() map).
+            caps a2a_capabilities::cap_e2e -> (
+                $cap     -> a2a_capabilities::cap_e2e,
+                $version -> 1,
+                $params  -> "",
+                $secrets -> (,)
+            ).
+            caps a2a_capabilities::cap_e2e_migrate -> (
+                $cap     -> a2a_capabilities::cap_e2e_migrate,
+                $version -> 1,
+                $params  -> "",
+                $secrets -> (,)
+            ).
             return (
                 $version           -> 1,
                 $app_id            -> "network.ours.telegram-connector",
@@ -515,6 +534,14 @@ application actor loads libraries
         a2a_capabilities::init (
             $describe   -> build_manifest,
             $supported  -> [],
+            // $advertise (core 0.9.0): PROTOCOL-surface capability ids carried on the
+            // wire piggyback ($caps in invite/restore/migration legs) -> self_caps, so
+            // self_advertises(cap_e2e_migrate)=TRUE (which gates mig_should_trigger) AND
+            // peers LEARN these into contact_caps. This — not the $describe manifest — is
+            // what makes an existing contact auto-migrate to the double ratchet once both
+            // sides advertise (§5.4). No handler needed (unlike $supported): these ids
+            // gate traffic shaping only and never route through dispatch.
+            $advertise  -> [ a2a_capabilities::cap_e2e, a2a_capabilities::cap_e2e_migrate ],
             $handlers   -> (,),
             $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. }
         ).
