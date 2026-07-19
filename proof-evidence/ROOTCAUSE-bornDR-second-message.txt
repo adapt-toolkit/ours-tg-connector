@@ -1,0 +1,39 @@
+ROOT CAUSE — born-DR: only the FIRST message per direction is delivered until the peer replies
+(2nd+ messages, text OR file, are silently dropped). Owner's voice path sends file+text => 2nd lost.
+
+LOCATION: @adapt-toolkit/mufl/mufl_stdlib/cryptography/e2e.mm  fn decrypt_and_commit  lines 406-414
+  (the mufl e2e stdlib that wraps the adapt-e2e-core crate; shipped in @adapt-toolkit/mufl 0.10.7,
+   used by BOTH the connector and the mcp agent — NOT ours-mufl-core, NOT connector-specific).
+
+MECHANISM (Olm pre-key phase):
+- Until the recipient REPLIES, every message the sender sends carries the pre-key preamble => olm_type=0.
+  (v1 bundles publish a MULTI-USE fallback key + empty OTK list, so this persists across messages.)
+- On receive, decrypt_and_commit (olm_type==0) runs the pre-key REPLAY guard:
+      if existing != NIL && session_matches(existing, ciphertext) { return replayed(). }   // L413-414
+- session_matches / _e2e_matches_inbound returns TRUE for ANY pre-key on the SAME outbound session
+  (same identity+ephemeral+fallback) — which is EVERY genuine message in the pre-reply phase, not just
+  a re-sent handshake. So the 2nd, 3rd, ... genuine message is treated as an idempotent handshake
+  replay and DROPPED (surfaces as e2e_app_recv ok=FALSE, get_messages/get_files empty).
+- The author's intent (comment L408-411) only anticipated (a) a replayed handshake [matches] vs
+  (b) a NEW handshake with a different ephemeral [doesn't match]. It MISSED (c) a genuine NEW MESSAGE
+  on the same not-yet-bidirectional session, which also matches.
+
+LIVE EVIDENCE (proof-evidence/): connector<->connector, connector<->nightly.7, AND
+mcp-nightly.7<->mcp-nightly.7 all reproduce. Instrumented run: C->G file => send olm_type=0 (pre-key),
+G emits e2e_app_recv ok=FALSE, get_files=[]; a 2nd C->G TEXT after it ALSO fails (get_messages=[]).
+Single message per direction works (why earlier proofs + voice DoD1/2 passed). Over the OLD box path
+(pre-DR) all messages delivered — this is born-DR-only.
+
+FIX DIRECTION (in e2e.mm decrypt_and_commit, coordinate with the adapt-e2e-core owner):
+A pre-key that matches the LIVE session must be DECRYPTED on that session (advancing its ratchet),
+NOT unconditionally dropped as a replay. Only a TRUE replay (an already-consumed message index) should
+drop. Options:
+  (1) For olm_type==0 matching `existing`, decrypt the message on the existing session and treat a
+      crate-reported already-seen-index as the replay (deliver otherwise). Needs a crate primitive to
+      decrypt a pre-key message on an existing session (or _e2e_decrypt(existing,0,ct) semantics), OR
+  (2) In adapt-e2e-core, have the inbound session's decrypt distinguish replay (seen index) from a new
+      pre-key message at a higher index and advance accordingly.
+Dev-9 authored adapt-e2e-core (the C-ABI crypto crate) — likely the right implementer for the crate
+side; the e2e.mm change is in @adapt-toolkit/mufl. This is a shipped-core / SDK fix (owner-gated),
+NOT the connector's migration gap. Testable locally by editing node_modules e2e.mm + recompiling the
+connector + re-running the 2-message file/text proof.
