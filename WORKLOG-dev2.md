@@ -111,3 +111,8 @@ VERIFY A FIX locally without the toolkit repo: edit that node_modules e2e.mm (or
   AND a true replay (re-send identical ciphertext) to still drop (no double-deliver). RAM is tight on this
   box — kill leftover workers with: for p in $(ps -eo pid,cmd|grep "[w]orker.mjs"|awk '{print $1}');do kill -9 $p;done
 STATE: standing by idle per FC; monitor armed; ready to re-run the multi-message proof once the fix lands.
+
+## 2026-07-19 — born-DR fix COMPLETED (Dev-9's design) + VERIFIED
+- Dev-9 (pre-/clear) had already: patched node_modules e2e.mm (helper decrypt_prekey_on_existing + guard(a) → decrypt-on-existing), recompiled connector (unit 59397EC3), wrote crate test. I completed + VERIFIED.
+- VERIFY GREEN: filediag.mjs → C→G 2nd file DELIVERS (get_files=[a.ogg], e2e_app_recv ok=%%TRUE, file_received) + 2nd C→G text DELIVERS. filetest-cc.mjs → files deliver BOTH directions. adapt-e2e-core crate test prekey_phase_decrypts_on_existing_session_and_rejects_true_replay PASSES (true replay still rejected → no double-deliver). Evidence: proof-evidence/S6-*.txt + e2e.mm-bornDR-fix.patch.
+- SOURCE COMMIT COMPLICATION (flagged to FC): adapt source e2e.mm = /home/fleet/ours.network/adapt/mufl_stdlib/cryptography/e2e.mm is a SHARED, DIRTY tree on Dev-10's branch (dev10/adapt-e2e-core-integration; other uncommitted M's incl. e2e.mm/address_document_types/transaction). Did NOT commit into it (isolation). Fix saved as proof-evidence/e2e.mm-bornDR-fix.patch. Crate test uncommitted on adapt-e2e-core:crate-bootstrap (Dev-9's). Awaiting FC steer on which repo/branch + isolated-worktree for the source commits.

@@ -1,0 +1,7 @@
+--- C->G FILE ---
+send route= e2e
+G get_files: [{"filename":"a.ogg","len":12}]
+G notifies after C->G file: [{"event":"file_received"},{"event":"e2e_app_recv","cid":"FED7AE802145DBC1CF4448EFA5077A0B3A1166C1DBECEC1197C6E05266AFBD0B","session_id":"fafc5ba04d2d0396e8721913bb19a1a8115bcf78d80ca82135cfa25edfe89b50","wire_id":"EB205DEC7070762375C1417D9E9695014533A3E48E72BC222CF157BD11241C72","ok":"%%TRUE"}]
+C notifies (send side): [{"event":"e2e_app_send","cid":"D8EDC4F596108EF5BD2B514C8AE257E05B7C1C0334130FFBEF252CE61E9BCD5D","session_id":"fafc5ba04d2d0396e8721913bb19a1a8115bcf78d80ca82135cfa25edfe89b50","olm_type":"0","wire_id":"EB205DEC7070762375C1417D9E9695014533A3E48E72BC222CF157BD11241C72"}]
+--- now a 2nd C->G MESSAGE (does text still work after the file?) ---
+2nd msg route= e2e  G drained: [{"text":"after-file","sender":"C"}]

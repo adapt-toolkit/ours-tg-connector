@@ -1,0 +1,51 @@
+--- /home/fleet/ours.network/adapt/mufl_stdlib/cryptography/e2e.mm	2026-07-15 19:52:51.946720573 +0000
++++ /home/fleet/work/dev2-migration-gap/node_modules/@adapt-toolkit/mufl/mufl_stdlib/cryptography/e2e.mm	2026-07-19 00:42:27.710224111 +0000
+@@ -394,6 +394,25 @@
+         return session_id (s as bin).
+     }
+ 
++    // Decrypt an olm_type=0 (pre-key) message ON the EXISTING session it matches — the
++    // born-DR pre-key phase, where the sender keeps prefixing the pre-key until the peer
++    // replies, so genuine 2nd+ messages are pre-keys on the live session. Decrypts on the
++    // given session (advancing its ratchet); a TRUE replay (already-consumed index)
++    // provisional-aborts in the crate -> $ok FALSE. DISTINCT from `decrypt` olm_type=0,
++    // which ESTABLISHES a fresh inbound session (first contact / self-heal) — this one
++    // never re-establishes, so it cannot double-deliver or reset the ratchet.
++    fn decrypt_prekey_on_existing (session: bin, ciphertext: bin) -> e2e_result
++    {
++        WHEN provisional abort err
++        {
++            r = _e2e_decrypt session 0 ciphertext (pickle_key()).
++            return ( $ok -> TRUE, $plaintext -> r $plaintext, $session -> r $session,
++                     $account -> NIL, $error -> NIL ).
++        }
++        return ( $ok -> FALSE, $plaintext -> NIL, $session -> NIL, $account -> NIL,
++                 $error -> (map_error err) ).
++    }
++
+     // RECEIVE: decrypt an inbound envelope for a known sender and COMMIT the advanced session
+     // (and, on the establish path only, the rotated account). Returns the typed e2e_result.
+     // The caller (the __t_wrapper decode hook) authenticates $emsignature FIRST and supplies
+@@ -409,9 +428,20 @@
+             // list), so a replayed olm_type=0 pre-key would re-establish successfully — re-running
+             // the inner tx AND overwriting the (possibly advanced) session. session_matches is a
+             // pure read; a genuine NEW handshake (different ephemeral) does not match.
+-            //  (a) matches the LIVE session — idempotent re-delivery, drop recoverably.
++            //  (a) matches the LIVE session. This is the born-DR pre-key phase: until the
++            //      peer REPLIES, the sender keeps prefixing the pre-key preamble, so the
++            //      2nd, 3rd, ... GENUINE message is an olm_type=0 pre-key on the SAME live
++            //      session (session_matches TRUE). DECRYPT it on the existing session
++            //      (advancing the ratchet) instead of dropping it as a replay. A TRUE replay
++            //      (an already-consumed message index) fails the crate decrypt — vodozemac
++            //      tracks the index — surfacing $ok=FALSE, which we drop recoverably as
++            //      "replayed", so genuine replays still cannot double-deliver.
+             if existing != NIL && (session_matches (existing as bin) ciphertext)
+-            { return replayed(). }
++            {
++                rd = decrypt_prekey_on_existing (existing as bin) ciphertext.
++                if rd $ok { m_sessions from_cid -> (rd $session) as bin.  return rd. }
++                return replayed().
++            }
+             //  (b) matches the STAGED session — a redelivered migration COMMIT after we already
+             //      staged it (the lost-confirm case, spec §5.5). The wrapper turns this typed
+             //      error into a re-confirm via core mig_handle_replayed_commit; NO inner
