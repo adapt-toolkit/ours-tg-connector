@@ -90,6 +90,13 @@ const TG_NET = {
 
 const log = (...parts: unknown[]) => process.stderr.write(`ours-tg: ${parts.join(' ')}\n`);
 
+// Render a `bin` field of a notify payload as lowercase hex ('' when absent) — for
+// the e2e migration proof lines (epoch / session_id arrive as binary).
+function binHexField(av: AdaptValue, field: string): string {
+  const x = av.Reduce(field);
+  return x.IsNil() ? '' : Buffer.from(x.GetBinary()).toString('hex');
+}
+
 // Route names double as on-disk directory names and peer-visible display names,
 // so keep them simple and path-safe.
 const NAME_RE = /^[A-Za-z0-9 _.-]{1,64}$/;
@@ -277,6 +284,63 @@ async function contactRestoreSweep(pkt: Packet): Promise<void> {
     }
   } catch (err) {
     log(`[${pkt.name}] contact-restore sweep failed:`, String(err));
+  }
+}
+
+// Boot + periodic e2e migration reconciler (core 0.9.0 §5.6). Re-drives any
+// in-flight migration handshake AND proactively OFFERS to every already-e2e
+// contact that both sides can now migrate (mig_should_trigger). This is the path
+// that makes case-3a — existing contacts auto-migrate to the double ratchet —
+// fire IMMEDIATELY, even for an idle contact with no inbound traffic (the receive
+// triggers need traffic; advertise_migrate is the runtime staged-enable). Inert +
+// idempotent + fail-closed IN CORE: sweep_e2e_migrations does nothing until this
+// node advertises core.e2e.migrate (the actor manifest $advertise) and never
+// re-offers an in-flight or already-migrated pair, so it is safe on every boot and
+// GC tick. Peer-facing sends ride the legacy encrypted channel (the migration
+// carve-out), so the packet must already be registered on the broker when called.
+async function migrationSweep(pkt: Packet): Promise<void> {
+  try {
+    const { initiated, redriven, superseded, stalled } = await withScopeAsync(async (lt) => {
+      const r = await pkt.mutatingTx('::a2a_messaging::sweep_e2e_migrations', {}, lt);
+      return {
+        initiated: Number(r.Reduce('initiated').Visualize()),
+        redriven: Number(r.Reduce('redriven').Visualize()),
+        superseded: Number(r.Reduce('superseded').Visualize()),
+        stalled: Number(r.Reduce('stalled').Visualize()),
+      };
+    });
+    if (initiated + redriven + superseded + stalled > 0) {
+      log(`[${pkt.name}] e2e migration sweep: ${initiated} offered, ${redriven} re-driven, ${superseded} superseded, ${stalled} stalled`);
+    }
+  } catch (err) {
+    log(`[${pkt.name}] e2e migration sweep failed:`, String(err));
+  }
+}
+
+// Boot/upgrade RE-ADVERTISE (DAEMON CONTRACT, core 0.10 B1) — mirrors the mcp host.
+// Pushes this route's fresh v2 AD (+ caps piggyback) to every PRE-EXISTING LEGACY
+// contact over the legacy channel. A v2 peer ingests it (handle_readvertise_ad →
+// learns our caps/pv, refreshes its stored AD) and offers migration back; a still-v1
+// peer ignores it. This is the ONLY bootstrap for a stable-era contact whose stored
+// peer AD predates DR — without it neither migrationSweep nor advertise_migrate can
+// find it eligible (they only offer to already-known-0.9 peers), so an existing
+// contact would never auto-migrate after both sides upgrade. Connector identities are
+// FLAT (self-sovereign packets, no delegation cert), so the mcp's role-cert re-mint
+// does NOT apply here — the readvertise carries a NIL cert (flat-identity verify path)
+// and is accepted. The core trn is STATELESS + idempotent (legacy-only filter; no
+// _save_state), so it is safe on every boot and GC tick; the packet must already be
+// registered on the broker (called after restore, like migrationSweep). The push is
+// delivered only while the PEER is online, so re-fire on a short schedule to catch a
+// peer that reconnects shortly after us.
+async function readvertiseOnUpgrade(pkt: Packet): Promise<void> {
+  try {
+    const readvertised = await withScopeAsync(async (lt) => {
+      const r = await pkt.mutatingTx('::a2a_messaging::readvertise_on_upgrade', {}, lt);
+      return Number(r.Reduce('readvertised').Visualize());
+    });
+    if (readvertised > 0) log(`[${pkt.name}] re-advertised v2 AD to ${readvertised} pre-existing legacy contact(s) (migration bootstrap)`);
+  } catch (err) {
+    log(`[${pkt.name}] readvertise-on-upgrade sweep failed:`, String(err));
   }
 }
 
@@ -679,6 +743,53 @@ function activateRoute(conn: Connection): void {
           const cid = payload.Reduce('container_id').Visualize();
           log(`[${cfg.name}] contact "${name}" restored (re-keyed)`);
           process.nextTick(() => void flushDeferredFor(pkt, String(cid)));
+        } else if (event === 'migration_active') {
+          // The e2e migration pin is set for this contact — the session is now the
+          // double ratchet (epoch + session_id of the migrated session). Proof line
+          // (DAEMON-INTEGRATION §4); epoch/session_id are bin -> hex.
+          const cid = payload.Reduce('cid').Visualize();
+          const role = payload.Reduce('role').Visualize();
+          const epoch = binHexField(payload, 'epoch');
+          const sid = binHexField(payload, 'session_id');
+          log(`[${cfg.name}] [migration] active cid=${cid} role=${role}${epoch ? ` epoch=${epoch}` : ''}${sid ? ` session_id=${sid}` : ''}`);
+        } else if (event === 'e2e_app_send') {
+          // §4 app-SEND proof: core delivered an app message over the migrated
+          // (double-ratchet) session. session_id (bin->hex) == active_session_id.
+          const cid = payload.Reduce('cid').Visualize();
+          const sid = binHexField(payload, 'session_id');
+          const olm = payload.Reduce('olm_type').Visualize();
+          const wireId = payload.Reduce('wire_id').Visualize();
+          log(`[${cfg.name}] [e2e-app] send cid=${cid} session_id=${sid} olm_type=${olm} wire_id=${wireId}`);
+        } else if (event === 'e2e_app_recv') {
+          // §4 app-RECV proof: core decrypted an inbound app message over the
+          // migrated (double-ratchet) session on this peer.
+          const cid = payload.Reduce('cid').Visualize();
+          const sid = binHexField(payload, 'session_id');
+          const ok = payload.Reduce('ok').GetBoolean();
+          const wireId = payload.Reduce('wire_id').Visualize();
+          log(`[${cfg.name}] [e2e-app] recv cid=${cid} session_id=${sid} ok=${ok} wire_id=${wireId}`);
+        } else if (event === 'migration_deferred_flush') {
+          // One notify per app message drained onto the now-active migrated session
+          // (FIFO). Core performs the re-drive (each surfaces as an e2e_app_send);
+          // this is observability only — NEVER box, NEVER drop silently.
+          const cid = payload.Reduce('cid').Visualize();
+          const wireId = payload.Reduce('wire_id').Visualize();
+          log(`[${cfg.name}] [migration] flush-notify cid=${cid} wire_id=${wireId} (deferred->e2e; core delivers)`);
+        } else if (event === 'migration_stalled') {
+          // Migration didn't reach active in its window. UX/log only — core re-drives
+          // via the sweep; legacy still flows (nothing silently downgrades).
+          const cid = payload.Reduce('cid').Visualize();
+          const phase = payload.Reduce('phase').Visualize();
+          const attempts = payload.Reduce('attempts').Visualize();
+          log(`[${cfg.name}] [migration] stalled-notify cid=${cid} phase=${phase} attempts=${attempts} (core re-drives via sweep)`);
+        } else if (event === 'downgrade_refused') {
+          // SECURITY: core DROPPED an inbound legacy plaintext app message from an
+          // epoch-pinned (migrated) contact — post-migration all app data is e2e, so a
+          // legacy plaintext is a downgrade attack. Core already dropped it; surface it.
+          const cid = payload.Reduce('cid').Visualize();
+          const wireAv = payload.Reduce('wire_id');
+          const wireId = wireAv.IsNil() ? '' : String(wireAv.Visualize());
+          log(`[${cfg.name}] [e2e-route] downgrade-dropped cid=${cid}${wireId ? ` wire_id=${wireId}` : ''} (legacy plaintext from a migrated peer — dropped by core)`);
         }
       },
     },
@@ -844,6 +955,17 @@ async function restoreConnection(name: string): Promise<void> {
   log(`[${name}] restored (bot ${botLabel(bot)}, ${key}${cfg.peerCid ? `, peer ${cfg.peerCid}` : ', awaiting proxy'})`);
   // Eager restore: re-key degraded contacts + flush queues orphaned by a crash.
   await contactRestoreSweep(pkt);
+  // Boot/upgrade re-advertise FIRST so a pre-existing legacy peer learns we are now
+  // e2e-capable (refreshes its stored AD/caps → it offers migration back); re-fire on
+  // a short schedule to catch a peer that reconnects shortly after us. Idempotent.
+  await readvertiseOnUpgrade(pkt);
+  for (const ms of [10_000, 30_000, 90_000]) {
+    setTimeout(() => { void readvertiseOnUpgrade(pkt); }, ms);
+  }
+  // Proactively migrate already-e2e contacts to the double ratchet (case 3a), even
+  // if they are idle — runs after restore so state is imported + the packet is
+  // registered on the broker (the migration offer rides the encrypted channel).
+  await migrationSweep(pkt);
   // Drain any control requests queued by the control plane while we were down.
   process.nextTick(() => void processControlRequests(conn));
 }
@@ -1075,6 +1197,8 @@ function startRestoreSweepTimer(): void {
       try {
         for (const conn of connections.values()) {
           await contactRestoreSweep(conn.pkt);
+          await readvertiseOnUpgrade(conn.pkt);
+          await migrationSweep(conn.pkt);
         }
       } finally {
         restoreSweepRunning = false;
