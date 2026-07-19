@@ -117,14 +117,19 @@ async function main() {
   }
   assert(route === 'e2e', `send A→B rides the double ratchet (route="${route}")`);
 
-  // Reverse direction too (both peers must be on the migrated session).
+  // Reverse direction too (both peers ride the double ratchet).
   const routeBack = await sendAndRoute(b, aCid, 'probe back');
   assert(routeBack === 'e2e', `send B→A rides the double ratchet (route="${routeBack}")`);
 
-  // The §4 proof notifies fired on the migrated session.
+  // §4 proof: the double-ratchet send/recv notifies fired (olm_type + session_id).
+  // NOTE: with the born-DR core (acd9cf6, what nightly.7 runs), two FRESH contacts
+  // go DR from msg#1 via the peer's AD $e2e_bundle — so `migration_active` (the
+  // existing-contact migration FSM) does NOT fire here; that path is exercised by
+  // the live existing-contact→reconnect proof. What matters at this altitude is
+  // that app data actually traverses the double ratchet, in BOTH directions.
   await sleep(1500);
-  assert(seen.a.migration_active || seen.b.migration_active, 'migration_active proof notify fired');
-  assert(seen.a.e2e_app_send || seen.b.e2e_app_send, 'e2e_app_send proof notify fired');
+  assert(seen.a.e2e_app_send || seen.b.e2e_app_send, 'e2e_app_send proof notify fired (DR send)');
+  assert(seen.a.e2e_app_recv || seen.b.e2e_app_recv, 'e2e_app_recv proof notify fired (DR recv/decrypt)');
 
   console.log(`\n${failures === 0 ? 'ALL PASSED' : failures + ' FAILED'}`);
   process.exit(failures === 0 ? 0 : 1);
