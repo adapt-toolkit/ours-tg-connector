@@ -70,3 +70,12 @@ A. actor.mu: add $advertise + describe caps. B. connector.ts: migrationSweep + n
 - Evidence: proof-evidence/INTEROP-MATRIX.txt, S4-connector-x-mcp7-BROKEN.err.txt.
 - Sent FC the finding + questions: (1) deployed agent's exact core? (2) re-pin connector submodule to the deployed/published core (Dev-10/core owner)? Offered to re-pin+rebuild+re-prove connector↔agent once target core known.
 - STATE: host/manifest gap fix DONE + proven for connector's core (S2/S3). BLOCKED on core-version confirmation for connector↔real-agent DR proof. Awaiting FC.
+
+## 2026-07-19 early — CORE RE-PIN d152aa8b→acd9cf6 + born-DR proven + core file finding
+- FC identified correct core = ours-mufl-core feat/migration-impl HEAD acd9cf6 (deployed nightly.7 agent's committed core; d152aa8b was a divergent dead-end reconstruction).
+- Re-pinned submodule → acd9cf6, recompiled connector (unit 08950466); my actor.mu $advertise + host wiring compiled unchanged. commit e552d26.
+- LIVE connector(acd9cf6) ↔ mcp nightly.7 (real owner topology): pairs clean, NO errors, BORN-DR (route e2e from msg#1, migration_active empty), e2e_app_send/recv ok, message delivered over DR. Evidence proof-evidence/S5-*.txt. Resolves the interop break + delivers case 3b born-DR + the "pin same core as agent" review concern.
+- Updated tests/migration.test.mjs to born-DR semantics; migration test + text DoDs pass.
+- NEW CORE-LEVEL FINDING (flagged): born-DR FILE delivery directionally broken — send_file INVITER→REDEEMER not delivered (get_files=[]), REDEEMER→INVITER ok; messages fine. Reproduces mcp-nightly.7↔mcp-nightly.7 (agent's OWN core) → core bug, not connector. Owner's Telegram→connector→agent voice-file path is the failing direction. proof-evidence/CORE-FINDING-bornDR-file.txt. Out of scope for connector gap; Dev-10/core owner.
+- voice.test.mjs file DoDs fail under born-DR core = this core bug surfacing (not a connector regression); text DoDs pass on real broker.
+- STATE: migration host/manifest gap CLOSED + core re-pinned + born-DR messages PROVEN live with the real agent. Branch pushed. Core-level born-DR file bug flagged to FC. Awaiting FC steer on the file bug + review.

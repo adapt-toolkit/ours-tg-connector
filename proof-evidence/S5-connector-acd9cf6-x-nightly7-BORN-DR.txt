@@ -1,0 +1,8 @@
+Connector unit=089504667504  Agent(mcp.7) unit=51BC8D01F5A9
+paired = true
+pre-migration route Connector->Agent = e2e
+=== RESULT ===
+route Connector->Agent = e2e  Agent->Connector = e2e (expect e2e/e2e)
+migration_active: []
+e2e_app_send: 3  e2e_app_recv(ok): 2
+delivered: Connector got 1  Agent got 1

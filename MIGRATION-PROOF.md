@@ -88,7 +88,37 @@ enable migrate (the runtime analog of upgrading + restarting on the NEW build):
    advertise together, and my connector change advertises. A genuinely-old peer (no
    DR core, no `$e2e_bundle`) boxes cleanly both ways with no asymmetry.
 
-## ⚠️ INTEROP FINDING — connector core d152aa8b vs the PUBLISHED mcp nightlies (BLOCKER-level for real deploy)
+## ✅ RESOLVED — core re-pinned to acd9cf6; connector ↔ real nightly.7 agent proven (born-DR)
+The interop break below was root-caused to the CORE PIN: Dev-9's d152aa8b was a
+reconstruction of the mcp's uncommitted working tree — a divergent dead-end. Re-pinned
+`mufl_code/core` → **acd9cf6** (ours-mufl-core `feat/migration-impl` HEAD = the committed
+core the deployed nightly.7 agent runs; adds a9494f4 v1-bundle downgrade_refused fix,
+f7a13ef born-DR invariant, 9bb4ad1 already-e2e-pair trigger, 671c6cd delegation-cert
+down-level). Recompiled connector (unit 08950466) — my host/manifest gap fix compiled
+unchanged.
+
+**LIVE-PROVEN connector(acd9cf6) ↔ mcp nightly.7 (the REAL owner topology, over broker1)**
+(`proof-evidence/S5-connector-acd9cf6-x-nightly7-BORN-DR.txt`):
+- Pairs cleanly, NO errors (downgrade_refused/SAFE-cast gone).
+- **BORN-DR (case 3b): route e2e from the FIRST message, no migration handshake**
+  (`migration_active` empty) — exactly the owner's "DR from msg#1" ask.
+- e2e_app_send/recv both directions, `ok`, real message content delivered over the ratchet.
+This resolves the interop break, delivers born-DR (3b), and satisfies the review's
+"pin the same core the agent runs" concern at once.
+
+## ⚠️ NEW CORE-LEVEL FINDING — born-DR FILE delivery is directionally broken (flag to Dev-10/core owner)
+`proof-evidence/CORE-FINDING-bornDR-file.txt`. Over born-DR e2e, `send_message` (text)
+delivers both directions, but `send_file` does NOT deliver INVITER→REDEEMER (the receiver's
+`get_files` is empty; REDEEMER→INVITER works). Reproduced identically for
+connector↔connector, connector↔nightly.7, AND **mcp-nightly.7 ↔ mcp-nightly.7 (the agent's
+OWN core)** — so it is a core born-DR file-path bug, NOT introduced by the connector change,
+present in the deployed agent's own core. Impact: the owner's Telegram→connector→agent
+voice-FILE forwarding is the failing direction (messages are fine; files delivered fine over
+the OLD box path). Flagged for the core owner; out of scope for this connector gap fix.
+(This is why the pre-existing `tests/voice.test.mjs` file DoDs now fail under the born-DR
+core — a real core bug surfaced, not a connector regression.)
+
+## (historical) INTEROP FINDING — connector core d152aa8b vs the PUBLISHED mcp nightlies
 Tested my connector against the actual published `@ours.network/mcp` nightlies over
 broker1 (all units run under the connector SDK @adapt-toolkit 0.10.7). Matrix
 (`proof-evidence/INTEROP-MATRIX.txt`, `S4-connector-x-mcp7-BROKEN.err.txt`):

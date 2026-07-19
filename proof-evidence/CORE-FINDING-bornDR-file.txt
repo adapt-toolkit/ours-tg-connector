@@ -1,0 +1,11 @@
+CORE-LEVEL FINDING (not the connector's migration gap; flagged to FC for Dev-10/core owner):
+born-DR FILE delivery is directionally broken in the PUBLISHED nightly.7 core AND acd9cf6.
+Reproduced identically for connector(acd9cf6)<->connector, connector<->nightly.7, AND
+mcp-nightly.7<->mcp-nightly.7 (the agent's OWN core):
+  - text send_message over born-DR e2e: delivers BOTH directions (OK).
+  - send_file over born-DR e2e (route=e2e): the INVITER->REDEEMER file is NOT delivered
+    (get_files=[]); the REDEEMER->INVITER file IS delivered.
+Impact: the owner's Telegram->connector->agent voice-FILE forwarding is the failing
+direction. Messages are fine. This is a core born-DR file-path bug present in the agent's
+own core (mcp-nightly.7<->mcp-nightly.7 fails too) — NOT introduced by the connector change.
+Over the OLD box path (pre-DR) files delivered fine (connector voice.test passed on d152aa8b box).
