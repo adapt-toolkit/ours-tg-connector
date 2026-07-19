@@ -86,3 +86,28 @@ A. actor.mu: add $advertise + describe caps. B. connector.ts: migrationSweep + n
 - Evidence: proof-evidence/ROOTCAUSE-bornDR-second-message.txt + instrumented run (2nd C->G text ALSO fails; olm_type=0 on the dropped file; e2e_app_recv ok=FALSE). Reproduces mcp-nightly.7<->mcp-nightly.7 (agent's own core).
 - Fix is CRATE/SDK-level (adapt-e2e-core + e2e.mm), owner-gated, NOT the connector gap. A pre-key matching the live session must be DECRYPTED on it (advance ratchet), dropping only a true already-seen-index replay — needs a crate primitive (decrypt pre-key on existing session / index-aware replay). Dev-9 (adapt-e2e-core author) likely right implementer. Did NOT hack a half-fix (naive guard removal would double-deliver true replays).
 - Reported to FC. My connector migration host/manifest deliverable remains ACCEPTED+complete; this is a separate shipped-crypto bug I root-caused.
+
+## 2026-07-19 — REPRO + VERIFY guide for the born-DR 2nd-message fix (for Dev-9 / crate owner)
+Everything needed to reproduce the bug and verify a fix is in proof-evidence/ (harness) + node_modules.
+
+REPRO (fails today): two separate daemons over the public broker, send msg then file (or 2 msgs) one way:
+  cd /home/fleet/work/dev2-migration-gap
+  node_modules/.bin/tsx /tmp/dev2-proof/filediag.mjs        # instrumented: shows 2nd msg dropped
+  # expect: "G get_files: []", G notify e2e_app_recv ok=%%FALSE, olm_type=0 on the dropped send,
+  #         and "2nd msg ... G drained: []" (2nd TEXT also dropped) => confirms not-file-specific.
+Harness pieces (copied into proof-evidence/ for durability; live copies under /tmp/dev2-proof/):
+  - worker.mjs      : one packet/process, JSON-lines stdin/stdout (cmds: invite/add/contacts/send/
+                      sendfile/drain/drainfiles/sweep/advertise/notifies). Captures migration_active/
+                      e2e_app_send/e2e_app_recv notifies (the crypto-envelope evidence).
+  - coordinator.mjs : S1 mixed / S2 both-new-DR / S3 upgrade. Env OLD_UNIT/NEW_UNIT override the muflo.
+  - filediag.mjs    : the instrumented 2-message repro above.
+  - xapp.mjs        : connector(mufl_code) <-> mcp nightly.7 (/tmp/dev2-oldmcp). Set MCP=CONN for conn<->conn.
+Units: connector build = ./mufl_code (compile via scripts/compile-mufl.sh, needs @adapt-toolkit/mufl 0.10.7).
+  Real agent = @ours.network/mcp@0.12.0-nightly.7 unit at /tmp/dev2-oldmcp/node_modules/.../dist/mufl_code (51BC8D01).
+BUG SITE: node_modules/@adapt-toolkit/mufl/mufl_stdlib/cryptography/e2e.mm  fn decrypt_and_commit L406-414.
+VERIFY A FIX locally without the toolkit repo: edit that node_modules e2e.mm (or drop in a patched
+  @adapt-toolkit/mufl), `rm -f mufl_code/*.muflo && bash scripts/compile-mufl.sh` to rebuild the connector
+  unit, then re-run filediag.mjs => expect the 2nd message/file to deliver (get_files non-empty, ok=%%TRUE)
+  AND a true replay (re-send identical ciphertext) to still drop (no double-deliver). RAM is tight on this
+  box — kill leftover workers with: for p in $(ps -eo pid,cmd|grep "[w]orker.mjs"|awk '{print $1}');do kill -9 $p;done
+STATE: standing by idle per FC; monitor armed; ready to re-run the multi-message proof once the fix lands.
