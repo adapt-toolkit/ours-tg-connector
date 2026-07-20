@@ -55,6 +55,16 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import * as fs from 'node:fs';
 
+// Own package version, for the pre-migration blob retention key. Resolved from the
+// package root in both layouts (src/../ and dist/../).
+const PKG_VERSION: string = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  } catch {
+    return 'unknown';
+  }
+})();
+
 import { loadConfig } from './config';
 import type { AdaptValue } from './adapt';
 import {
@@ -205,13 +215,36 @@ function exportSigningSecret(pkt: Packet): string {
 
 function saveState(pkt: Packet, dir: string): void {
   try {
-    const bytes = withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_state', lt).Serialize()));
-    fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${dataPath(dir)}.tmp`;
-    fs.writeFileSync(tmp, bytes);
-    fs.renameSync(tmp, dataPath(dir));
+    saveStateFailClosed(pkt, dir);
   } catch (err) {
     log(`[${pkt.name}] failed to save state:`, String(err));
+  }
+}
+
+// Fail-closed persist (APP-GUARANTEE-1, DR-ROLLOUT-PLAN §6.3): DR ratchet state must be
+// durably on disk before any network effect of the same transaction — a swallowed write
+// failure here turns the next crash into a stale-ratchet restore. On failure this THROWS;
+// wired as the save_state RET hook, the throw propagates into the wrapper's action loop,
+// which (on the #137-line SDK's SEND durability barrier) withholds the transaction's
+// buffered SENDs. Under the current 0.10.9 SDK the throw still surfaces loudly instead
+// of being logged-and-forgotten. fsync on file AND dir: rename alone is not durable.
+function saveStateFailClosed(pkt: Packet, dir: string): void {
+  const bytes = withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_state', lt).Serialize()));
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${dataPath(dir)}.tmp`;
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, dataPath(dir));
+  const dirFd = fs.openSync(dir, 'r');
+  try {
+    fs.fsyncSync(dirFd);
+  } finally {
+    fs.closeSync(dirFd);
   }
 }
 
@@ -715,7 +748,7 @@ function activateRoute(conn: Connection): void {
   wireHandlers(
     pkt,
     {
-      onSaveState: () => saveState(pkt, dir),
+      onSaveState: () => saveStateFailClosed(pkt, dir),
       onNotify: (event, payload) => {
         if (event === 'message_received') {
           process.nextTick(() => void forwardToTelegram(conn));
@@ -934,6 +967,22 @@ async function restoreConnection(name: string): Promise<void> {
   const conflict = registerRoute(conn);
   if (conflict) log(`[${name}] route conflict on restore: ${conflict} — left unrouted`);
   if (hasSavedState(dir)) {
+    // Pre-migration retention (DR-ROLLOUT-PLAN §7.3): on the FIRST boot of this version
+    // over an existing blob, keep a copy keyed by the new version — the last state the
+    // previous version wrote. A lossy-but-successful core migration otherwise overwrites
+    // in place and leaves no rollback artifact (.failed-* only covers import *failure*).
+    // Same-version reboots skip (the file exists), so the copy stays the true pre-upgrade
+    // blob. Same secrecy class as the live blob (0600).
+    const preCopy = `${dataPath(dir)}.pre-${PKG_VERSION}`;
+    if (!fs.existsSync(preCopy)) {
+      try {
+        fs.copyFileSync(dataPath(dir), preCopy);
+        fs.chmodSync(preCopy, 0o600);
+        log(`[${name}] pre-migration blob retained as ${preCopy.split('/').pop()}`);
+      } catch (err) {
+        log(`[${name}] pre-migration retention failed (continuing):`, String(err));
+      }
+    }
     try {
       const buf = fs.readFileSync(dataPath(dir));
       await withScopeAsync(async (lt) => {
