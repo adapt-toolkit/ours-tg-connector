@@ -35,12 +35,12 @@
     "test": "for f in tests/*.test.mjs; do echo \"# $f\"; node_modules/.bin/tsx \"$f\" || exit 1; done"
   },
   "dependencies": {
-    "@adapt-toolkit/sdk": "0.10.8",
-    "@adapt-toolkit/sdk-native": "0.10.8",
+    "@adapt-toolkit/sdk": "0.10.9",
+    "@adapt-toolkit/sdk-native": "0.10.9",
     "undici": "^7.28.0"
   },
   "devDependencies": {
-    "@adapt-toolkit/mufl": "0.10.8",
+    "@adapt-toolkit/mufl": "0.10.9",
     "@types/node": "^20.14.0",
     "esbuild": "^0.24.2",
     "tsx": "^4.19.0",
