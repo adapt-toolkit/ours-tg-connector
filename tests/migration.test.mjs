@@ -77,14 +77,15 @@ async function main() {
 
   // Capture the §4 migration proof notifies from each side.
   const seen = { a: {}, b: {} };
+  const saves = { a: 0, b: 0 };
   const capture = (who) => (event, payload) => {
     if (event === 'migration_active' || event === 'e2e_app_send' || event === 'e2e_app_recv') {
       seen[who][event] = true;
       log(`${who} notify ${event}`);
     }
   };
-  wireHandlers(a, { onSaveState: () => {}, onNotify: capture('a') }, log);
-  wireHandlers(b, { onSaveState: () => {}, onNotify: capture('b') }, log);
+  wireHandlers(a, { onSaveState: () => { saves.a++; }, onNotify: capture('a') }, log);
+  wireHandlers(b, { onSaveState: () => { saves.b++; }, onNotify: capture('b') }, log);
   await withScopeAsync((lt) => a.mutatingTx('::a2a_messaging::set_my_name', { name: 'A' }, lt));
   await withScopeAsync((lt) => b.mutatingTx('::a2a_messaging::set_my_name', { name: 'B' }, lt));
 
@@ -118,8 +119,18 @@ async function main() {
   assert(route === 'e2e', `send A→B rides the double ratchet (route="${route}")`);
 
   // Reverse direction too (both peers ride the double ratchet).
+  const savesBeforeForward = { ...saves };
+  await sendAndRoute(a, bCid, 'save-hook-forward');
+  await sleep(500);
+  assert(saves.a > savesBeforeForward.a, 'outbound DR ratchet advance fires A save_state hook');
+  assert(saves.b > savesBeforeForward.b, 'inbound DR ratchet advance fires B save_state hook');
+
+  const savesBeforeReverse = { ...saves };
   const routeBack = await sendAndRoute(b, aCid, 'probe back');
   assert(routeBack === 'e2e', `send B→A rides the double ratchet (route="${routeBack}")`);
+  await sleep(500);
+  assert(saves.b > savesBeforeReverse.b, 'reverse outbound ratchet advance fires B save_state hook');
+  assert(saves.a > savesBeforeReverse.a, 'reverse inbound ratchet advance fires A save_state hook');
 
   // §4 proof: the double-ratchet send/recv notifies fired (olm_type + session_id).
   // NOTE: with the born-DR core (acd9cf6, what nightly.7 runs), two FRESH contacts

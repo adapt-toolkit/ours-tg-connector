@@ -225,9 +225,8 @@ function saveState(pkt: Packet, dir: string): void {
 // durably on disk before any network effect of the same transaction — a swallowed write
 // failure here turns the next crash into a stale-ratchet restore. On failure this THROWS;
 // wired as the save_state RET hook, the throw propagates into the wrapper's action loop,
-// which (on the #137-line SDK's SEND durability barrier) withholds the transaction's
-// buffered SENDs. Under the current 0.10.9 SDK the throw still surfaces loudly instead
-// of being logged-and-forgotten. fsync on file AND dir: rename alone is not durable.
+// which (on the 0.10.12 SDK's SEND durability barrier) withholds the transaction's
+// buffered SENDs. fsync on file AND dir: rename alone is not durable.
 function saveStateFailClosed(pkt: Packet, dir: string): void {
   const bytes = withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_state', lt).Serialize()));
   fs.mkdirSync(dir, { recursive: true });
