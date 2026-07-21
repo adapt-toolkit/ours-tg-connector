@@ -67,6 +67,23 @@ async function sweep(pkt) {
   });
 }
 
+// DR self-heal recovery legs (parity with mcp prerelease's e2eRecoverySweep) — the two
+// core trns the connector host now drives on boot + GC. A wrong trn name or field name
+// throws here, so this is a genuine wiring assertion (not a manifest-only smoke test).
+async function readvertiseE2eRecovery(pkt) {
+  return withScopeAsync(async (lt) => {
+    const r = await pkt.mutatingTx('::a2a_messaging::readvertise_e2e_recovery', {}, lt);
+    return Number(r.Reduce('readvertised').Visualize());
+  });
+}
+async function redriveUnackedSweep(pkt) {
+  return withScopeAsync(async (lt) => {
+    const r = await pkt.mutatingTx('::a2a_messaging::redrive_unacked_sweep', {}, lt);
+    const num = (f) => (r.Reduce(f).IsNil() ? 0 : Number(r.Reduce(f).Visualize()));
+    return { redriven: num('redriven_contacts'), purged: num('purged_contacts'), deferred: num('deferred_contacts') };
+  });
+}
+
 async function main() {
   console.log('=== connector DR migration (host + manifest gap) ===\n');
   const host = new AdaptHost(BROKER, log);
@@ -141,6 +158,32 @@ async function main() {
   await sleep(1500);
   assert(seen.a.e2e_app_send || seen.b.e2e_app_send, 'e2e_app_send proof notify fired (DR send)');
   assert(seen.a.e2e_app_recv || seen.b.e2e_app_recv, 'e2e_app_recv proof notify fired (DR recv/decrypt)');
+
+  // ---- DR self-heal recovery legs (mcp e2eRecoverySweep parity) --------------
+  // The connector host now drives readvertise_e2e_recovery + redrive_unacked_sweep on
+  // boot + GC (Block 2 parity gap closed). Exercise both against the live DR pair: a
+  // wrong trn name (mis-port) or a wrong return-field name throws, so a green here is a
+  // real wiring assertion, and the shapes match what connector.ts's e2eRecoverySweep reads.
+  console.log('\n-- DR self-heal recovery legs (readvertise_e2e_recovery + redrive_unacked_sweep) --');
+  let recovErr = null;
+  let readvA = -1, redriveA = null;
+  try {
+    // A is e2e-paired with B, so readvertise_e2e_recovery re-advertises to >=1 e2e contact.
+    readvA = await readvertiseE2eRecovery(a);
+    redriveA = await redriveUnackedSweep(a);
+    // Idempotent: a second immediate pass must not throw either.
+    await readvertiseE2eRecovery(b);
+    await redriveUnackedSweep(b);
+  } catch (e) {
+    recovErr = e;
+  }
+  assert(recovErr === null, `e2e recovery sweep legs run without error on a DR pair${recovErr ? ` (threw: ${recovErr})` : ''}`);
+  assert(readvA >= 1, `readvertise_e2e_recovery re-advertises the fresh AD to the e2e contact (readvertised=${readvA})`);
+  assert(
+    redriveA !== null &&
+      Number.isInteger(redriveA.redriven) && Number.isInteger(redriveA.purged) && Number.isInteger(redriveA.deferred),
+    `redrive_unacked_sweep returns the {redriven,purged,deferred} counters (${JSON.stringify(redriveA)})`,
+  );
 
   console.log(`\n${failures === 0 ? 'ALL PASSED' : failures + ' FAILED'}`);
   process.exit(failures === 0 ? 0 : 1);

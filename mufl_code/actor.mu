@@ -541,7 +541,11 @@ application actor loads libraries
             // what makes an existing contact auto-migrate to the double ratchet once both
             // sides advertise (§5.4). No handler needed (unlike $supported): these ids
             // gate traffic shaping only and never route through dispatch.
-            $advertise  -> [ a2a_capabilities::cap_e2e, a2a_capabilities::cap_e2e_migrate ],
+            // cap_e2e_rekey (core 0.11 self-heal): advertised so a peer learns this node
+            // participates in the rekey / wire_id-dedup path — the redrive/self-heal
+            // machinery a 0.11 peer relies on (a2a_messaging §self-heal; matches the mcp
+            // prerelease host, closing the historical tg drift where rekey went unadvertised).
+            $advertise  -> [ a2a_capabilities::cap_e2e, a2a_capabilities::cap_e2e_migrate, a2a_capabilities::cap_e2e_rekey ],
             $handlers   -> (,),
             $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. }
         ).

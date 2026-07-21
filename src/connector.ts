@@ -376,6 +376,49 @@ async function readvertiseOnUpgrade(pkt: Packet): Promise<void> {
   }
 }
 
+// Boot/GC SESSION-RECOVERY sweep (core 0.11 self-heal, DAEMON CONTRACT) — mirrors the
+// mcp prerelease host's e2eRecoverySweep. Complements readvertiseOnUpgrade (legacy-only)
+// and migrationSweep (sweep_e2e_migrations, already run above). Two extra core legs the
+// connector historically skipped:
+//   - readvertise_e2e_recovery: pushes this route's FRESH AD to every E2E-CAPABLE contact
+//     (complement of the legacy-only upgrade sweep). Since the persist-primary change the
+//     Olm account + live sessions normally SURVIVE a restart (validated $e2e_sessions
+//     import), so this is the FALLBACK layer for true loss: a rejected/absent state blob
+//     re-mints the account, leaving every peer's stored e2e_bundle for me stale until a
+//     fresh AD lands, and an in-flight migration always loses its staged session
+//     (m_staged is deliberately not persisted).
+//   - redrive_unacked_sweep: TTL-purges plaintext a peer never receipted (a withholder
+//     cannot pin it forever) then re-drives aged-but-live unacked ratchet sends.
+// Both are idempotent / attempt-capped / budgeted (bounded, resumable via an exported
+// cursor) — safe on every boot and GC tick, and a near no-op refresh when persist
+// restored everything. The packet must already be registered on the broker (called after
+// restore, like migrationSweep) since the recovery re-advertise rides the encrypted channel.
+async function e2eRecoverySweep(pkt: Packet): Promise<void> {
+  try {
+    const readvertised = await withScopeAsync(async (lt) => {
+      const r = await pkt.mutatingTx('::a2a_messaging::readvertise_e2e_recovery', {}, lt);
+      return Number(r.Reduce('readvertised').Visualize());
+    });
+    if (readvertised > 0) log(`[${pkt.name}] re-advertised fresh AD to ${readvertised} e2e contact(s) (session recovery)`);
+  } catch (err) {
+    log(`[${pkt.name}] e2e recovery re-advertise failed:`, String(err));
+  }
+  try {
+    // Report what ACTUALLY happened — redriven / TTL-purged / deferred (cursor-batched)
+    // are different outcomes and must not be conflated (mirrors mcp review #15).
+    const s = await withScopeAsync(async (lt) => {
+      const r = await pkt.mutatingTx('::a2a_messaging::redrive_unacked_sweep', {}, lt);
+      const num = (f: string): number => (r.Reduce(f).IsNil() ? 0 : Number(r.Reduce(f).Visualize()));
+      return { redriven: num('redriven_contacts'), purged: num('purged_contacts'), deferred: num('deferred_contacts') };
+    });
+    if (s.redriven > 0 || s.purged > 0 || s.deferred > 0) {
+      log(`[${pkt.name}] unacked sweep: redriven=${s.redriven} ttl_purged=${s.purged} deferred=${s.deferred} contact(s)`);
+    }
+  } catch (err) {
+    log(`[${pkt.name}] unacked redrive sweep failed:`, String(err));
+  }
+}
+
 // ----- bot registry -----------------------------------------------------------
 function botLabel(bot: Bot): string {
   return bot.username ? `${bot.name} (@${bot.username})` : bot.name;
@@ -1014,6 +1057,14 @@ async function restoreConnection(name: string): Promise<void> {
   // if they are idle — runs after restore so state is imported + the packet is
   // registered on the broker (the migration offer rides the encrypted channel).
   await migrationSweep(pkt);
+  // Session-recovery fallback (self-heal after a lost/rejected state blob): re-advertise
+  // a fresh AD to e2e contacts and redrive/TTL-purge unacked ratchet sends. Idempotent +
+  // budgeted; re-fire on the same short schedule as readvertiseOnUpgrade so a peer that
+  // reconnects shortly after us is reached. Mirrors the mcp prerelease boot sequence.
+  await e2eRecoverySweep(pkt);
+  for (const ms of [10_000, 30_000, 90_000]) {
+    setTimeout(() => { void e2eRecoverySweep(pkt); }, ms);
+  }
   // Drain any control requests queued by the control plane while we were down.
   process.nextTick(() => void processControlRequests(conn));
 }
@@ -1229,12 +1280,16 @@ function startControlServer(): void {
   process.on('SIGTERM', shutdown);
 }
 
-// ----- contact restore retry timer ---------------------------------------
-// A periodic backstop for contactRestoreSweep (already run on boot per route,
-// and again once a contact heals via the 'contact_restored' notify): retries
-// restore requests for contacts still degraded, and flushes anything queued
-// by a heal whose notify was lost to a crash. The reentrancy guard skips a
-// tick if the previous sweep still runs.
+// ----- contact restore / DR self-heal retry timer ------------------------
+// A periodic backstop for the four boot sweeps (contactRestoreSweep,
+// readvertiseOnUpgrade, migrationSweep, e2eRecoverySweep — all also run on boot
+// per route, and contactRestoreSweep again once a contact heals via the
+// 'contact_restored' notify): retries restore requests for contacts still
+// degraded, flushes anything queued by a heal whose notify was lost to a crash,
+// re-drives stalled migrations, and re-advertises / redrives for e2e session
+// recovery. All are idempotent, so a steady GC-cadence re-fire is safe. The
+// reentrancy guard skips a tick if the previous sweep still runs. Mirrors the
+// mcp prerelease GC timer's per-identity sweep set.
 const RESTORE_SWEEP_INTERVAL_MS = 3_600_000;
 let restoreSweepRunning = false;
 function startRestoreSweepTimer(): void {
@@ -1247,6 +1302,7 @@ function startRestoreSweepTimer(): void {
           await contactRestoreSweep(conn.pkt);
           await readvertiseOnUpgrade(conn.pkt);
           await migrationSweep(conn.pkt);
+          await e2eRecoverySweep(conn.pkt);
         }
       } finally {
         restoreSweepRunning = false;
