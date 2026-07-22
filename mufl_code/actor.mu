@@ -1402,34 +1402,35 @@ application actor loads libraries
     // The packet-level snapshot is NOT used for upgrades: it is bound to the unit
     // code hash, so a new .muflo cannot load an old snapshot. This data blob is.
     //
-    // The blob stays FLAT with the historical field names — the core fields come
-    // from a2a_messaging::export_core_state / import_core_state, the app fields
-    // are composed in here — so a PRE-migration export imports unchanged.
+    // Core (contact / profile / hierarchy / DR-session) state is carried WHOLE under
+    // $core: export_core_state owns its OWN field set, so any field the shared core
+    // adds — most importantly $e2e_sessions (the DR ratchet pickles that a manual
+    // per-field projection silently DROPPED, losing messages across a reload) — rides
+    // forward automatically, and the core's monitoring keys never collide with the
+    // APP-level monitoring keys we still own below (they share both names AND shapes).
+    // The blob stays code-independent; import_state migrates the pre-namespacing FLAT
+    // shape forward (see there). Mirrors ours-mcp's actor exactly.
 
     trn readonly export_state _
     {
-        core_state = a2a_messaging::export_core_state NIL.
         return (
             $app_format_version -> 1,
-            $my_name           -> core_state $my_name,
-            $contacts          -> core_state $contacts,
-            $pending_invites   -> core_state $pending_invites,
+            $core              -> a2a_messaging::export_core_state NIL,
+            // ---- app-owned state (route inbox + files + local book + monitoring) ----
             $inbox             -> inbox,
             $next_msg_seq      -> next_msg_seq,
             $file_inbox        -> file_inbox,
             $next_file_seq     -> next_file_seq,
-            $peer_ads          -> core_state $peer_ads,
             $registrar_ad      -> registrar_ad,
             $local_auto_accept -> local_auto_accept,
             // Nonces are exported so a restart does not reopen the replay window
             // for still-fresh credentials; stale ones are purged lazily anyway.
             $seen_nonces       -> seen_nonces,
             $pending_introductions -> pending_introductions,
-            $my_bio            -> core_state $my_bio,
-            $delegation_cert   -> core_state $delegation_cert,
-            $root_ad           -> core_state $root_ad,
-            $root_profile      -> core_state $root_profile,
-            $contact_roots     -> core_state $contact_roots,
+            // App-level (role->root) monitoring — a DISTINCT mechanism from core's
+            // forced monitoring. Stays app-owned and top-level; it must NEVER be fed
+            // into import_core_state (that would arm core's hidden monitoring_proxy,
+            // which the app cannot disarm). See import_state's legacy branch.
             $monitoring_enabled -> monitoring_enabled,
             $monitoring_inbox  -> monitoring_inbox,
             $proxy_pending     -> proxy_pending,
@@ -1449,11 +1450,36 @@ application actor loads libraries
         if (data $app_format_version) != NIL { app_fmt -> (data $app_format_version) safe int. }
         abort "App state blob format_version " + (_str app_fmt) + " is newer than this code (supports up to 1) — upgrade ours-tg-connector before importing." when app_fmt > 1.
 
-        // Core fields (contacts/profile/hierarchy) — validated and restored by
-        // the shared library, which also replays every peer's address document
-        // through process_address_document so encrypted channels keep working
-        // after the upgrade with no re-handshake.
-        a2a_messaging::import_core_state data.
+        // Core fields (contacts/profile/hierarchy/DR-sessions) — validated and restored
+        // by the shared library, which also replays every peer's address document
+        // through process_address_document so encrypted channels keep working after the
+        // upgrade with no re-handshake, and parks $e2e_sessions for the staged commit
+        // below. The current export namespaces core under $core, so the core owns its
+        // own field set and its monitoring keys never collide with the app's. A
+        // PRE-namespacing FLAT blob carries the core fields at the top level — migrate it
+        // by feeding import_core_state ONLY the genuine shared fields. We deliberately
+        // OMIT proxy_pending / monitoring_proxy on the legacy path: in a flat blob those
+        // keys hold the APP-level monitoring state (same names AND shapes as core's), and
+        // feeding them to import_core_state would arm core's hidden forced-monitoring
+        // proxy — which the app can NEVER disarm. Mirrors ours-mcp's actor exactly.
+        if (data $core) != NIL
+        {
+            a2a_messaging::import_core_state (data $core).
+        }
+        else
+        {
+            a2a_messaging::import_core_state (
+                $my_name         -> data $my_name,
+                $contacts        -> data $contacts,
+                $pending_invites -> data $pending_invites,
+                $peer_ads        -> data $peer_ads,
+                $my_bio          -> data $my_bio,
+                $delegation_cert -> data $delegation_cert,
+                $root_ad         -> data $root_ad,
+                $root_profile    -> data $root_profile,
+                $contact_roots   -> data $contact_roots
+            ).
+        }
 
         // The inbox + next_msg_seq are the only parts the message-lifecycle changes
         // touched. A pre-lifecycle blob has no $next_msg_seq and inbox entries with

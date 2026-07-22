@@ -36,7 +36,7 @@ try {
 assert(imported, 'pre-#137 tg state imports without the $e2e_sessions safe-cast failure');
 
 if (imported) {
-  const restoredName = withScope((lt) => packet.readonlyTx('::actor::export_state', lt).Reduce('my_name').Visualize());
+  const restoredName = withScope((lt) => packet.readonlyTx('::actor::export_state', lt).Reduce('core').Reduce('my_name').Visualize());
   assert(restoredName === 'Pre137Fixture', 'pre-#137 application state survives import');
 }
 

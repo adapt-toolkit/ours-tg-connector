@@ -982,12 +982,14 @@ async function restoreConnection(name: string): Promise<void> {
         log(`[${name}] pre-migration retention failed (continuing):`, String(err));
       }
     }
+    let imported = false;
     try {
       const buf = fs.readFileSync(dataPath(dir));
       await withScopeAsync(async (lt) => {
         const adaptData = pkt.pw.packet.ParseValue(new Uint8Array(buf)).Attach(lt);
         await pkt.mutatingTx('::actor::import_state', adaptData, lt);
       });
+      imported = true;
     } catch (err) {
       log(`[${name}] FAILED TO IMPORT SAVED STATE — continuing with the reseeded identity; ` +
         `surviving contacts (if the blob was partially migrated) self-heal via contact restore:`, String(err));
@@ -996,6 +998,34 @@ async function restoreConnection(name: string): Promise<void> {
         log(`[${name}] unreadable state blob preserved as state_data.bin.failed-*`);
       } catch {
         /* best effort */
+      }
+    }
+    if (imported) {
+      // DR staged-restore commit (mirrors ours-mcp's host): import_state PARKED the
+      // $e2e_sessions blob unvalidated; validate + assign it in a dedicated transaction.
+      // A corrupt pickle hard-fails ONLY this txn (atomic rollback — nothing assigned),
+      // observed here identity-scoped, and we discard the staged blob via reject so the
+      // fresh account + contact self-heal fallback take over. Both legs fire _save_state,
+      // persisting the now-clean export (via the onSaveState hook) so the corrupt pickles
+      // never come back on the next boot.
+      try {
+        const st = await withScopeAsync(async (lt) => {
+          const r = await pkt.mutatingTx('::a2a_messaging::commit_e2e_restore', {}, lt);
+          const status = r.Reduce('status').Visualize();
+          const sessions = r.Reduce('sessions').IsNil() ? '0' : r.Reduce('sessions').Visualize();
+          return { status: String(status), sessions: String(sessions) };
+        });
+        log(`[${name}] e2e restore commit: status=${st.status} sessions=${st.sessions}`);
+      } catch (err) {
+        log(`[${name}] E2E RESTORE REJECTED — staged session blob failed pickle validation; ` +
+          `discarding it, fresh account + self-heal fallback take over: ${String(err).slice(0, 260)}`);
+        try {
+          await withScopeAsync(async (lt) => {
+            await pkt.mutatingTx('::a2a_messaging::reject_e2e_restore', {}, lt);
+          });
+        } catch (err2) {
+          log(`[${name}] reject_e2e_restore failed (staging is transient; continuing):`, String(err2));
+        }
       }
     }
   }
