@@ -15,6 +15,14 @@ export type SttResult =
   | { ok: true; text: string; lang?: string }
   | { ok: false; error: string };
 
+function baseMime(mime: string): string {
+  return mime.split(';', 1)[0].trim() || 'application/octet-stream';
+}
+
+function redactSecret(text: string, secret: string): string {
+  return secret ? text.split(secret).join('[redacted]') : text;
+}
+
 export async function transcribe(bytes: Buffer, filename: string, mime: string, opts: SttOptions): Promise<SttResult> {
   if (!opts.apiKey) return { ok: false, error: 'no STT api key configured' };
   const aborter = new AbortController();
@@ -22,7 +30,9 @@ export async function transcribe(bytes: Buffer, filename: string, mime: string, 
   try {
     const form = new FormData();
     // Copy into a plain Uint8Array — a Buffer is not a valid BlobPart (see sendDocument).
-    form.set('file', new Blob([new Uint8Array(bytes)], { type: mime }), filename);
+    // Connector wire metadata may include the ours voice-message marker; STT
+    // providers receive only the real container MIME.
+    form.set('file', new Blob([new Uint8Array(bytes)], { type: baseMime(mime) }), filename);
     form.set('model', opts.model);
     form.set('response_format', 'json');
     if (opts.language) form.set('language', opts.language);
@@ -34,7 +44,8 @@ export async function transcribe(bytes: Buffer, filename: string, mime: string, 
     });
     if (!resp.ok) {
       const detail = await resp.text().catch(() => '');
-      return { ok: false, error: `STT HTTP ${resp.status}${detail ? `: ${detail.slice(0, 200)}` : ''}` };
+      const safeDetail = redactSecret(detail, opts.apiKey).slice(0, 200);
+      return { ok: false, error: `STT HTTP ${resp.status}${safeDetail ? `: ${safeDetail}` : ''}` };
     }
     const body = (await resp.json()) as { text?: string; language?: string };
     if (typeof body.text !== 'string') return { ok: false, error: 'STT response missing text' };
@@ -42,7 +53,8 @@ export async function transcribe(bytes: Buffer, filename: string, mime: string, 
   } catch (err) {
     const name = (err as { name?: string })?.name;
     if (name === 'AbortError') return { ok: false, error: `STT timeout after ${opts.timeoutMs}ms` };
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    const detail = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: redactSecret(detail, opts.apiKey) };
   } finally {
     clearTimeout(timer);
   }

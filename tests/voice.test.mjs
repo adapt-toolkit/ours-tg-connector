@@ -21,7 +21,7 @@
 //        node_modules/.bin/tsx tests/voice.test.mjs
 
 import { AdaptHost, wireHandlers, packInvite, unpackInvite, renderInbox, renderFiles, withScope, withScopeAsync } from '../src/adapt.ts';
-import { buildEnvelope, attachmentMeta } from '../src/envelope.ts';
+import { buildEnvelope, attachmentMeta, VOICE_MESSAGE_MIME } from '../src/envelope.ts';
 import { transcribe } from '../src/stt.ts';
 
 const BROKER = process.env.OURS_TG_BROKER_URL ?? 'ws://localhost:9000';
@@ -110,7 +110,9 @@ async function main() {
     from: 'Alice', from_id: 555, text: '', date: 1750602602,
     attachment: { kind: 'voice', file_id: `vf-${id}`, mime_type: 'audio/ogg', file_size: 2048 },
   });
-  const opus = Buffer.from('OPUS-BYTES-'.repeat(64)); // ~700 B of fake audio
+  // Placeholder bytes with the expected container/codec signatures; no real
+  // Telegram media or user content is used by this test.
+  const opus = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(24), Buffer.from('OpusHead'), Buffer.alloc(640)]);
   const resolvedOk = { ok: true, bytes: opus };
 
   const realFetch = globalThis.fetch;
@@ -140,6 +142,10 @@ async function main() {
     assert(a.env && a.env.text === 'hello there', 'DoD3: text still folded in forward mode');
     assert(r.sentFile && a.files.length === 1 && a.files[0].bytes.equals(opus), 'DoD3: audio also delivered via send_file (bytes intact)');
     assert(a.env && a.env.attachment && a.env.attachment.wire_id && a.env.attachment.transport === 'send_file', 'DoD3: envelope carries the attachment block with a wire_id');
+    assert(a.files[0].filename === 'voice_702.ogg' && a.env.attachment.filename === a.files[0].filename,
+      'DoD3: send_file and envelope share the safe .ogg filename');
+    assert(a.files[0].mime === VOICE_MESSAGE_MIME && a.env.attachment.mime === a.files[0].mime,
+      'DoD3: send_file and envelope share the exact ours-mcp voice MIME');
     assert(a.env && a.env.transcription?.status === 'ok', 'DoD3: transcription block also present');
 
     // DoD 4: graceful failure on invalid key / provider error → .ogg forwarded, status:error.
@@ -151,6 +157,22 @@ async function main() {
     assert(a.env && a.env.transcription?.status === 'error' && /401/.test(a.env.transcription.error), 'DoD4: transcription.status:error captured');
     assert(a.env && a.env.text === '', 'DoD4: text stays empty (nothing dropped)');
     assert(a.env && a.env.attachment && a.env.attachment.wire_id, 'DoD4: attachment block announces the forwarded audio');
+    assert(a.files[0].mime === VOICE_MESSAGE_MIME && a.env.attachment.mime === VOICE_MESSAGE_MIME,
+      'DoD4: STT failure fallback remains recognizable as a voice message');
+
+    // Enabled STT with no local/provider key is another graceful fallback: the
+    // STT client short-circuits and the original bytes remain available.
+    console.log('\n-- no local STT credential degrades to file forward --');
+    let fetchedNoKey = false;
+    globalThis.fetch = async () => { fetchedNoKey = true; return { ok: true, status: 200, json: async () => ({ text: 'must not run' }) }; };
+    r = await forwardVoice(connector, agent.cid, voiceMsg(706), resolvedOk,
+      { ...baseCfg, sttEnabled: true, sttApiKey: '' });
+    a = await drainAgent();
+    assert(!fetchedNoKey, 'missing local STT credential never calls the provider');
+    assert(a.env?.transcription?.status === 'error' && /no STT api key/i.test(a.env.transcription.error),
+      'missing local STT credential is reported without a secret');
+    assert(r.sentFile && a.files[0].bytes.equals(opus) && a.files[0].mime === VOICE_MESSAGE_MIME,
+      'missing local STT credential forwards unchanged marked OGG/Opus bytes');
 
     // DoD 6: size guard — bytes over sttMaxBytes skip STT, forward the .ogg.
     console.log('\n-- DoD 6: size guard (over sttMaxBytes) --');
@@ -161,16 +183,59 @@ async function main() {
     assert(!fetched, 'DoD6: STT endpoint not called when over the size guard');
     assert(a.env && a.env.transcription?.status === 'error' && a.env.transcription.error === 'too_large', 'DoD6: transcription.status:error error:too_large');
     assert(r.sentFile && a.files.length === 1, 'DoD6: .ogg forwarded despite skipped STT');
+    assert(a.files[0].mime === VOICE_MESSAGE_MIME && a.env.attachment.mime === VOICE_MESSAGE_MIME,
+      'DoD6: oversized-for-STT fallback carries the exact voice MIME');
 
-    // DoD 5: sttEnabled:false → today's output exactly (file + text:'' + attachment, no transcription).
-    console.log('\n-- DoD 5: sttEnabled:false ⇒ unchanged --');
+    // DoD 5: sttEnabled:false → file + text:'' + attachment, no transcription.
+    console.log('\n-- DoD 5: sttEnabled:false ⇒ marked file fallback --');
     let fetched2 = false;
     globalThis.fetch = async () => { fetched2 = true; return { ok: true, status: 200, json: async () => ({ text: 'x' }) }; };
     r = await forwardVoice(connector, agent.cid, voiceMsg(705), resolvedOk, { ...baseCfg, sttEnabled: false });
     a = await drainAgent();
     assert(!fetched2, 'DoD5: no STT call when disabled');
     assert(a.env && a.env.text === '' && a.env.transcription === undefined, 'DoD5: text:"" and NO transcription field');
-    assert(r.sentFile && a.files.length === 1 && a.env.attachment && a.env.attachment.wire_id, 'DoD5: .ogg forwarded with an attachment block, exactly as today');
+    assert(r.sentFile && a.files.length === 1 && a.env.attachment && a.env.attachment.wire_id,
+      'DoD5: .ogg forwarded with a correlated attachment block');
+    assert(a.files[0].bytes.equals(opus) && a.files[0].mime === VOICE_MESSAGE_MIME,
+      'DoD5: disabled STT forwards unchanged bytes with the exact voice MIME');
+    assert(a.env.attachment.mime === a.files[0].mime && a.env.attachment.filename === a.files[0].filename,
+      'DoD5: disabled-STT file and envelope metadata correlate exactly');
+
+    // Semantic kind is the source of truth. A normal audio attachment can also
+    // be OGG, but must not opt into ours-mcp voice-message handling.
+    console.log('\n-- ordinary non-voice OGG stays ordinary audio --');
+    const ordinaryOgg = {
+      ...voiceMsg(707), text: 'music clip',
+      attachment: {
+        kind: 'audio', file_id: 'audio-707', file_name: 'recording.ogg',
+        mime_type: 'audio/ogg', file_size: opus.length,
+      },
+    };
+    r = await forwardVoice(connector, agent.cid, ordinaryOgg, resolvedOk,
+      { ...baseCfg, sttEnabled: false });
+    a = await drainAgent();
+    assert(r.sentFile && a.files[0].mime === 'audio/ogg' && a.files[0].filename === 'recording.ogg',
+      'ordinary OGG send_file metadata remains unmarked');
+    assert(a.env.attachment.kind === 'audio' && a.env.attachment.mime === 'audio/ogg',
+      'ordinary OGG envelope metadata remains non-voice');
+
+    // Voice metadata is never trusted for the filename or base MIME: Telegram's
+    // semantic `voice` field is enough to select the fixed OGG/Opus contract.
+    console.log('\n-- malformed voice metadata is normalized safely --');
+    const malformedVoice = {
+      ...voiceMsg(708),
+      attachment: {
+        kind: 'voice', file_id: 'voice-708', file_name: '../../escape.bin',
+        mime_type: 'application/octet-stream', file_size: opus.length,
+      },
+    };
+    r = await forwardVoice(connector, agent.cid, malformedVoice, resolvedOk,
+      { ...baseCfg, sttEnabled: false });
+    a = await drainAgent();
+    assert(r.sentFile && a.files[0].filename === 'voice_708.ogg' && a.files[0].mime === VOICE_MESSAGE_MIME,
+      'malformed semantic voice gets a safe .ogg filename and exact MIME');
+    assert(a.env.attachment.filename === a.files[0].filename && a.env.attachment.mime === a.files[0].mime,
+      'normalized malformed metadata agrees across file and envelope channels');
   } finally {
     globalThis.fetch = realFetch;
   }
