@@ -9,7 +9,7 @@
 //
 // Run: node_modules/.bin/tsx tests/envelope.test.mjs
 
-import { buildEnvelope } from '../src/envelope.ts';
+import { attachmentMeta, buildEnvelope, VOICE_MESSAGE_MIME } from '../src/envelope.ts';
 
 let failures = 0;
 function assert(cond, msg) {
@@ -42,6 +42,8 @@ console.log('=== envelope transcription (voice STT) ===');
     { status: 'ok', text: 'hi', engine: 'openai', model: 'whisper-1' }));
   assert(e2.text === 'hi', 'text folded in forward mode');
   assert(e2.attachment && e2.attachment.wire_id === 'ours-file-abc', 'attachment kept in forward mode');
+  assert(e2.attachment.filename === 'voice_4521.ogg', 'voice attachment gets deterministic safe .ogg filename');
+  assert(e2.attachment.mime === VOICE_MESSAGE_MIME, 'voice envelope carries exact ours-mcp MIME marker');
   assert(e2.transcription.status === 'ok', 'transcription kept in forward mode');
 
   // STT error => attachment kept (file fallback), transcription.status error, text stays ''
@@ -51,10 +53,18 @@ console.log('=== envelope transcription (voice STT) ===');
   assert(e3.transcription.status === 'error' && /401/.test(e3.transcription.error), 'error captured in transcription');
   assert(e3.attachment && e3.attachment.wire_id === 'ours-file-def', 'file still announced on STT error');
 
-  // no transcription arg => byte-identical to today (no transcription field)
+  // no transcription arg => fallback shape has no transcription field
   const e4 = JSON.parse(buildEnvelope(voice, resolved, 'ours-file-ghi'));
   assert(e4.transcription === undefined, 'no transcription field when STT was not attempted');
-  assert(e4.text === '' && e4.attachment && e4.attachment.wire_id === 'ours-file-ghi', 'off-path is today’s output exactly');
+  assert(e4.text === '' && e4.attachment && e4.attachment.wire_id === 'ours-file-ghi',
+    'off-path keeps empty text and the correlated attachment');
+  assert(e4.attachment.mime === VOICE_MESSAGE_MIME, 'no-STT fallback still marks semantic voice for ours-mcp');
+
+  // A failed send_file must not claim a transport or wire-id correlation.
+  const e5 = JSON.parse(buildEnvelope(voice, resolved));
+  assert(e5.attachment.error === 'file transfer failed', 'send_file failure is explicit in the envelope');
+  assert(e5.attachment.transport === undefined && e5.attachment.wire_id === undefined,
+    'send_file failure never advertises an unresolved transport correlation');
 }
 // caption guard: an audio file WITH a caption keeps its caption as text
 {
@@ -62,6 +72,23 @@ console.log('=== envelope transcription (voice STT) ===');
   const e = JSON.parse(buildEnvelope(audio, undefined, undefined, { status: 'ok', text: 'lyrics here', model: 'whisper-1' }));
   assert(e.text === 'my song', 'existing caption is NOT overwritten by transcript');
   assert(e.transcription.text === 'lyrics here', 'transcript still available in transcription block');
+}
+
+// Semantic kind, not filename/MIME guessing, controls voice-message marking.
+{
+  const malformedVoice = {
+    kind: 'voice', file_id: 'v2', file_name: '../../not-safe.exe',
+    mime_type: 'application/octet-stream; x-ours-kind=not-voice',
+  };
+  const voiceMeta = attachmentMeta(malformedVoice, Number.NaN);
+  assert(voiceMeta.filename === 'voice_unknown.ogg', 'malformed voice metadata cannot escape the safe .ogg filename');
+  assert(voiceMeta.mime === VOICE_MESSAGE_MIME, 'malformed voice MIME is replaced by the exact marker');
+
+  const ordinaryOgg = attachmentMeta({
+    kind: 'audio', file_id: 'a2', file_name: 'recording.ogg', mime_type: 'audio/ogg',
+  }, 99);
+  assert(ordinaryOgg.filename === 'recording.ogg' && ordinaryOgg.mime === 'audio/ogg',
+    'ordinary non-voice OGG remains unmarked');
 }
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);

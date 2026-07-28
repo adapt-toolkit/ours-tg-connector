@@ -32,9 +32,10 @@ try {
       assert(init.body instanceof FormData, 'sends multipart FormData');
       assert(init.body.get('model') === 'whisper-1', 'model field set');
       assert(init.body.get('response_format') === 'json', 'response_format json');
+      assert(init.body.get('file').type === 'audio/ogg', 'strips ours MIME parameters from the STT upload part');
       return { ok: true, status: 200, json: async () => ({ text: 'hello world', language: 'en' }) };
     };
-    const r = await transcribe(bytes, 'voice_1.ogg', 'audio/ogg', opts);
+    const r = await transcribe(bytes, 'voice_1.ogg', 'audio/ogg; x-ours-kind=voice-message', opts);
     assert(r.ok && r.text === 'hello world', 'returns transcript text on 200');
     assert(r.ok && r.lang === 'en', 'passes through provider language when present');
   }
@@ -49,9 +50,11 @@ try {
   }
   // HTTP error
   {
-    globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => 'unauthorized' });
+    globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => `unauthorized token ${opts.apiKey}` });
     const r = await transcribe(bytes, 'v.ogg', 'audio/ogg', opts);
     assert(!r.ok && /401/.test(r.error), 'returns {ok:false} with status on HTTP error');
+    assert(!r.ok && !r.error.includes(opts.apiKey) && r.error.includes('[redacted]'),
+      'redacts a configured key echoed in an HTTP error');
   }
   // bad JSON
   {
@@ -70,6 +73,13 @@ try {
     globalThis.fetch = async (_url, _init) => { const e = new Error('aborted'); e.name = 'AbortError'; throw e; };
     const r = await transcribe(bytes, 'v.ogg', 'audio/ogg', { ...opts, timeoutMs: 1 });
     assert(!r.ok && /timeout|abort/i.test(r.error), 'returns {ok:false} on abort/timeout');
+  }
+  // thrown provider/network errors cannot echo the configured key into logs
+  {
+    globalThis.fetch = async () => { throw new Error(`request rejected for ${opts.apiKey}`); };
+    const r = await transcribe(bytes, 'v.ogg', 'audio/ogg', opts);
+    assert(!r.ok && !r.error.includes(opts.apiKey) && r.error.includes('[redacted]'),
+      'redacts a configured key echoed in a thrown error');
   }
   // no key => never calls fetch
   {

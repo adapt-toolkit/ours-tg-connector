@@ -18,6 +18,11 @@
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 
 export const ENVELOPE_VERSION = 2;
+// ours-mcp classifies voice messages by this exact MIME parameter. Telegram's
+// semantic attachment kind is authoritative here: plain audio/ogg files must
+// remain ordinary audio, while every forwarded `kind: voice` file carries the
+// marker on both the file channel and the correlated envelope metadata.
+export const VOICE_MESSAGE_MIME = 'audio/ogg; x-ours-kind=voice-message';
 
 // The outcome of trying to fetch a media message's bytes. The connector
 // produces this (network) and hands it to buildEnvelope (pure).
@@ -72,6 +77,13 @@ function buildReply(m: TelegramMessage): Record<string, unknown> | undefined {
 // file the agent receives agree. Telegram's own values win; otherwise per-kind
 // defaults fill in (photos/voice/etc. never carry a name).
 export function attachmentMeta(d: AttachmentDescriptor, messageId: number): { filename: string; mime: string } {
+  if (d.kind === 'voice') {
+    // Bot API voice notes are OGG/Opus and do not have an original filename.
+    // Ignore malformed/untrusted extra filename or MIME fields on this semantic
+    // kind so the receiver always gets a path-safe .ogg and the exact marker.
+    const id = Number.isSafeInteger(messageId) && messageId >= 0 ? String(messageId) : 'unknown';
+    return { filename: `voice_${id}.ogg`, mime: VOICE_MESSAGE_MIME };
+  }
   const defaults = KIND_DEFAULTS[d.kind] ?? KIND_DEFAULTS.document;
   return {
     filename: d.file_name ?? `${d.kind}_${messageId}.${defaults.ext}`,
@@ -85,6 +97,11 @@ function buildAttachment(m: TelegramMessage, resolved?: ResolvedAttachment, file
   const { filename, mime } = attachmentMeta(d, m.message_id);
   const base = { kind: d.kind, filename, mime, size: d.file_size };
   if (resolved?.ok) {
+    if (!fileWireId) {
+      // send_file failed (or never returned a usable id): keep the metadata but
+      // do not claim a transport/correlation that the receiver cannot resolve.
+      return { ...base, size: d.file_size ?? resolved.bytes.length, error: 'file transfer failed' };
+    }
     // Bytes travel via send_file; the envelope only points at them by wire_id.
     return { ...base, size: d.file_size ?? resolved.bytes.length, transport: 'send_file', wire_id: fileWireId };
   }
