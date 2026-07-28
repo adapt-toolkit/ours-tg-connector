@@ -205,8 +205,18 @@ added for provenance:
   delivered as **text only** (no `send_file`, no `attachment` block — the
   `transcription` block already signals it came from voice). Set
   `forwardVoiceAudio:true` to also `send_file` the `.ogg` alongside the transcript.
+- **Receiver interoperability.** Whenever a semantic Telegram `voice` attachment
+  is forwarded (STT is off/unavailable/fails/is over the cap, or
+  `forwardVoiceAudio:true`), the original OGG/Opus bytes travel unchanged under
+  a path-safe `voice_<message-id>.ogg` filename. Both `send_file.mime` and the
+  correlated envelope's `attachment.mime` are exactly
+  `audio/ogg; x-ours-kind=voice-message`, which is the ours-mcp recognition
+  contract. The semantic Telegram attachment kind is authoritative: an ordinary
+  `audio` attachment whose MIME is plain `audio/ogg` is not marked as voice.
+  See [the connector/receiver contract](docs/voice-message-contract.md) for the
+  independent verification matrix.
 - **Graceful degradation.** If STT is disabled, fails, times out, or the audio is
-  over `sttMaxBytes`, the bridge falls back to **today's exact behaviour** — the
+  over `sttMaxBytes`, the bridge falls back to file forwarding — the
   `.ogg` is still forwarded via `send_file` and nothing the user sent is lost. When
   STT was attempted and failed, the envelope adds `transcription.status:"error"`
   (e.g. `error:"too_large"` for the size guard); the daemon logs a single line
