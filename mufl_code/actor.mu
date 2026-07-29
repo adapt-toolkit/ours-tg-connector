@@ -541,7 +541,30 @@ application actor loads libraries
             // what makes an existing contact auto-migrate to the double ratchet once both
             // sides advertise (§5.4). No handler needed (unlike $supported): these ids
             // gate traffic shaping only and never route through dispatch.
-            $advertise  -> [ a2a_capabilities::cap_e2e, a2a_capabilities::cap_e2e_migrate ],
+            //
+            // cap_e2e_rekey (core 0.11): lets a peer REPAIR a diverged DR session with
+            // us instead of waiting for one to re-establish by accident. A peer that
+            // detects divergence checks peer_supports_rekey (a2a_messaging.mm:1100 at
+            // core pin edbb11ad) on US before it will send anything at all — so while
+            // this id was absent, three separate paths were hard-stopped against us:
+            // maybe_init_rekey (:1211, never mints), redrive_unacked_actions (:1114,
+            // returns []) and rekey_ping_actions (:1143, returns []). The responder is
+            // core-side and library-routed (e2e_rekey_request_tx, :100 -> trn :3827 ->
+            // handle_e2e_rekey_request :3751), inherited by any actor loading
+            // a2a_messaging, so this advertisement is all that was missing.
+            //
+            // SAFETY — this id is a VERSION CLAIM, not just "I answer rekey": both
+            // cap-gates above exist because a pre-0.11 peer would deposit unrecognized
+            // duplicates on redrive and would render a $rekey_ping bootstrap AS AN APP
+            // MESSAGE. Advertising it from a pre-0.11 core would therefore be a harmful
+            // false yes. Checked before adding: the deployed connector packet carries
+            // core.e2e.rekey, rekey_ping, delivered_wire, unacked_e2e and
+            // e2e_rekey_request — i.e. its core already has receive-side wire_id dedup
+            // and understands the ping. The npm version string (0.1.8-nightly.4 on the
+            // running bridge) is NOT a proxy for the compiled core version; they are
+            // different objects and only the packet answers this question.
+            $advertise  -> [ a2a_capabilities::cap_e2e, a2a_capabilities::cap_e2e_migrate,
+                             a2a_capabilities::cap_e2e_rekey ],
             $handlers   -> (,),
             $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. }
         ).
