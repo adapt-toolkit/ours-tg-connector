@@ -1,13 +1,12 @@
-// Bundles the connector into self-contained ESM so it runs straight from a clone
-// (only the native ADAPT SDK stays external — see below). Outputs:
+// Bundles the connector into self-contained ESM so it runs straight from a clone.
+// Outputs:
 //   dist/connector.js  ← the daemon (loaded by the CLI's `serve`)
 //   dist/cli.js        ← the CLI entrypoint (bin: ours-tg-connector)
 //
 // Run via `npm run build`.
 
 import { build } from 'esbuild';
-import { mkdir, rm, cp } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -23,9 +22,11 @@ const shared = {
   target: 'node20',
   format: 'esm',
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
-  // The ADAPT SDK pulls in a native NAPI addon + WASM blob that cannot be
-  // bundled — keep it external and resolve from node_modules at runtime.
-  external: ['@adapt-toolkit/sdk', '@adapt-toolkit/sdk/*', '@adapt-toolkit/sdk-native'],
+  // THE CONNECTOR NO LONGER BUNDLES AN ENGINE. It is an HTTP client of a running
+  // ours daemon, so there is no native NAPI addon, no WASM blob and no ADAPT SDK
+  // here at all — the whole `external` list went with them. @ours.network/sdk IS
+  // bundled: only its typed client and the daemon-selection resolver are reached
+  // from this tree, and neither touches the engine.
   logLevel: 'info',
 };
 
@@ -41,12 +42,12 @@ await build({
   outfile: resolve(dist, 'cli.js'),
 });
 
-// Ship the compiled MUFL packet alongside the bundle; the daemon loads the
-// single .muflo it finds in dist/mufl_code/ at runtime (see locateUnit()).
-const muflSrc = resolve(root, 'mufl_code');
-if (existsSync(muflSrc)) {
-  await cp(muflSrc, resolve(dist, 'mufl_code'), {
-    recursive: true,
-    filter: (src) => !src.includes('/core/.git') && !src.endsWith('/.git'),
-  });
-}
+// NO MUFL IS SHIPPED. This repo used to carry its own actor.mu, its own
+// protocol_container.mm and a core submodule pinned at edbb11a, compile them, and
+// copy the packet into dist/. All of it is gone: the daemon owns the packet, and
+// @ours.network/sdk ships it inside its own tarball.
+//
+// The pin moved as a CONSEQUENCE OF THE DELETION, not by a submodule bump —
+// edbb11a -> 4b6704ff in one step, because there is no longer a second core to
+// disagree. That is a protocol-compatibility change for a deployed connector
+// node, and it is authorised (see the PR body).
