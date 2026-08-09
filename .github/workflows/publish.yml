@@ -1,4 +1,23 @@
 name: CI
+# ---------------------------------------------------------------------------
+# NOTE FOR ours-shared, AND FOR THE NEXT REPO THAT DROPS ITS MUFL.
+#
+# The "Compile MUFL packet" steps below are guarded with
+#     if [ -x scripts/compile-mufl.sh ]; then scripts/compile-mufl.sh; fi
+# which asks WHETHER THE SCRIPT EXISTS, not whether there is anything to
+# compile. Those are different questions, and this repo just proved it: the
+# mufl_code/ tree and all three @adapt-toolkit dependencies were deleted, the
+# script was left behind and still executable, so the step fired, found no
+# toolkit, and failed with "set ADAPT_TOOLKIT or npm-install @adapt-toolkit/mufl"
+# — in a repo that has no MUFL at all. The step's own name says "repos with mufl
+# sources only" and its guard does not test that.
+#
+# Fixed here by deleting the script with the tree it served. THE GUARD IS STILL
+# WRONG UPSTREAM: `[ -d mufl_code ]` tests the actual condition. Worth fixing in
+# ours-shared before the next repo hits it identically — this repo's copy is not
+# diverged unilaterally, because a second divergent copy of shared boilerplate is
+# its own problem.
+# ---------------------------------------------------------------------------
 
 # Canonical publish workflow for single-package ours.network repos.
 # On apply, replace @ours.network/tg-connector with the repo's npm package.
