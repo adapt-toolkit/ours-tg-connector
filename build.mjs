@@ -21,7 +21,14 @@ const shared = {
   platform: 'node',
   target: 'node20',
   format: 'esm',
-  banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
+  // THE ALIAS IS LOAD-BEARING. A banner is raw text injected AFTER bundling, so
+  // esbuild's renamer never sees its identifiers. esbuild renames the bundled
+  // dependencies' `createRequire` imports to createRequire2, createRequire16,
+  // createRequire29 … and leaves ONE un-suffixed; with a bare banner that one
+  // collided, and dist/connector.js died at load with
+  //   SyntaxError: Identifier 'createRequire' has already been declared
+  // while `npm run build` exited 0. Do not "simplify" this back.
+  banner: { js: "import { createRequire as __tgCreateRequire } from 'node:module'; const require = __tgCreateRequire(import.meta.url);" },
   // THE CONNECTOR NO LONGER BUNDLES AN ENGINE. It is an HTTP client of a running
   // ours daemon, so there is no native NAPI addon, no WASM blob and no ADAPT SDK
   // here at all — the whole `external` list went with them. @ours.network/sdk IS
