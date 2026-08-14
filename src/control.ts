@@ -25,6 +25,14 @@ export const CONFIG_SCHEMA = {
       desc: 'Control which Telegram chat may talk to this bot, and what everyone else is told.',
       fields: [
         {
+          key: 'payloadMode',
+          label: 'Inbound payload mode',
+          type: 'string',
+          required: true,
+          help: 'envelope keeps Telegram sender/chat metadata for groups; plain forwards direct-chat text without a JSON wrapper.',
+          placeholder: 'envelope',
+        },
+        {
           key: 'allowedChatId',
           label: 'Allowed chat ID',
           type: 'string',
@@ -51,6 +59,7 @@ export interface NodeConfig {
   label: string;
   chatId: string; // the allowed chat
   deniedMessage: string;
+  payloadMode: string;
 }
 
 export function monitoringStatus(pkt: Packet): MonitoringStatus {
@@ -92,6 +101,7 @@ export function configValues(cfg: NodeConfig): Record<string, unknown> {
   return {
     allowedChatId: cfg.chatId,
     deniedMessage: cfg.deniedMessage || DEFAULT_DENIED,
+    payloadMode: cfg.payloadMode === 'plain' ? 'plain' : 'envelope',
   };
 }
 
@@ -105,6 +115,11 @@ export function applyConfig(cfg: NodeConfig, values: Record<string, unknown>): b
   }
   if (typeof values.deniedMessage === 'string' && values.deniedMessage !== cfg.deniedMessage) {
     cfg.deniedMessage = values.deniedMessage;
+    changed = true;
+  }
+  if ((values.payloadMode === 'plain' || values.payloadMode === 'envelope')
+      && values.payloadMode !== cfg.payloadMode) {
+    cfg.payloadMode = values.payloadMode;
     changed = true;
   }
   return changed;

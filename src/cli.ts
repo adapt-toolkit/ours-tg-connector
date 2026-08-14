@@ -301,7 +301,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
   const positionals = argv.filter((a) => !a.startsWith('--'));
   // Drop positionals that are actually flag VALUES.
   const flagged = new Set<string>();
-  for (const f of ['--name', '--bot', '--chat-id', '--thread-id', '--label', '--bio']) {
+  for (const f of ['--name', '--bot', '--chat-id', '--thread-id', '--label', '--bio', '--payload-mode']) {
     const i = argv.indexOf(f);
     if (i >= 0 && i + 1 < argv.length) flagged.add(argv[i + 1]);
   }
@@ -313,6 +313,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
   const threadId = (flagValue(argv, '--thread-id', '--topic') ?? '').trim();
   const label = (flagValue(argv, '--label') ?? '').trim();
   const bio = (flagValue(argv, '--bio') ?? '').trim();
+  const payloadMode = (flagValue(argv, '--payload-mode') ?? (argv.includes('--plain') ? 'plain' : 'envelope')).trim();
 
   if (!name || !botName || !chatId) {
     err('add_new_connection requires --name, --bot and --chat-id');
@@ -322,6 +323,10 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
     err('         [--thread-id 42] [--bio "ACME #support — paying customers"]');
     process.exit(1);
   }
+  if (payloadMode !== 'plain' && payloadMode !== 'envelope') {
+    err('add_new_connection --payload-mode must be "plain" or "envelope"');
+    process.exit(1);
+  }
 
   await ensureDaemon();
   let res: Response;
@@ -329,7 +334,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
     res = await fetch(`${BASE}/connections`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, botName, chatId, threadId, label, bio }),
+      body: JSON.stringify({ name, botName, chatId, threadId, label, bio, payloadMode }),
     });
   } catch (e) {
     err(`failed to reach the daemon control API: ${String(e)}`);
@@ -347,6 +352,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
   out(`  telegram bot:            ${botName}${body.botUsername ? ` (@${body.botUsername})` : ''}`);
   out(`  bridged chat id:         ${chatId}${threadId ? `  (topic ${threadId})` : ''}`);
   if (bio) out(`  identity bio:            ${bio}`);
+  out(`  inbound payload mode:     ${payloadMode}`);
   out('');
   out('Paste this invite into your proxy agent (ours `add_contact`):');
   out('');
@@ -376,6 +382,7 @@ async function cmdListConnections(): Promise<void> {
       threadId: string | null;
       label: string;
       bio: string | null;
+      payloadMode: 'plain' | 'envelope';
       peerCid: string | null;
       contacts: Array<{ name: string; cid: string }>;
     }>;
@@ -401,6 +408,7 @@ async function cmdListConnections(): Promise<void> {
       out(`        identity: ${c.cid}`);
       out(`        chat:     ${chat}`);
       if (c.bio) out(`        bio:      ${c.bio}`);
+      out(`        payload:  ${c.payloadMode}`);
       out(`        status:   ${peer}`);
       if (c.contacts.length) out(`        contacts: ${c.contacts.map((x) => `${x.name} (${x.cid})`).join(', ')}`);
     }
@@ -648,9 +656,11 @@ function usage(): void {
   out('  routes:');
   out('  add_new_connection   create a chat↔agent route (one identity) and print an invite');
   out('     --name <n> --bot <bot-name> --chat-id <c> [--thread-id <topic>] [--label <l>] [--bio <text>]');
+  out('     [--payload-mode envelope|plain] [--plain]');
   out('     (positional also accepted: add_new_connection <name> <bot-name> <chat-id>)');
   out('     reuse the same --bot with different --chat-id/--thread-id to bridge many');
   out('     chats/topics through one bot; --bio gives the agent that chat\'s context');
+  out('     envelope is the safe default for groups; plain forwards DM text without JSON metadata');
   out('  list_connections     list configured routes grouped by bot');
   out('  remove_connection <name>   delete a route and its state');
   out('');
