@@ -59,6 +59,14 @@ customers; escalate refunds to a human").
    `--chat-id`/`--thread-id` to add more routes on the one bot. Point two routes at
    the same agent and it sees two distinct contacts (distinct bios) — one per chat.
 
+For a one-to-one route, add `--payload-mode plain` (or `--plain`) to forward
+message text directly without the Telegram JSON envelope. The default remains
+`envelope`, which is required for groups/topics where per-message sender and chat
+metadata distinguishes participants. Files always use the core file channel in
+both modes; Telegram voice notes retain the protocol MIME marker
+`audio/ogg; x-ours-kind=voice-message`, allowing the receiving daemon to invoke
+its native voice-transcription path even when no companion text is sent.
+
 Messages are end-to-end encrypted between the connector packet and the agent (ADAPT
 encrypted channels). The connector never persists message bodies to disk — only the
 bot registry (`bot name`, `token`, `@username`), the per-route seed + serialized

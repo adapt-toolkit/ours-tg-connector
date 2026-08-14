@@ -9,7 +9,7 @@
 //
 // Run: node_modules/.bin/tsx tests/envelope.test.mjs
 
-import { attachmentMeta, buildEnvelope, VOICE_MESSAGE_MIME } from '../src/envelope.ts';
+import { attachmentMeta, buildEnvelope, buildPlainPayload, VOICE_MESSAGE_MIME } from '../src/envelope.ts';
 
 let failures = 0;
 function assert(cond, msg) {
@@ -38,6 +38,18 @@ console.log('=== envelope transcription (voice STT) ===');
 
   // transcribed AND forwarded => both blocks
   const resolved = { ok: true, bytes: Buffer.from('x'.repeat(2048)) };
+  assert(buildPlainPayload({ ...base, attachment: undefined }, undefined, undefined) === 'hello',
+    'plain mode forwards direct-chat text without JSON wrapping');
+  assert(buildPlainPayload(voice, resolved, 'ours-file-abc') === undefined,
+    'plain mode sends no companion text for a caption-less voice file');
+  assert(buildPlainPayload(voice, resolved, 'ours-file-abc', { status: 'ok', text: 'spoken words' }) === 'spoken words',
+    'plain mode forwards an enabled connector transcript as ordinary text');
+  assert(buildPlainPayload(voice, { ok: false, reason: 'error', detail: 'download failed' }, undefined)
+    === '[Telegram voice unavailable: download failed]',
+  'plain mode reports a failed attachment without a JSON envelope');
+  assert(buildPlainPayload(voice, resolved, undefined)
+    === '[Telegram voice unavailable: file transfer failed]',
+  'plain mode reports a failed file-channel transfer without a JSON envelope');
   const e2 = JSON.parse(buildEnvelope(voice, resolved, 'ours-file-abc',
     { status: 'ok', text: 'hi', engine: 'openai', model: 'whisper-1' }));
   assert(e2.text === 'hi', 'text folded in forward mode');
