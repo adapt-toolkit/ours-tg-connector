@@ -19,7 +19,8 @@
 //
 // Config precedence per field: env var > config.json (OURS_TG_CONFIG, else
 // ~/.ours-telegram/config.json) > default:
-//   OURS_TG_BROKER_URL    broker to connect to (default: public broker)
+//   OURS_TG_DAEMON_URL       the ours daemon to attach to (default: the SDK's selection)
+//   OURS_TG_DAEMON_STATE_DIR its state directory — REQUIRED alongside a URL, see config.ts
 //   OURS_TG_CONTROL_PORT  localhost control API port (default 3051)
 //   OURS_TG_STATE_DIR     state + pid/log dir (default ~/.ours-telegram)
 //   OURS_TG_POLL_TIMEOUT  Telegram long-poll seconds (default 30)
@@ -124,7 +125,7 @@ async function cmdStart(): Promise<void> {
   const ready = await waitForPort(PORT);
   if (ready) {
     out(`up on ${BASE}`);
-    out(`  broker: ${CONFIG.brokerUrl}`);
+    out(`  daemon: ${CONFIG.daemonUrl || '(default selection)'}`);
     out(`  state:  ${STATE_DIR}`);
     out(`  logs:   ${LOG_PATH}`);
   } else {
@@ -173,7 +174,7 @@ async function cmdStatus(): Promise<void> {
   out('ours-tg-connector: running');
   if (pid) out(`  pid:    ${pid}`);
   out(`  url:    ${BASE} ${up ? '(reachable)' : '(port not answering!)'}`);
-  out(`  broker: ${CONFIG.brokerUrl}`);
+  out(`  daemon: ${CONFIG.daemonUrl || '(default selection)'}`);
   out(`  state:  ${STATE_DIR}`);
   out(`  logs:   ${LOG_PATH}`);
   if (up) {
@@ -301,7 +302,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
   const positionals = argv.filter((a) => !a.startsWith('--'));
   // Drop positionals that are actually flag VALUES.
   const flagged = new Set<string>();
-  for (const f of ['--name', '--bot', '--chat-id', '--thread-id', '--label', '--bio']) {
+  for (const f of ['--name', '--bot', '--chat-id', '--thread-id', '--label', '--bio', '--payload-mode']) {
     const i = argv.indexOf(f);
     if (i >= 0 && i + 1 < argv.length) flagged.add(argv[i + 1]);
   }
@@ -313,6 +314,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
   const threadId = (flagValue(argv, '--thread-id', '--topic') ?? '').trim();
   const label = (flagValue(argv, '--label') ?? '').trim();
   const bio = (flagValue(argv, '--bio') ?? '').trim();
+  const payloadMode = (flagValue(argv, '--payload-mode') ?? (argv.includes('--plain') ? 'plain' : 'envelope')).trim();
 
   if (!name || !botName || !chatId) {
     err('add_new_connection requires --name, --bot and --chat-id');
@@ -322,6 +324,10 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
     err('         [--thread-id 42] [--bio "ACME #support — paying customers"]');
     process.exit(1);
   }
+  if (payloadMode !== 'plain' && payloadMode !== 'envelope') {
+    err('add_new_connection --payload-mode must be "plain" or "envelope"');
+    process.exit(1);
+  }
 
   await ensureDaemon();
   let res: Response;
@@ -329,7 +335,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
     res = await fetch(`${BASE}/connections`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, botName, chatId, threadId, label, bio }),
+      body: JSON.stringify({ name, botName, chatId, threadId, label, bio, payloadMode }),
     });
   } catch (e) {
     err(`failed to reach the daemon control API: ${String(e)}`);
@@ -347,6 +353,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
   out(`  telegram bot:            ${botName}${body.botUsername ? ` (@${body.botUsername})` : ''}`);
   out(`  bridged chat id:         ${chatId}${threadId ? `  (topic ${threadId})` : ''}`);
   if (bio) out(`  identity bio:            ${bio}`);
+  out(`  inbound payload mode:     ${payloadMode}`);
   out('');
   out('Paste this invite into your proxy agent (ours `add_contact`):');
   out('');
@@ -376,6 +383,7 @@ async function cmdListConnections(): Promise<void> {
       threadId: string | null;
       label: string;
       bio: string | null;
+      payloadMode: 'plain' | 'envelope';
       peerCid: string | null;
       contacts: Array<{ name: string; cid: string }>;
     }>;
@@ -401,65 +409,14 @@ async function cmdListConnections(): Promise<void> {
       out(`        identity: ${c.cid}`);
       out(`        chat:     ${chat}`);
       if (c.bio) out(`        bio:      ${c.bio}`);
+      out(`        payload:  ${c.payloadMode}`);
       out(`        status:   ${peer}`);
       if (c.contacts.length) out(`        contacts: ${c.contacts.map((x) => `${x.name} (${x.cid})`).join(', ')}`);
     }
   }
 }
 
-// Generate an invite to add the messenger control plane as a contact of a
-// connection's node (prerequisite for binding it as the control plane).
-async function cmdCpInvite(name: string): Promise<void> {
-  if (!name) {
-    err('cp_invite requires a connection name.');
-    process.exit(1);
-  }
-  if (!(await portOpen(PORT))) {
-    err('daemon not running — start it first.');
-    process.exit(1);
-  }
-  const res = await fetch(`${BASE}/connections/${encodeURIComponent(name)}/cp-invite`, { method: 'POST' });
-  const body = (await res.json()) as { ok: boolean; invite?: string; error?: string };
-  if (!body.ok || !body.invite) {
-    err(`cp_invite failed: ${body.error ?? `HTTP ${res.status}`}`);
-    process.exit(1);
-  }
-  out('');
-  out(`Add the messenger control plane as a contact of "${name}".`);
-  out('Paste this invite into the messenger (add contact / add node):');
-  out('');
-  out(body.invite);
-  out('');
-  out(`Once it is a contact, bind it:  ours-tg-connector bind_proxy ${name} <contact-name-or-cid>`);
-}
 
-// Start binding a contact (the messenger) as the control plane: prints a 6-digit
-// code to enter in the messenger Control Panel (out-of-band).
-async function cmdBindProxy(name: string, contact: string): Promise<void> {
-  if (!name || !contact) {
-    err('bind_proxy requires <connection-name> <contact-name-or-cid>.');
-    process.exit(1);
-  }
-  if (!(await portOpen(PORT))) {
-    err('daemon not running — start it first.');
-    process.exit(1);
-  }
-  const res = await fetch(`${BASE}/connections/${encodeURIComponent(name)}/bind`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contact }),
-  });
-  const body = (await res.json()) as { ok: boolean; code?: string; error?: string };
-  if (!body.ok || !body.code) {
-    err(`bind_proxy failed: ${body.error ?? `HTTP ${res.status}`}`);
-    process.exit(1);
-  }
-  out('');
-  out(`Verification code: ${body.code}`);
-  out('');
-  out('Enter it in the messenger Control Panel within 5 minutes (3 attempts).');
-  out('Do NOT send it over ours — it must travel out-of-band (this terminal counts).');
-}
 
 async function cmdRemoveConnection(name: string): Promise<void> {
   if (!name) {
@@ -502,7 +459,8 @@ function run(cmd: string, args: string[]): boolean {
 // Env baked into the service definition so the daemon resolves the same config.
 function serviceEnv(): Record<string, string> {
   return {
-    OURS_TG_BROKER_URL: CONFIG.brokerUrl,
+    OURS_TG_DAEMON_URL: CONFIG.daemonUrl,
+    OURS_TG_DAEMON_STATE_DIR: CONFIG.daemonStateDir,
     OURS_TG_CONTROL_PORT: String(CONFIG.controlPort),
     OURS_TG_STATE_DIR: STATE_DIR,
     OURS_TG_POLL_TIMEOUT: String(CONFIG.pollTimeoutSec),
@@ -648,15 +606,13 @@ function usage(): void {
   out('  routes:');
   out('  add_new_connection   create a chat↔agent route (one identity) and print an invite');
   out('     --name <n> --bot <bot-name> --chat-id <c> [--thread-id <topic>] [--label <l>] [--bio <text>]');
+  out('     [--payload-mode envelope|plain] [--plain]');
   out('     (positional also accepted: add_new_connection <name> <bot-name> <chat-id>)');
   out('     reuse the same --bot with different --chat-id/--thread-id to bridge many');
   out('     chats/topics through one bot; --bio gives the agent that chat\'s context');
+  out('     envelope is the safe default for groups; plain forwards DM text without JSON metadata');
   out('  list_connections     list configured routes grouped by bot');
   out('  remove_connection <name>   delete a route and its state');
-  out('');
-  out('  control plane (ours messenger):');
-  out('  cp_invite <name>           print an invite to add the messenger as a contact');
-  out('  bind_proxy <name> <contact>  start binding the messenger as control plane (prints a 6-digit code)');
   out('');
   out('  start    start the daemon in the background');
   out('  stop     stop the running daemon');
@@ -669,7 +625,8 @@ function usage(): void {
   out('');
   out('Config precedence (per field): env var > config.json > default.');
   out('  config.json: OURS_TG_CONFIG, else ~/.ours-telegram/config.json');
-  out('  env: OURS_TG_BROKER_URL, OURS_TG_CONTROL_PORT (3051), OURS_TG_STATE_DIR, OURS_TG_POLL_TIMEOUT (30)');
+  out('  env: OURS_TG_DAEMON_URL + OURS_TG_DAEMON_STATE_DIR (both, or neither), OURS_TG_CONTROL_PORT (3051),');
+  out('       OURS_TG_STATE_DIR, OURS_TG_POLL_TIMEOUT (30)');
 }
 
 async function main(): Promise<void> {
@@ -723,14 +680,6 @@ async function main(): Promise<void> {
     case 'remove-connection':
     case 'remove':
       await cmdRemoveConnection(process.argv[3]);
-      break;
-    case 'cp_invite':
-    case 'cp-invite':
-      await cmdCpInvite(process.argv[3]);
-      break;
-    case 'bind_proxy':
-    case 'bind-proxy':
-      await cmdBindProxy(process.argv[3], process.argv[4]);
       break;
     case 'start':
       await cmdStart();

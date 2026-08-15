@@ -133,3 +133,15 @@ export function deliveryTarget(chatId: string, threadId: string, lastChat: ChatR
   if (!isCatchAll(chatId)) return { chatId, threadId: '' };
   return null;
 }
+
+// The reply a bot sends to a chat it does not serve.
+//
+// THIS IS THE ONLY THING THAT SURVIVED src/control.ts. That file had twelve
+// exports and was the connector's MANAGED-NODE side: APP_ID, CONFIG_SCHEMA, the
+// manifest, the bind/get_manifest/get_config/set_config verb dispatch the ours
+// messenger drove over a2a_control, and monitoringStatus. All of it went with the
+// messenger-manageability removal — and this constant went with none of it,
+// because it is Telegram routing copy that only ever lived there by proximity.
+// Recorded so a reviewer seeing control.ts gone does not assume the rest was
+// missed: eleven of twelve exports were deliberate deletions, one was a relocation.
+export const DEFAULT_DENIED = 'You are not allowed to speak to this bot, please contact the admin.';
