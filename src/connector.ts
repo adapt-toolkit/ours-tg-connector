@@ -94,8 +94,8 @@ import {
 import type { ResolvedDaemonConfig } from '@ours.network/sdk';
 import { TelegramClient } from './telegram';
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
-import { buildEnvelope, attachmentMeta } from './envelope';
-import type { ResolvedAttachment, TranscriptionResult } from './envelope';
+import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
+import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './envelope';
 import { transcribe } from './stt';
 import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply, DEFAULT_DENIED } from './routing';
 
@@ -126,6 +126,7 @@ interface ConnectionFile {
   threadId: string; // forum topic id ('' => whole chat); pins the route to a single topic
   label: string;
   bio: string; // group/topic context set on the identity (embedded in its invite, read by the agent)
+  payloadMode: PayloadMode; // envelope preserves Telegram metadata; plain forwards DM text directly
   deniedMessage: string; // reply sent to a non-routed chat when the bot serves exactly one route
   peerCid: string; // the proxy agent's container id once it accepts the invite ('' until then)
   // This route's daemon lease token. PERSISTED ON PURPOSE: the token IS the
@@ -249,6 +250,7 @@ function readMeta(dir: string): ConnectionFile {
   if (typeof cfg.threadId !== 'string') cfg.threadId = '';
   if (typeof cfg.bio !== 'string') cfg.bio = '';
   if (typeof cfg.deniedMessage !== 'string') cfg.deniedMessage = DEFAULT_DENIED;
+  if (cfg.payloadMode !== 'plain' && cfg.payloadMode !== 'envelope') cfg.payloadMode = 'envelope';
   return cfg;
 }
 
@@ -549,7 +551,12 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     }
     // Omit `resolved` from the envelope when we are not announcing the audio, so
     // no attachment block is emitted for a text-only transcript (SPEC §4.5).
-    const body = buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId, transcription);
+    const body = cfg.payloadMode === 'plain'
+      ? buildPlainPayload(m, resolved, fileWireId, transcription)
+      : buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId, transcription);
+    // In plain mode, a caption-less attachment is represented completely by
+    // send_file. Do not manufacture an empty text message or a JSON wrapper.
+    if (body === undefined) continue;
     try {
       const sent = await client.sendMessage({ contact: target, text: body });
       if (sent.kind === 'deferred') {
@@ -738,6 +745,7 @@ async function createConnection(args: {
   threadId: string;
   label: string;
   bio: string;
+  payloadMode: PayloadMode;
 }): Promise<{ cid: string; invite: string; botUsername: string }> {
   const bot = bots.get(args.botName);
   if (!bot) throw new Error(`no bot named "${args.botName}" — register it with add_bot`);
@@ -756,6 +764,7 @@ async function createConnection(args: {
       threadId: args.threadId,
       label: args.label,
       bio: args.bio,
+      payloadMode: args.payloadMode,
       deniedMessage: DEFAULT_DENIED,
       peerCid: '',
       // Minted once, here, and persisted. See ConnectionFile.leaseToken.
@@ -919,6 +928,7 @@ async function describeConnection(conn: Connection): Promise<Record<string, unkn
     threadId: conn.cfg.threadId || null,
     label: conn.cfg.label,
     bio: conn.cfg.bio || null,
+    payloadMode: conn.cfg.payloadMode,
     deniedMessage: conn.cfg.deniedMessage || DEFAULT_DENIED,
     peerCid: conn.cfg.peerCid || null,
     contacts,
@@ -946,14 +956,20 @@ function startControlServer(): void {
         const threadId = String(body.threadId ?? '').trim();
         const label = String(body.label ?? '').trim();
         const bio = String(body.bio ?? '').trim();
+        const payloadMode = String(body.payloadMode ?? 'envelope').trim();
         const bad = routeNameError(name);
         if (bad) return sendJson(res, 400, { ok: false, error: bad });
         if (!botName) return sendJson(res, 400, { ok: false, error: 'botName is required (register a bot with add_bot first)' });
         if (!chatId) return sendJson(res, 400, { ok: false, error: 'chatId is required (use 0 for a catch-all route)' });
+        if (payloadMode !== 'plain' && payloadMode !== 'envelope') {
+          return sendJson(res, 400, { ok: false, error: 'payloadMode must be "plain" or "envelope"' });
+        }
         if (!bots.has(botName)) return sendJson(res, 404, { ok: false, error: `no bot named "${botName}" — register it with add_bot` });
         if (connections.has(name)) return sendJson(res, 409, { ok: false, error: `a connection named "${name}" already exists` });
         try {
-          const out = await createConnection({ name, botName, chatId, threadId, label, bio });
+          const out = await createConnection({
+            name, botName, chatId, threadId, label, bio, payloadMode,
+          });
           return sendJson(res, 201, { ok: true, ...out });
         } catch (err) {
           return sendJson(res, 500, { ok: false, error: String(err) });

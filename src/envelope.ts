@@ -18,6 +18,7 @@
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 
 export const ENVELOPE_VERSION = 2;
+export type PayloadMode = 'envelope' | 'plain';
 // ours-mcp classifies voice messages by this exact MIME parameter. Telegram's
 // semantic attachment kind is authoritative here: plain audio/ogg files must
 // remain ordinary audio, while every forwarded `kind: voice` file carries the
@@ -155,4 +156,29 @@ export function buildEnvelope(
     transcription: transcription ?? undefined,
   };
   return JSON.stringify(envelope);
+}
+
+// Plain routes are intended for one-to-one chats where the route identity is
+// already the sender/chat boundary. Text is forwarded byte-for-byte, while
+// attachments continue to use the core file channel. A caption-less attachment
+// therefore needs no companion text message; in particular, a voice note is
+// delivered only as its x-ours-kind=voice-message file so the receiving daemon
+// can invoke its native transcription path.
+export function buildPlainPayload(
+  m: TelegramMessage,
+  resolved?: ResolvedAttachment,
+  fileWireId?: string,
+  transcription?: TranscriptionResult,
+): string | undefined {
+  const transcribed = transcription?.status === 'ok' && typeof transcription.text === 'string';
+  const text = transcribed && m.text === '' ? (transcription!.text as string) : m.text;
+  if (text !== '') return text;
+  if (m.attachment && resolved && !resolved.ok) {
+    const status = resolved.reason === 'too_large' ? 'omitted' : 'unavailable';
+    return `[Telegram ${m.attachment.kind} ${status}: ${resolved.detail}]`;
+  }
+  if (m.attachment && resolved?.ok && !fileWireId) {
+    return `[Telegram ${m.attachment.kind} unavailable: file transfer failed]`;
+  }
+  return undefined;
 }

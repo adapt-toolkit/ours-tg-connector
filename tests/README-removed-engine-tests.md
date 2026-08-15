@@ -20,3 +20,23 @@ history. Whoever needs it next will need it in a repo that has an engine.
 `tests/voice.test.mjs` was **not** deleted — it was rewritten. The STT and
 envelope logic it covers (`src/stt.ts`, `src/envelope.ts`) is still the
 connector's own; only the transport underneath it moved.
+
+## `payload-mode.test.mjs`, removed when main's plain-payload feature merged in
+
+`tests/payload-mode.test.mjs` arrived on `main` with the plain-payload feature
+(#16) and imported `CONFIG_SCHEMA`, `configValues` and `applyConfig` from
+`src/control.ts`. All three are the managed-node control plane, which this branch
+deletes by ruling — the test cannot import a file that no longer exists.
+
+The **feature** survives the merge intact: `buildPlainPayload`, the
+`--payload-mode`/`--plain` CLI flags, the `payloadMode` field on
+`ConnectionFile`, its `readMeta` normalisation, the `POST /connections`
+validation, and the `forwardToNode` branch are all merged. What is gone is the
+**control-plane path to change it after creation**, because there is no control
+plane. `payloadMode` is now a create-time route property only.
+
+Its behavioural coverage lives in `tests/envelope.test.mjs`, which asserts the
+five `buildPlainPayload` outcomes directly (text forwarded verbatim, no
+companion text for a caption-less voice file, transcript forwarded as ordinary
+text, and the two attachment-failure strings). Only the schema/`applyConfig`
+assertions had no surviving subject.
