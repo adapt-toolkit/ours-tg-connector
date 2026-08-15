@@ -28,7 +28,13 @@ export interface ConnectorConfig {
   tgFetchRetryBaseMs: number;  // base backoff between those retries (ms)
   attachmentMaxBytes: number; // max media size forwarded inline (base64) before degrading to a metadata-only stub
   outboundFileMaxBytes: number; // max size of a received file we will upload to Telegram (bot upload limit is 50 MB)
-  // Speech-to-text for inbound voice notes (opt-in; off ⇒ byte-identical to today).
+  // Speech-to-text for inbound voice notes (opt-in).
+  //
+  // WHAT `false` PROMISES, PRECISELY: that THIS PROCESS does not send audio to a
+  // speech-to-text provider. It does NOT promise the audio is never transcribed.
+  // The connector is a client of a daemon that runs its OWN STT when the
+  // receiving side pulls a voice note, under configuration this operator does
+  // not control. As a host, `false` covered the whole path; attached, it cannot.
   sttEnabled: boolean;
   sttApiKey: string;        // secret; env-preferred, masked on config.json rewrite
   sttBaseUrl: string;       // OpenAI-compatible endpoint root

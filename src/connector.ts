@@ -62,7 +62,7 @@
 // persisted route binds its identity in the daemon and starts watching its
 // notification stream, then each bot's single poll starts.
 //
-// A localhost-only JSON control API (default :3040) is how the CLI adds / lists /
+// A localhost-only JSON control API (default :3051) is how the CLI adds / lists /
 // removes routes against the live daemon, so a new packet is online to complete
 // its invite handshake the moment the user pastes it.
 
@@ -72,16 +72,6 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import * as fs from 'node:fs';
 
-// Own package version, for the pre-migration blob retention key. Resolved from the
-// package root in both layouts (src/../ and dist/../).
-const PKG_VERSION: string = (() => {
-  try {
-    return JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  } catch {
-    return 'unknown';
-  }
-})();
-
 import { loadConfig } from './config';
 import {
   OursClient,
@@ -89,7 +79,6 @@ import {
   resolveDaemonConfig,
   describeDaemonConfig,
   assertDaemonStateDir,
-  DaemonSelectionError,
 } from '@ours.network/sdk';
 import type { ResolvedDaemonConfig } from '@ours.network/sdk';
 import { TelegramClient } from './telegram';
@@ -97,6 +86,7 @@ import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
 import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './envelope';
 import { transcribe } from './stt';
+import { watchWithRetry } from './watch';
 import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply, DEFAULT_DENIED } from './routing';
 
 const CONFIG = loadConfig();
@@ -112,10 +102,6 @@ const TG_NET = {
 
 const log = (...parts: unknown[]) => process.stderr.write(`ours-tg: ${parts.join(' ')}\n`);
 
-
-// Route names double as on-disk directory names and peer-visible display names,
-// so keep them simple and path-safe.
-const NAME_RE = /^[A-Za-z0-9 _.-]{1,64}$/;
 
 // ----- connection (route) model ----------------------------------------------
 interface ConnectionFile {
@@ -230,9 +216,10 @@ function routeNameError(name: string): string | null {
 
 
 // ----- per-route paths --------------------------------------------------------
+// identity.key and state_data.bin are NOT here any more, and neither are their
+// path helpers: the daemon owns identity material and packet state. A route
+// directory holds connection.json and nothing else.
 const connDir = (name: string) => join(STATE_DIR, name);
-const keyPath = (dir: string) => join(dir, 'identity.key');
-const dataPath = (dir: string) => join(dir, 'state_data.bin');
 const metaPath = (dir: string) => join(dir, 'connection.json');
 const botsPath = () => join(STATE_DIR, 'bots.json');
 
@@ -367,12 +354,9 @@ function unregisterRoute(conn: Connection): void {
   if (conn.bot.catchAll === conn) conn.bot.catchAll = null;
 }
 
-// Re-index a route after its chat-key changed (control-plane set_config). Returns
-// a conflict string if the new slot is taken.
-function reregisterRoute(conn: Connection): string | null {
-  unregisterRoute(conn);
-  return registerRoute(conn);
-}
+// There is no re-index helper any more: a route's chat-key was only ever edited
+// in flight by the control plane's set_config, which went with the control plane.
+// A chat-key now changes by removing the route and adding it back.
 
 // Is the chat-key (or the single catch-all slot) already claimed on this bot?
 // Lets createConnection fail before minting an identity.
@@ -433,50 +417,67 @@ function sttEngineLabel(baseUrl: string): string {
  * WHAT IS DELIBERATELY GONE: every migration/e2e proof line. Those were
  * observability for an engine THIS PROCESS NO LONGER RUNS — the daemon logs them,
  * and re-logging them here would claim knowledge of a session we do not hold.
+ *
+ * THE WATCH IS KEPT ALIVE ACROSS TRANSIENT FAILURES (see src/watch.ts). A
+ * callback could not stop; a long poll can, and the SDK generator throws out of
+ * `for await` on any fetch failure or daemon-side error. Giving up there would
+ * leave the route reading Telegram and never answering it.
  */
 function watchRoute(conn: Connection): void {
   if (conn.watch) return;
   const ctrl = new AbortController();
   conn.watch = ctrl;
   const { cfg, client } = conn;
-  void (async () => {
+  void watchWithRetry(
     // `since: 'tip'` skips the backlog: anything already in the log was handled
     // before this restart, and get_messages is the source of truth regardless —
     // a replayed event would at worst cause one redundant, empty poll.
-    for await (const ev of client.watchNotifications(cfg.name, { since: 'tip', signal: ctrl.signal })) {
-      const event = String(ev.event ?? '');
-      try {
-        if (event === 'message_received') {
-          await forwardToTelegram(conn);
-        } else if (event === 'file_received') {
-          await forwardFilesToTelegram(conn);
-        } else if (event === 'contact_accepted' || event === 'sibling_contact_added' || event === 'local_contact_added') {
-          // The FIRST accepted contact is the proxy agent (telegram traffic routes
-          // there). Later contacts must NOT clobber it, so only set peerCid while
-          // it is still empty.
-          const name = String(ev.from ?? ev.name ?? '');
-          const cid = String(ev.container_id ?? ev.cid ?? '');
-          if (cid && !cfg.peerCid) {
-            cfg.peerCid = cid;
-            writeMeta(conn.dir, cfg);
-            log(`[${cfg.name}] proxy agent connected: "${name}" (${cid})`);
-          } else {
-            log(`[${cfg.name}] contact added: "${name}" (${cid})`);
+    () => client.watchNotifications(cfg.name, { since: 'tip', signal: ctrl.signal }),
+    {
+      signal: ctrl.signal,
+      onEvent: async (ev) => {
+        const event = String(ev.event ?? '');
+        try {
+          if (event === 'message_received') {
+            await forwardToTelegram(conn);
+          } else if (event === 'file_received') {
+            await forwardFilesToTelegram(conn);
+          } else if (event === 'contact_accepted' || event === 'sibling_contact_added' || event === 'local_contact_added') {
+            // The FIRST accepted contact is the proxy agent (telegram traffic routes
+            // there). Later contacts must NOT clobber it, so only set peerCid while
+            // it is still empty.
+            const name = String(ev.from ?? ev.name ?? '');
+            const cid = String(ev.container_id ?? ev.cid ?? '');
+            if (cid && !cfg.peerCid) {
+              cfg.peerCid = cid;
+              writeMeta(conn.dir, cfg);
+              log(`[${cfg.name}] proxy agent connected: "${name}" (${cid})`);
+            } else {
+              log(`[${cfg.name}] contact added: "${name}" (${cid})`);
+            }
+          } else if (event === 'contact_restored') {
+            // Observability only now: the DAEMON drains the deferred queue on its
+            // own sweep. As a host this arm called flush_deferred itself.
+            log(`[${cfg.name}] contact "${String(ev.from ?? '')}" restored (re-keyed) — daemon will drain the queue`);
           }
-        } else if (event === 'contact_restored') {
-          // Observability only now: the DAEMON drains the deferred queue on its
-          // own sweep. As a host this arm called flush_deferred itself.
-          log(`[${cfg.name}] contact "${String(ev.from ?? '')}" restored (re-keyed) — daemon will drain the queue`);
+        } catch (err) {
+          // One bad event must not tear the stream down.
+          log(`[${cfg.name}] handling ${event} failed:`, String(err));
         }
-      } catch (err) {
-        log(`[${cfg.name}] handling ${event} failed:`, String(err));
-      }
-    }
-  })().catch((err) => {
-    if (ctrl.signal.aborted) return;
-    log(`[${cfg.name}] notification watch stopped:`, String(err));
-    conn.watch = null;
-  });
+      },
+      // The re-armed watch primes at `tip` like the first one, so it does not
+      // replay what landed while it was down. This is the same drain
+      // restoreConnection does on boot, for the same reason.
+      onResume: async () => {
+        log(`[${cfg.name}] notification watch resumed — draining what arrived while it was down`);
+        await forwardToTelegram(conn);
+        await forwardFilesToTelegram(conn);
+      },
+      onError: (err, delayMs) => {
+        log(`[${cfg.name}] notification watch failed (retrying in ${delayMs}ms):`, String(err));
+      },
+    },
+  );
 }
 
 // invite yet, there is no contact and the message is dropped with a log line.
@@ -724,15 +725,6 @@ function activateBot(bot: Bot): void {
   if (bot.pollHandle) return;
   bot.pollHandle = bot.tg.poll((m) => onBotMessage(bot, m));
 }
-
-// ----- control plane (ours messenger) --------------------------------------
-// Each route is itself a self-sovereign node bound + configured from the messenger
-// control plane over the a2a_control channel. Verb dispatch lives in control.ts
-// (shared with the e2e test); here we just drain the queue and supply the
-// persist/log hooks, then re-index the route if its chat-key was changed.
-
-const controlBusy = new Set<string>();
-
 
 // ----- create / restore / remove ----------------------------------------------
 // Create a brand-new route live on an already-registered bot: mint a fresh packet,
@@ -1052,14 +1044,10 @@ function startControlServer(): void {
   process.on('SIGTERM', shutdown);
 }
 
-// ----- contact restore retry timer ---------------------------------------
-// A periodic backstop for contactRestoreSweep (already run on boot per route,
-// and again once a contact heals via the 'contact_restored' notify): retries
-// restore requests for contacts still degraded, and flushes anything queued
-// by a heal whose notify was lost to a crash. The reentrancy guard skips a
-// tick if the previous sweep still runs.
-const RESTORE_SWEEP_INTERVAL_MS = 3_600_000;
-let restoreSweepRunning = false;
+// The contact-restore retry timer went with contactRestoreSweep — the daemon
+// runs its own sweep, and a second one here would be a client retrying repairs
+// on a session it does not hold. The 'contact_restored' notify is observability
+// now (see watchRoute), not a trigger.
 
 // ----- startup ----------------------------------------------------------------
 async function main(): Promise<void> {

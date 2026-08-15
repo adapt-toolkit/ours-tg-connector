@@ -200,8 +200,15 @@ added for provenance:
 }
 ```
 
-- **Opt-in.** Off by default (`sttEnabled:false`) — behaviour is then byte-identical
-  to today. Turn it on and supply a key (see [Configuration](#configuration)).
+- **Opt-in, and it covers THIS PROCESS ONLY.** Off by default
+  (`sttEnabled:false`), which means *the connector* sends no audio to a
+  speech-to-text provider. It does **not** mean the audio is never transcribed:
+  the connector is a client of an ours daemon, and **the daemon runs its own
+  speech-to-text** when the receiving side pulls a voice note — under
+  configuration this connector's operator does not control and may not know
+  exists. When the connector was its own host, `sttEnabled:false` did cover the
+  whole path; attached, it no longer can. Turn it on and supply a key to
+  transcribe here as well (see [Configuration](#configuration)).
 - **No transcoding.** Telegram voice is **OGG/Opus**, which OpenAI-compatible
   transcription endpoints accept directly — the connector adds **no ffmpeg** and no
   new dependency (just built-in `fetch`).
@@ -255,9 +262,11 @@ npm install
 npm run build
 ```
 
-Requires Node ≥ 20. The native ADAPT SDK (`@adapt-toolkit/sdk` +
-`@adapt-toolkit/sdk-native`, pinned to the version matching the shipped
-`.muflo`) is resolved from `node_modules` at runtime.
+Requires Node ≥ 20, and **an ours daemon already running on this box** — the
+connector attaches to it over `/api/v1` and drives it through
+[`@ours.network/sdk`](https://www.npmjs.com/package/@ours.network/sdk). It runs
+no engine of its own: there is no native ADAPT SDK and no MUFL packet here, so
+nothing beyond `npm install` is resolved at runtime.
 
 ## Usage
 
@@ -330,7 +339,8 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 
 | field          | env var                   | default                                         |
 |----------------|---------------------------|-------------------------------------------------|
-| broker URL     | `OURS_TG_BROKER_URL`   | `wss://broker1.ours.network` |
+| daemon URL     | `OURS_TG_DAEMON_URL`   | `''` (the SDK's own default selection) |
+| daemon state dir | `OURS_TG_DAEMON_STATE_DIR` | `''` (the SDK's own default selection) |
 | control port   | `OURS_TG_CONTROL_PORT` | `3051` (localhost only)                         |
 | state dir      | `OURS_TG_STATE_DIR`    | `~/.ours-telegram`                            |
 | poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
@@ -340,7 +350,7 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | retry backoff  | `OURS_TG_FETCH_RETRY_BASE_MS` | `300` (base delay between those retries; grows exponentially with jitter) |
 | attachment cap | `OURS_TG_ATTACHMENT_MAX_BYTES` | `10485760` (10 MB; larger inbound media forwarded as a metadata-only stub) |
 | outbound file cap | `OURS_TG_OUTBOUND_FILE_MAX_BYTES` | `52428800` (50 MB; a larger file from a contact is skipped + logged — Telegram's `sendDocument` limit) |
-| STT enabled    | `OURS_TG_STT_ENABLED`     | `false` (master switch for voice transcription; off ⇒ byte-identical to today) |
+| STT enabled    | `OURS_TG_STT_ENABLED`     | `false` (whether **this connector** transcribes voice; the attached daemon runs its own STT regardless — see [Voice](#voice-messages--speech-to-text)) |
 | STT API key    | `OURS_TG_STT_API_KEY`     | `''` (secret; env preferred — masked if placed in `config.json`, never logged) |
 | STT base URL   | `OURS_TG_STT_BASE_URL`    | `https://api.openai.com/v1` (OpenAI-compatible endpoint root; e.g. `https://api.groq.com/openai/v1` or a self-hosted whisper server) |
 | STT model      | `OURS_TG_STT_MODEL`       | `whisper-1` (e.g. `whisper-large-v3-turbo` on Groq) |
@@ -353,36 +363,18 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
 tokens, so do not expose the control port off-host.
 
-## Control plane (ours messenger)
+## Control plane (removed)
 
-Each bridge is a self-sovereign ours node that can be **managed from the
-ours messenger control plane** over the encrypted a2a_control
-channel — no extra ports. The connector advertises an app manifest
-(`network.ours.telegram-connector`) with a `core.configuration` capability, so the
-messenger renders its generic config form for it. Two fields are configurable
-live (no restart):
+The connector used to be a **managed node**: it advertised an app manifest
+(`network.ours.telegram-connector`) and the ours messenger could bind to it over
+the a2a_control channel and edit the allowed chat id and denial message live.
+That is gone — messenger manageability was removed by ruling, and with it the
+`cp_invite` and `bind_proxy` commands, the `get_manifest` / `get_config` /
+`set_config` verbs, and the bind ceremony.
 
-- **Allowed chat ID** — only this chat is proxied to the agent.
-- **Denial message** — what any other chat is told.
-
-(The bot token is *not* CP-configurable: the messenger strips secret-field values
-on save, so the token stays set at connection creation.)
-
-Bind it once:
-
-```sh
-# 1. add the messenger as a contact of the bridge node
-ours-tg-connector cp_invite supportbot
-#    → paste the invite into the messenger (add contact / add node)
-
-# 2. start the bind ceremony for that contact; read out the 6-digit code
-ours-tg-connector bind_proxy supportbot <messenger-contact-name-or-cid>
-#    → enter the code in the messenger Control Panel (out-of-band, 5 min, 3 tries)
-```
-
-Once bound, the messenger can pull the manifest, render the config form, and push
-changes (`get_manifest` / `get_config` / `set_config`). Config verbs are gated:
-only the bound control plane may read or write the configuration.
+A route is configured when it is created (`add_new_connection`) and changed by
+removing it and adding it back. There is no live reconfiguration path, and
+nothing to bind.
 
 ## Learn more
 
