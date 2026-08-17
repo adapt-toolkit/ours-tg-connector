@@ -72,7 +72,7 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import * as fs from 'node:fs';
 
-import { loadConfig } from './config';
+import { loadConfig, rawFileConfig, removedSttWarnings } from './config';
 import {
   OursClient,
   OursError,
@@ -84,8 +84,7 @@ import type { ResolvedDaemonConfig } from '@ours.network/sdk';
 import { TelegramClient } from './telegram';
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
-import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './envelope';
-import { transcribe } from './stt';
+import type { PayloadMode, ResolvedAttachment } from './envelope';
 import { watchWithRetry } from './watch';
 import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply, DEFAULT_DENIED } from './routing';
 
@@ -391,13 +390,6 @@ async function resolveAttachment(conn: Connection, d: AttachmentDescriptor): Pro
   }
 }
 
-// Best-effort provider label from the STT base URL host (e.g.
-// https://api.openai.com/v1 -> "openai", https://api.groq.com/openai/v1 ->
-// "groq"). Cosmetic only — recorded in the envelope's transcription block.
-function sttEngineLabel(baseUrl: string): string {
-  try { return new URL(baseUrl).hostname.replace(/^api\./, '').split('.')[0]; } catch { return 'stt'; }
-}
-
 // ----- the bridge -------------------------------------------------------------
 // Telegram → agent: forward an inbound message to the route's proxy as a JSON
 // envelope (sender/chat/reply/forward metadata + the text, plus the file inline
@@ -485,31 +477,21 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
   const { client, cfg } = conn;
   const resolved = m.attachment ? await resolveAttachment(conn, m.attachment) : undefined;
 
-  // Speech-to-text for voice (and any other configured kinds). Only when
-  // enabled, the kind opted in, and the bytes resolved within the STT size
-  // guard. Failures degrade to the file-forward path — never crash the poll
-  // loop (mirrors resolveAttachment).
-  let transcription: TranscriptionResult | undefined;
-  const kind = m.attachment?.kind;
-  if (CONFIG.sttEnabled && kind && CONFIG.sttKinds.includes(kind) && resolved?.ok) {
-    const engine = sttEngineLabel(CONFIG.sttBaseUrl);
-    if (resolved.bytes.length > CONFIG.sttMaxBytes) {
-      transcription = { status: 'error', error: 'too_large', engine, model: CONFIG.sttModel };
-    } else {
-      const meta = attachmentMeta(m.attachment!, m.message_id);
-      const r = await transcribe(resolved.bytes, meta.filename, meta.mime, {
-        baseUrl: CONFIG.sttBaseUrl, apiKey: CONFIG.sttApiKey, model: CONFIG.sttModel,
-        language: CONFIG.sttLanguage || undefined, timeoutMs: CONFIG.sttTimeoutMs,
-      });
-      transcription = r.ok
-        ? { status: 'ok', text: r.text, engine, model: CONFIG.sttModel, lang: r.lang }
-        : { status: 'error', error: r.error, engine, model: CONFIG.sttModel };
-      if (!r.ok) log(`[${cfg.name}] STT failed for ${kind} from ${m.from}: ${r.error}`); // never logs the key
-    }
-  }
-  // Whether to still send the audio bytes: yes unless we successfully
-  // transcribed AND the operator did not ask to keep the audio.
-  const sendAudio = !!(resolved?.ok) && !(transcription?.status === 'ok' && !CONFIG.forwardVoiceAudio);
+  // THE AUDIO IS ALWAYS FORWARDED WHEN IT RESOLVED. This connector no longer
+  // transcribes anything: transcription belongs to the ours SDK, and the SDK
+  // only ever sees a voice note if the bytes actually reach the receiver. The
+  // old `forwardVoiceAudio: false` default suppressed exactly those bytes on a
+  // successful local transcription, so keeping it while deleting src/stt.ts
+  // would have delivered nothing at all. There is deliberately no condition
+  // here any more.
+  //
+  // What makes this work without a transcription client: attachmentMeta() stamps
+  // `audio/ogg; x-ours-kind=voice-message` (envelope.ts VOICE_MESSAGE_MIME) on
+  // every semantic `voice` attachment, and that marker is precisely what the
+  // SDK's isVoiceMessage() matches when the receiving side pulls the file with
+  // get_files. The transcript is produced there, once, under the RECEIVER's
+  // `stt` config in ~/.ours/config.json.
+  const sendAudio = !!(resolved?.ok);
 
   const targets: string[] = [];
   if (cfg.peerCid) {
@@ -550,11 +532,12 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
         log(`[${cfg.name}] send_file to ${target} failed:`, String(err));
       }
     }
-    // Omit `resolved` from the envelope when we are not announcing the audio, so
-    // no attachment block is emitted for a text-only transcript (SPEC §4.5).
+    // `sendAudio` is now simply "the bytes resolved", so the envelope announces
+    // the attachment exactly when one was sent. The text-only-transcript case
+    // that used to omit it no longer exists here.
     const body = cfg.payloadMode === 'plain'
-      ? buildPlainPayload(m, resolved, fileWireId, transcription)
-      : buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId, transcription);
+      ? buildPlainPayload(m, resolved, fileWireId)
+      : buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId);
     // In plain mode, a caption-less attachment is represented completely by
     // send_file. Do not manufacture an empty text message or a JSON wrapper.
     if (body === undefined) continue;
@@ -1052,6 +1035,12 @@ function startControlServer(): void {
 // ----- startup ----------------------------------------------------------------
 async function main(): Promise<void> {
   log(`booting (config ${STATE_DIR})`);
+
+  // Before anything else, and regardless of how many routes exist: tell an
+  // operator who still has the removed stt* settings that they are inert. This
+  // runs first so it cannot be buried under route-restore output.
+  for (const line of removedSttWarnings(rawFileConfig(), process.env)) log(line);
+
   daemon = await attachToDaemon();
 
   // 1. Load the bot registry first (one TelegramClient per bot; no poll yet).

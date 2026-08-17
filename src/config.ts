@@ -28,22 +28,15 @@ export interface ConnectorConfig {
   tgFetchRetryBaseMs: number;  // base backoff between those retries (ms)
   attachmentMaxBytes: number; // max media size forwarded inline (base64) before degrading to a metadata-only stub
   outboundFileMaxBytes: number; // max size of a received file we will upload to Telegram (bot upload limit is 50 MB)
-  // Speech-to-text for inbound voice notes (opt-in).
+  // NO SPEECH-TO-TEXT SETTINGS LIVE HERE ANY MORE. The connector had its own STT
+  // client (src/stt.ts) configured by sttEnabled/sttApiKey/sttBaseUrl/sttModel/
+  // sttLanguage/sttKinds/sttMaxBytes/sttTimeoutMs/forwardVoiceAudio. All nine are
+  // gone: transcription is the ours SDK's job and there is now exactly one
+  // transcription client in the system, on the receiving side.
   //
-  // WHAT `false` PROMISES, PRECISELY: that THIS PROCESS does not send audio to a
-  // speech-to-text provider. It does NOT promise the audio is never transcribed.
-  // The connector is a client of a daemon that runs its OWN STT when the
-  // receiving side pulls a voice note, under configuration this operator does
-  // not control. As a host, `false` covered the whole path; attached, it cannot.
-  sttEnabled: boolean;
-  sttApiKey: string;        // secret; env-preferred, masked on config.json rewrite
-  sttBaseUrl: string;       // OpenAI-compatible endpoint root
-  sttModel: string;         // transcription model
-  sttLanguage: string;      // '' => provider auto-detects
-  sttKinds: string[];       // attachment kinds to transcribe
-  sttMaxBytes: number;      // skip STT above this (cost/latency guard)
-  sttTimeoutMs: number;     // per-call abort deadline
-  forwardVoiceAudio: boolean; // also send_file the transcribed audio
+  // Any of those keys still sitting in an operator's config.json or environment
+  // is INERT — so it is reported loudly at startup rather than ignored. See
+  // removedSttWarnings() at the bottom of this file.
 }
 
 export const DEFAULT_CONFIG: ConnectorConfig = {
@@ -58,34 +51,34 @@ export const DEFAULT_CONFIG: ConnectorConfig = {
   tgFetchRetryBaseMs: 300,
   attachmentMaxBytes: 10 * 1024 * 1024, // 10 MB (encoded ≈ 13.5 MB; under Telegram's 20 MB bot-API download limit)
   outboundFileMaxBytes: 50 * 1024 * 1024, // Telegram bot sendDocument upper bound
-  sttEnabled: false,
-  sttApiKey: '',
-  sttBaseUrl: 'https://api.openai.com/v1',
-  sttModel: 'whisper-1',
-  sttLanguage: '',
-  sttKinds: ['voice'],
-  sttMaxBytes: 5 * 1024 * 1024, // 5 MB
-  sttTimeoutMs: 60000,
-  forwardVoiceAudio: false,
 };
 
 export function configPath(): string {
   return process.env.OURS_TG_CONFIG ?? join(homedir(), '.ours-telegram', 'config.json');
 }
 
-function readFileConfig(): Partial<ConnectorConfig> {
+// The config file exactly as it is on disk, before any field is recognised. Only
+// removedSttWarnings() needs this: it has to see keys that loadConfig no longer
+// knows about. Unreadable or malformed => {} , same as readFileConfig.
+export function rawFileConfig(): Record<string, unknown> {
   let raw: string;
   try {
     raw = fs.readFileSync(configPath(), 'utf8');
   } catch {
     return {};
   }
-  let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
   } catch {
     return {};
   }
+}
+
+function readFileConfig(): Partial<ConnectorConfig> {
+  const parsed = rawFileConfig();
   const out: Partial<ConnectorConfig> = {};
   if (typeof parsed.daemonUrl === 'string') out.daemonUrl = parsed.daemonUrl;
   if (typeof parsed.daemonStateDir === 'string') out.daemonStateDir = resolve(parsed.daemonStateDir);
@@ -110,15 +103,9 @@ function readFileConfig(): Partial<ConnectorConfig> {
   if (typeof parsed.outboundFileMaxBytes === 'number' && Number.isFinite(parsed.outboundFileMaxBytes)) {
     out.outboundFileMaxBytes = parsed.outboundFileMaxBytes;
   }
-  if (typeof parsed.sttEnabled === 'boolean') out.sttEnabled = parsed.sttEnabled;
-  if (typeof parsed.sttApiKey === 'string') out.sttApiKey = parsed.sttApiKey;
-  if (typeof parsed.sttBaseUrl === 'string') out.sttBaseUrl = parsed.sttBaseUrl;
-  if (typeof parsed.sttModel === 'string') out.sttModel = parsed.sttModel;
-  if (typeof parsed.sttLanguage === 'string') out.sttLanguage = parsed.sttLanguage;
-  if (Array.isArray(parsed.sttKinds)) out.sttKinds = parsed.sttKinds.filter((k): k is string => typeof k === 'string');
-  if (typeof parsed.sttMaxBytes === 'number' && Number.isFinite(parsed.sttMaxBytes)) out.sttMaxBytes = parsed.sttMaxBytes;
-  if (typeof parsed.sttTimeoutMs === 'number' && Number.isFinite(parsed.sttTimeoutMs)) out.sttTimeoutMs = parsed.sttTimeoutMs;
-  if (typeof parsed.forwardVoiceAudio === 'boolean') out.forwardVoiceAudio = parsed.forwardVoiceAudio;
+  // The nine stt*/forwardVoiceAudio keys are deliberately NOT read here — they no
+  // longer exist. rawFileConfig() below hands the untouched parse to
+  // removedSttWarnings() so a surviving key is announced, not silently dropped.
   return out;
 }
 
@@ -152,29 +139,119 @@ export function loadConfig(): ConnectorConfig {
     tgFetchRetryBaseMs: envInt('OURS_TG_FETCH_RETRY_BASE_MS') ?? file.tgFetchRetryBaseMs ?? DEFAULT_CONFIG.tgFetchRetryBaseMs,
     attachmentMaxBytes: envInt('OURS_TG_ATTACHMENT_MAX_BYTES') ?? file.attachmentMaxBytes ?? DEFAULT_CONFIG.attachmentMaxBytes,
     outboundFileMaxBytes: envInt('OURS_TG_OUTBOUND_FILE_MAX_BYTES') ?? file.outboundFileMaxBytes ?? DEFAULT_CONFIG.outboundFileMaxBytes,
-    sttEnabled: envBool('OURS_TG_STT_ENABLED') ?? file.sttEnabled ?? DEFAULT_CONFIG.sttEnabled,
-    sttApiKey: process.env.OURS_TG_STT_API_KEY ?? file.sttApiKey ?? DEFAULT_CONFIG.sttApiKey,
-    sttBaseUrl: process.env.OURS_TG_STT_BASE_URL ?? file.sttBaseUrl ?? DEFAULT_CONFIG.sttBaseUrl,
-    sttModel: process.env.OURS_TG_STT_MODEL ?? file.sttModel ?? DEFAULT_CONFIG.sttModel,
-    sttLanguage: process.env.OURS_TG_STT_LANGUAGE ?? file.sttLanguage ?? DEFAULT_CONFIG.sttLanguage,
-    sttKinds: process.env.OURS_TG_STT_KINDS?.split(',').map((s) => s.trim()).filter(Boolean) ?? file.sttKinds ?? DEFAULT_CONFIG.sttKinds,
-    sttMaxBytes: envInt('OURS_TG_STT_MAX_BYTES') ?? file.sttMaxBytes ?? DEFAULT_CONFIG.sttMaxBytes,
-    sttTimeoutMs: envInt('OURS_TG_STT_TIMEOUT_MS') ?? file.sttTimeoutMs ?? DEFAULT_CONFIG.sttTimeoutMs,
-    forwardVoiceAudio: envBool('OURS_TG_FORWARD_VOICE_AUDIO') ?? file.forwardVoiceAudio ?? DEFAULT_CONFIG.forwardVoiceAudio,
   };
 }
 
 export function writeConfig(cfg: ConnectorConfig): string {
   const path = configPath();
+  // A rewrite drops every key this build no longer knows about, including the
+  // removed stt* block. Say so BEFORE overwriting rather than letting the
+  // operator discover it from a diff — there is no sttApiKey field left to mask
+  // here any more, because there is no STT client left to configure.
+  const losing = removedSttWarnings(rawFileConfig(), {});
+  if (losing.length) {
+    process.stderr.write(`${losing.join('\n')}\n`);
+    process.stderr.write(`[config] rewriting ${path} now REMOVES those keys from the file.\n`);
+  }
   fs.mkdirSync(dirname(path), { recursive: true });
-  // Never persist the STT secret in clear — operators supply it via
-  // OURS_TG_STT_API_KEY. Mirror the token-at-rest hygiene used for bots.json.
-  const onDisk: ConnectorConfig = { ...cfg, sttApiKey: cfg.sttApiKey ? `${cfg.sttApiKey.slice(0, 4)}…(set via env)` : '' };
-  fs.writeFileSync(path, JSON.stringify(onDisk, null, 2) + '\n', { mode: 0o600 });
+  fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
   try {
     fs.chmodSync(path, 0o600);
   } catch {
     /* best effort: platforms without POSIX modes */
   }
   return path;
+}
+
+// ----- removed speech-to-text settings ----------------------------------------
+//
+// The connector's own STT is gone (src/stt.ts deleted). These nine settings are
+// therefore INERT, and an operator who has them set today is losing a capability
+// they deliberately turned on — so every surviving one is named, individually,
+// at startup. A generic "some settings are obsolete" line would be worse than
+// nothing: it tells an operator something changed without telling them what they
+// lost.
+
+/** config.json keys that no longer do anything, paired with their env var. */
+export const REMOVED_STT_SETTINGS: ReadonlyArray<{ key: string; env: string }> = [
+  { key: 'sttEnabled', env: 'OURS_TG_STT_ENABLED' },
+  { key: 'sttApiKey', env: 'OURS_TG_STT_API_KEY' },
+  { key: 'sttBaseUrl', env: 'OURS_TG_STT_BASE_URL' },
+  { key: 'sttModel', env: 'OURS_TG_STT_MODEL' },
+  { key: 'sttLanguage', env: 'OURS_TG_STT_LANGUAGE' },
+  { key: 'sttKinds', env: 'OURS_TG_STT_KINDS' },
+  { key: 'sttMaxBytes', env: 'OURS_TG_STT_MAX_BYTES' },
+  { key: 'sttTimeoutMs', env: 'OURS_TG_STT_TIMEOUT_MS' },
+  { key: 'forwardVoiceAudio', env: 'OURS_TG_FORWARD_VOICE_AUDIO' },
+];
+
+/**
+ * The one attachment kind the SDK can still transcribe. `voice` is Telegram's
+ * SEMANTIC voice-note kind, and it is the only kind this connector stamps with
+ * `x-ours-kind=voice-message` — which is exactly what the SDK's isVoiceMessage()
+ * matches. Any other kind an operator had in sttKinds is transcribed by nobody
+ * now, and that is the one real capability loss in this change.
+ */
+export const SDK_TRANSCRIBABLE_KIND = 'voice';
+
+function parseKinds(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((k): k is string => typeof k === 'string');
+  if (typeof value === 'string') return value.split(',').map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
+/**
+ * One warning line per surviving removed setting, plus an explicit line naming
+ * the non-voice kinds that lose transcription outright. Pure — takes the raw
+ * config object and an env map — so it is unit-testable without a daemon, a
+ * config file, or process.env.
+ *
+ * Returns [] when the operator has none of them set, which is the common case:
+ * silence when there is nothing to say.
+ */
+export function removedSttWarnings(
+  raw: Record<string, unknown>,
+  env: Record<string, string | undefined>,
+): string[] {
+  const present = REMOVED_STT_SETTINGS.filter(
+    ({ key, env: name }) => raw[key] !== undefined || env[name] !== undefined,
+  );
+  if (present.length === 0) return [];
+
+  const lines = [
+    '[config] SPEECH-TO-TEXT HAS MOVED OUT OF THIS CONNECTOR and the following ' +
+      'settings no longer do anything:',
+  ];
+  for (const { key, env: name } of present) {
+    const where: string[] = [];
+    if (raw[key] !== undefined) where.push(`config.json "${key}"`);
+    if (env[name] !== undefined) where.push(`env ${name}`);
+    // The value is never echoed: one of these keys is an API key.
+    lines.push(`[config]   - ${where.join(' and ')} — ignored`);
+  }
+  lines.push(
+    '[config] Voice notes are now forwarded as audio and transcribed ONCE, by the ' +
+      'RECEIVING side\'s ours daemon, using the `stt` key in ITS ~/.ours/config.json. ' +
+      'Transcription is off there until that key is configured — and configuring it ' +
+      'is no longer something this operator controls.',
+  );
+
+  // The specific loss, named. Only meaningful when STT was actually on.
+  const enabled = raw.sttEnabled === true || env.OURS_TG_STT_ENABLED === '1' ||
+    env.OURS_TG_STT_ENABLED?.toLowerCase() === 'true';
+  const kinds = env.OURS_TG_STT_KINDS !== undefined
+    ? parseKinds(env.OURS_TG_STT_KINDS)
+    : parseKinds(raw.sttKinds);
+  const orphaned = kinds.filter((k) => k !== SDK_TRANSCRIBABLE_KIND);
+  if (orphaned.length) {
+    lines.push(
+      `[config] CAPABILITY LOST: sttKinds included ${orphaned.map((k) => `"${k}"`).join(', ')}, ` +
+        `which ${orphaned.length === 1 ? 'is' : 'are'} NOT transcribed by anything now. The SDK only ` +
+        `transcribes Telegram's semantic "${SDK_TRANSCRIBABLE_KIND}" notes (the only kind carrying the ` +
+        `x-ours-kind=voice-message marker its detector matches). Such attachments are now ` +
+        `delivered as plain files with no transcript` +
+        `${enabled ? '' : ' (STT was already disabled, so nothing changes today)'}.`,
+    );
+  }
+  return lines;
 }

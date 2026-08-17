@@ -18,8 +18,17 @@ real pre-#137 **tg** packet tuple, and it is the only copy of that particular
 history. Whoever needs it next will need it in a repo that has an engine.
 
 `tests/voice.test.mjs` was **not** deleted — it was rewritten. The STT and
-envelope logic it covers (`src/stt.ts`, `src/envelope.ts`) is still the
+envelope logic it covered (`src/stt.ts`, `src/envelope.ts`) was still the
 connector's own; only the transport underneath it moved.
+
+**Superseded since, for a different reason.** `src/stt.ts` and `tests/stt.test.mjs`
+are now deleted outright: the connector no longer transcribes, and transcription
+lives once in the ours SDK on the receiving side. `tests/voice.test.mjs` was
+rewritten a second time around what this repo still owns — that a voice note is
+always forwarded, carries the `x-ours-kind=voice-message` marker, and reaches the
+envelope with no transcript. The removed settings are covered by the new pure test
+`tests/config-stt-removed.test.mjs`. Note that this makes the section above
+historical: the STT half of what `voice.test.mjs` "still covers" no longer exists.
 
 ## `payload-mode.test.mjs`, removed when main's plain-payload feature merged in
 

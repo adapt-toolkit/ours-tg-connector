@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-// Pure unit test for the transcription behaviour of src/envelope.ts buildEnvelope()
-// — the text-fold, attachment-omit, error-shape, off-path, and caption-guard cases
-// that back the voice-STT DoD (SPEC §8.1–8.6). No broker, no Telegram, no network.
+// Pure unit test for src/envelope.ts — the voice-note shaping that survives now
+// that the connector no longer transcribes anything. No broker, no Telegram, no
+// network.
 //
-// (The broader envelope shaping lived in the root test-envelope.mjs, removed on
-// main as a scratch script; this keeps the STT-specific envelope coverage under
-// tests/ without resurrecting that file.)
+// WHAT THIS FILE USED TO TEST AND DELIBERATELY NO LONGER DOES: the transcript
+// text-fold, the `transcription` block, and the attachment-omit that went with a
+// text-only transcript. src/stt.ts is deleted; transcription belongs to the ours
+// SDK on the receiving side. The cases below are the inverse assertions — that
+// the envelope carries NO transcript and ALWAYS announces the forwarded audio —
+// because that is what makes the SDK's own transcription reachable at all.
 //
 // Run: node_modules/.bin/tsx tests/envelope.test.mjs
 
@@ -23,70 +26,65 @@ const base = {
   is_topic: false, from: 'Alice Smith', from_id: 12345, text: 'hello', date: 1750602602,
 };
 
-console.log('=== envelope transcription (voice STT) ===');
+console.log('=== envelope: voice notes travel as marked audio, never as a transcript ===');
 
-// ---- transcription (voice) ----
 {
   const voice = { ...base, text: '', attachment: { kind: 'voice', file_id: 'v1', file_size: 2048 } };
-  // transcribed, audio NOT forwarded => text folded, no attachment block
-  const e1 = JSON.parse(buildEnvelope(voice, undefined, undefined,
-    { status: 'ok', text: 'ship it friday', engine: 'openai', model: 'whisper-1', lang: 'en' }));
-  assert(e1.text === 'ship it friday', 'transcript folds into top-level text');
-  assert(e1.attachment === undefined, 'attachment omitted when audio not forwarded');
-  assert(e1.transcription && e1.transcription.status === 'ok' && e1.transcription.model === 'whisper-1', 'transcription block present');
-  assert(e1.transcription.engine === 'openai' && e1.transcription.lang === 'en', 'transcription carries engine + lang');
-
-  // transcribed AND forwarded => both blocks
   const resolved = { ok: true, bytes: Buffer.from('x'.repeat(2048)) };
+
+  // THE CORE OF THE CHANGE: a caption-less voice note keeps text '' and always
+  // announces the audio it forwarded.
+  const e1 = JSON.parse(buildEnvelope(voice, resolved, 'ours-file-abc'));
+  assert(e1.text === '', 'caption-less voice note keeps text "" — no transcript is folded in');
+  assert(e1.transcription === undefined, 'envelope has NO transcription block at all');
+  assert(e1.attachment && e1.attachment.wire_id === 'ours-file-abc', 'forwarded audio is announced with its wire_id');
+  assert(e1.attachment.transport === 'send_file', 'attachment declares the send_file transport');
+  assert(e1.attachment.filename === 'voice_4521.ogg', 'voice attachment gets deterministic safe .ogg filename');
+  assert(e1.attachment.mime === VOICE_MESSAGE_MIME,
+    'voice envelope carries the exact marker the SDK isVoiceMessage() matches');
+
+  // buildEnvelope takes three arguments now. A stale fourth argument from an
+  // un-migrated caller must not resurrect a transcript field.
+  const e2 = JSON.parse(buildEnvelope(voice, resolved, 'ours-file-abc',
+    { status: 'ok', text: 'ship it friday', engine: 'openai', model: 'whisper-1' }));
+  assert(e2.text === '' && e2.transcription === undefined,
+    'a leftover transcription argument is ignored, not folded into text');
+
+  // A failed send_file must not claim a transport or wire-id correlation.
+  const e3 = JSON.parse(buildEnvelope(voice, resolved));
+  assert(e3.attachment.error === 'file transfer failed', 'send_file failure is explicit in the envelope');
+  assert(e3.attachment.transport === undefined && e3.attachment.wire_id === undefined,
+    'send_file failure never advertises an unresolved transport correlation');
+  assert(e3.text === '', 'send_file failure still leaves text empty');
+
+  // Plain mode: the voice note is represented completely by the file, so there
+  // is no companion text message to manufacture.
   assert(buildPlainPayload({ ...base, attachment: undefined }, undefined, undefined) === 'hello',
     'plain mode forwards direct-chat text without JSON wrapping');
   assert(buildPlainPayload(voice, resolved, 'ours-file-abc') === undefined,
     'plain mode sends no companion text for a caption-less voice file');
-  assert(buildPlainPayload(voice, resolved, 'ours-file-abc', { status: 'ok', text: 'spoken words' }) === 'spoken words',
-    'plain mode forwards an enabled connector transcript as ordinary text');
+  assert(buildPlainPayload(voice, resolved, 'ours-file-abc', { status: 'ok', text: 'spoken words' }) === undefined,
+    'plain mode ignores a leftover transcription argument rather than sending it as text');
   assert(buildPlainPayload(voice, { ok: false, reason: 'error', detail: 'download failed' }, undefined)
     === '[Telegram voice unavailable: download failed]',
   'plain mode reports a failed attachment without a JSON envelope');
   assert(buildPlainPayload(voice, resolved, undefined)
     === '[Telegram voice unavailable: file transfer failed]',
   'plain mode reports a failed file-channel transfer without a JSON envelope');
-  const e2 = JSON.parse(buildEnvelope(voice, resolved, 'ours-file-abc',
-    { status: 'ok', text: 'hi', engine: 'openai', model: 'whisper-1' }));
-  assert(e2.text === 'hi', 'text folded in forward mode');
-  assert(e2.attachment && e2.attachment.wire_id === 'ours-file-abc', 'attachment kept in forward mode');
-  assert(e2.attachment.filename === 'voice_4521.ogg', 'voice attachment gets deterministic safe .ogg filename');
-  assert(e2.attachment.mime === VOICE_MESSAGE_MIME, 'voice envelope carries exact ours-mcp MIME marker');
-  assert(e2.transcription.status === 'ok', 'transcription kept in forward mode');
-
-  // STT error => attachment kept (file fallback), transcription.status error, text stays ''
-  const e3 = JSON.parse(buildEnvelope(voice, resolved, 'ours-file-def',
-    { status: 'error', error: 'STT HTTP 401' }));
-  assert(e3.text === '', 'text unchanged on STT error');
-  assert(e3.transcription.status === 'error' && /401/.test(e3.transcription.error), 'error captured in transcription');
-  assert(e3.attachment && e3.attachment.wire_id === 'ours-file-def', 'file still announced on STT error');
-
-  // no transcription arg => fallback shape has no transcription field
-  const e4 = JSON.parse(buildEnvelope(voice, resolved, 'ours-file-ghi'));
-  assert(e4.transcription === undefined, 'no transcription field when STT was not attempted');
-  assert(e4.text === '' && e4.attachment && e4.attachment.wire_id === 'ours-file-ghi',
-    'off-path keeps empty text and the correlated attachment');
-  assert(e4.attachment.mime === VOICE_MESSAGE_MIME, 'no-STT fallback still marks semantic voice for ours-mcp');
-
-  // A failed send_file must not claim a transport or wire-id correlation.
-  const e5 = JSON.parse(buildEnvelope(voice, resolved));
-  assert(e5.attachment.error === 'file transfer failed', 'send_file failure is explicit in the envelope');
-  assert(e5.attachment.transport === undefined && e5.attachment.wire_id === undefined,
-    'send_file failure never advertises an unresolved transport correlation');
 }
-// caption guard: an audio file WITH a caption keeps its caption as text
+
+// A captioned audio file keeps its caption. This used to be a guard against the
+// transcript overwriting it; it now simply asserts text is passed through.
 {
   const audio = { ...base, text: 'my song', attachment: { kind: 'audio', file_id: 'a1', file_size: 10 } };
-  const e = JSON.parse(buildEnvelope(audio, undefined, undefined, { status: 'ok', text: 'lyrics here', model: 'whisper-1' }));
-  assert(e.text === 'my song', 'existing caption is NOT overwritten by transcript');
-  assert(e.transcription.text === 'lyrics here', 'transcript still available in transcription block');
+  const e = JSON.parse(buildEnvelope(audio, { ok: true, bytes: Buffer.from('x') }, 'ours-file-xyz'));
+  assert(e.text === 'my song', 'a caption is forwarded verbatim');
+  assert(e.transcription === undefined, 'a captioned audio file has no transcription block either');
 }
 
 // Semantic kind, not filename/MIME guessing, controls voice-message marking.
+// This is now load-bearing rather than cosmetic: the marker is the ONLY thing
+// that tells the receiving SDK to transcribe the file.
 {
   const malformedVoice = {
     kind: 'voice', file_id: 'v2', file_name: '../../not-safe.exe',
@@ -100,7 +98,7 @@ console.log('=== envelope transcription (voice STT) ===');
     kind: 'audio', file_id: 'a2', file_name: 'recording.ogg', mime_type: 'audio/ogg',
   }, 99);
   assert(ordinaryOgg.filename === 'recording.ogg' && ordinaryOgg.mime === 'audio/ogg',
-    'ordinary non-voice OGG remains unmarked');
+    'ordinary non-voice OGG remains unmarked — and is therefore transcribed by nobody');
 }
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);

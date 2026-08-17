@@ -31,17 +31,20 @@ export type ResolvedAttachment =
   | { ok: true; bytes: Buffer }
   | { ok: false; reason: 'too_large' | 'error'; detail: string };
 
-// The outcome of a speech-to-text attempt on a voice/audio attachment. The
-// connector produces this (network, src/stt.ts) and hands it to buildEnvelope
-// (pure). Additive to the v:2 envelope — absent when STT was not attempted.
-export interface TranscriptionResult {
-  status: 'ok' | 'error';
-  text?: string;   // the transcript (present on ok)
-  engine?: string; // best-effort provider label
-  model?: string;
-  lang?: string;   // only if the provider returned it
-  error?: string;  // present on status:'error'
-}
+// THE `transcription` BLOCK IS GONE FROM THE v:2 ENVELOPE, and this is a
+// semantic change rather than a refactor. The connector used to run its own
+// speech-to-text (src/stt.ts, deleted) and both (a) attach a `transcription`
+// object and (b) substitute the transcript into the top-level `text` of a
+// caption-less message. It no longer does either.
+//
+// A voice note now travels as nothing but its marked file. The receiving side's
+// ours daemon transcribes it when it pulls the file with get_files, so the
+// transcript reaches the agent on the SDK's own voice delivery line instead of
+// in this envelope. Consequences worth stating outright:
+//   - `text` for a caption-less voice note is now always '' (it used to become
+//     the transcript);
+//   - transcription is configured by the RECEIVING operator, in the `stt` key of
+//     their ~/.ours/config.json — not by whoever runs this connector.
 
 // How far we excerpt the replied-to message's text into reply_to.text.
 const REPLY_EXCERPT_MAX = 200;
@@ -119,22 +122,15 @@ function buildAttachment(m: TelegramMessage, resolved?: ResolvedAttachment, file
 // Build the JSON envelope for one inbound Telegram message. `resolved` is the
 // attachment fetch outcome; `fileWireId` is the wire_id returned by send_file
 // when the bytes were sent on the file channel (present only on a successful
-// transfer). `transcription` is an optional STT result: on a successful
-// transcription of a caption-less message (always true for voice notes) its
-// text folds into the top-level `text`, so a bridged agent reads a spoken
-// message as ordinary text with zero agent-side changes.
+// transfer). The text is the user's own text, verbatim — nothing is ever folded
+// into it (see the note on the removed transcription block above).
 export function buildEnvelope(
   m: TelegramMessage,
   resolved?: ResolvedAttachment,
   fileWireId?: string,
-  transcription?: TranscriptionResult,
 ): string {
-  const transcribed = transcription?.status === 'ok' && typeof transcription.text === 'string';
-  // Voice notes have no caption (m.text === ''); only then does the transcript
-  // become text — this protects a captioned audio file from being overwritten.
-  const text = transcribed && m.text === '' ? (transcription!.text as string) : m.text;
-  // Audio bytes are only announced when they were actually sent: the connector
-  // omits `resolved` to deliver a text-only transcript (no attachment block).
+  const text = m.text;
+  // Audio bytes are only announced when they were actually sent.
   const attachment = resolved ? buildAttachment(m, resolved, fileWireId) : undefined;
   const envelope = {
     v: ENVELOPE_VERSION,
@@ -153,7 +149,6 @@ export function buildEnvelope(
     forwarded_from: m.forwarded_from,
     text,
     attachment,
-    transcription: transcription ?? undefined,
   };
   return JSON.stringify(envelope);
 }
@@ -168,10 +163,8 @@ export function buildPlainPayload(
   m: TelegramMessage,
   resolved?: ResolvedAttachment,
   fileWireId?: string,
-  transcription?: TranscriptionResult,
 ): string | undefined {
-  const transcribed = transcription?.status === 'ok' && typeof transcription.text === 'string';
-  const text = transcribed && m.text === '' ? (transcription!.text as string) : m.text;
+  const text = m.text;
   if (text !== '') return text;
   if (m.attachment && resolved && !resolved.ok) {
     const status = resolved.reason === 'too_large' ? 'omitted' : 'unavailable';

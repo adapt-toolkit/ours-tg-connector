@@ -65,7 +65,8 @@ message text directly without the Telegram JSON envelope. The default remains
 metadata distinguishes participants. Files always use the core file channel in
 both modes; Telegram voice notes retain the protocol MIME marker
 `audio/ogg; x-ours-kind=voice-message`, allowing the receiving daemon to invoke
-its native voice-transcription path even when no companion text is sent.
+its native voice-transcription path — which is now the only place transcription
+happens (see [Voice notes](#voice-notes-transcription-lives-in-the-ours-sdk)).
 
 Messages are end-to-end encrypted between the connector packet and the agent (ADAPT
 encrypted channels). The connector never persists message bodies to disk — only the
@@ -177,75 +178,51 @@ distinct from `send_message`, so files and text are always separate messages.
   plane receives a forced **metadata-only** copy (`[file] <name> (<mime>, <N> B)`)
   — never the bytes.
 
-### Voice transcription (speech-to-text)
+### Voice notes (transcription lives in the ours SDK)
 
-A Telegram **voice note** carries no caption, so a bridged agent (a text LLM)
-would otherwise receive an empty `text` and an unreadable audio blob. With STT
-enabled, the connector transcribes the voice note and delivers the transcript
-**through the normal envelope as ordinary `text`**, so any agent understands a
-spoken message with **zero agent-side changes**. A small `transcription` block is
-added for provenance:
+**This connector does not transcribe anything.** It used to run its own
+speech-to-text client; that client is gone, and with it the `sttEnabled`,
+`sttApiKey`, `sttBaseUrl`, `sttModel`, `sttLanguage`, `sttKinds`, `sttMaxBytes`,
+`sttTimeoutMs` and `forwardVoiceAudio` settings. There is now exactly **one**
+transcription implementation in the system and it lives in the ours SDK, on the
+receiving side.
 
-```jsonc
-{
-  "v": 2,
-  "text": "let's ship it friday",        // the transcript (voice notes have no caption)
-  "transcription": {
-    "text":   "let's ship it friday",
-    "engine": "openai",                    // best-effort label from the provider host
-    "model":  "whisper-1",
-    "lang":   "en",                        // only if the provider returns it
-    "status": "ok"                         // "ok" | "error"  (on error: "error":"<reason>", no text)
-  }
-}
-```
+**How a spoken message reaches an agent now.** A Telegram voice note is always
+forwarded as its original OGG/Opus bytes under a path-safe
+`voice_<message-id>.ogg` filename. Both `send_file.mime` and the correlated
+envelope's `attachment.mime` are exactly `audio/ogg; x-ours-kind=voice-message`.
+That marker is the whole mechanism: when the receiving side pulls the file with
+`get_files`, its ours daemon recognises it as a voice message and transcribes it
+there, delivering the transcript to the agent on its own voice delivery line.
+The semantic Telegram attachment kind is authoritative — an ordinary `audio`
+attachment whose MIME is plain `audio/ogg` is **not** marked as voice. See
+[the connector/receiver contract](docs/voice-message-contract.md).
 
-- **Opt-in, and it covers THIS PROCESS ONLY.** Off by default
-  (`sttEnabled:false`), which means *the connector* sends no audio to a
-  speech-to-text provider. It does **not** mean the audio is never transcribed:
-  the connector is a client of an ours daemon, and **the daemon runs its own
-  speech-to-text** when the receiving side pulls a voice note — under
-  configuration this connector's operator does not control and may not know
-  exists. When the connector was its own host, `sttEnabled:false` did cover the
-  whole path; attached, it no longer can. Turn it on and supply a key to
-  transcribe here as well (see [Configuration](#configuration)).
-- **No transcoding.** Telegram voice is **OGG/Opus**, which OpenAI-compatible
-  transcription endpoints accept directly — the connector adds **no ffmpeg** and no
-  new dependency (just built-in `fetch`).
-- **Provider-agnostic.** The endpoint is `{sttBaseUrl}/audio/transcriptions` with a
-  `Bearer` key — point it at OpenAI (`whisper-1`), Groq
-  (`whisper-large-v3-turbo`, faster/cheaper), or a **self-hosted** `whisper.cpp`
-  server. One config switch, no lock-in.
-- **Audio forwarding.** By default a successfully transcribed voice note is
-  delivered as **text only** (no `send_file`, no `attachment` block — the
-  `transcription` block already signals it came from voice). Set
-  `forwardVoiceAudio:true` to also `send_file` the `.ogg` alongside the transcript.
-- **Receiver interoperability.** Whenever a semantic Telegram `voice` attachment
-  is forwarded (STT is off/unavailable/fails/is over the cap, or
-  `forwardVoiceAudio:true`), the original OGG/Opus bytes travel unchanged under
-  a path-safe `voice_<message-id>.ogg` filename. Both `send_file.mime` and the
-  correlated envelope's `attachment.mime` are exactly
-  `audio/ogg; x-ours-kind=voice-message`, which is the ours-mcp recognition
-  contract. The semantic Telegram attachment kind is authoritative: an ordinary
-  `audio` attachment whose MIME is plain `audio/ogg` is not marked as voice.
-  See [the connector/receiver contract](docs/voice-message-contract.md) for the
-  independent verification matrix.
-- **Graceful degradation.** If STT is disabled, fails, times out, or the audio is
-  over `sttMaxBytes`, the bridge falls back to file forwarding — the
-  `.ogg` is still forwarded via `send_file` and nothing the user sent is lost. When
-  STT was attempted and failed, the envelope adds `transcription.status:"error"`
-  (e.g. `error:"too_large"` for the size guard); the daemon logs a single line
-  **without the key** and keeps polling.
-- **Cost & data egress.** Transcription bills to the configured provider
-  (whisper-1 ≈ **$0.006/min**, billed to the nearest second; operators pick the
-  provider and bear the cost). **Audio bytes leave the host** for that provider —
-  point `sttBaseUrl` at a self-hosted server to keep audio local. Per-message cost
-  and latency are bounded by `sttMaxBytes` and `sttTimeoutMs`.
+Two consequences are worth stating outright, because they are visible changes
+rather than refactors:
 
-**Secret handling.** Supply the key via `OURS_TG_STT_API_KEY` (preferred). If it
-is placed in `config.json` instead, the file stays mode `0600` and the key is
-**masked** whenever the daemon rewrites config — it is never persisted in clear
-and never written to logs.
+- **The envelope no longer carries a transcript.** There is no `transcription`
+  block, and a caption-less voice note now arrives with `"text": ""` — it used to
+  arrive with the transcript folded into `text`. An agent that read the transcript
+  out of the envelope must read it from its `get_files` voice line instead.
+- **Transcription is configured by the RECEIVER, not by you.** It is the `stt`
+  key in the receiving side's `~/.ours/config.json`, and it is **off** until that
+  key is set. Whoever runs this connector no longer controls whether — or where —
+  a voice note is transcribed, and no longer bears the provider cost.
+
+**Audio is now always forwarded.** The old `forwardVoiceAudio:false` default
+delivered a successfully transcribed note as text only, suppressing the bytes.
+That default is removed rather than flipped: withholding the audio would leave
+the receiving daemon with nothing to transcribe.
+
+**Upgrading from a version that had STT.** Any of the nine removed settings left
+in `config.json` or the environment is inert, and the connector **says so by name
+at startup** rather than ignoring it — one line per surviving setting. One case is
+a genuine loss and is reported as such: if `sttKinds` contained anything other
+than `voice` (e.g. `audio`, `video_note`), those attachments are transcribed by
+**nothing** now, because only semantic `voice` notes carry the marker the SDK's
+detector matches. Note also that the next config rewrite drops the removed keys
+from the file; the connector warns before doing it.
 
 ## Install
 
@@ -350,15 +327,15 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | retry backoff  | `OURS_TG_FETCH_RETRY_BASE_MS` | `300` (base delay between those retries; grows exponentially with jitter) |
 | attachment cap | `OURS_TG_ATTACHMENT_MAX_BYTES` | `10485760` (10 MB; larger inbound media forwarded as a metadata-only stub) |
 | outbound file cap | `OURS_TG_OUTBOUND_FILE_MAX_BYTES` | `52428800` (50 MB; a larger file from a contact is skipped + logged — Telegram's `sendDocument` limit) |
-| STT enabled    | `OURS_TG_STT_ENABLED`     | `false` (whether **this connector** transcribes voice; the attached daemon runs its own STT regardless — see [Voice](#voice-messages--speech-to-text)) |
-| STT API key    | `OURS_TG_STT_API_KEY`     | `''` (secret; env preferred — masked if placed in `config.json`, never logged) |
-| STT base URL   | `OURS_TG_STT_BASE_URL`    | `https://api.openai.com/v1` (OpenAI-compatible endpoint root; e.g. `https://api.groq.com/openai/v1` or a self-hosted whisper server) |
-| STT model      | `OURS_TG_STT_MODEL`       | `whisper-1` (e.g. `whisper-large-v3-turbo` on Groq) |
-| STT language   | `OURS_TG_STT_LANGUAGE`    | *(unset)* (optional ISO-639-1 hint; omit ⇒ provider auto-detects) |
-| STT kinds      | `OURS_TG_STT_KINDS`       | `voice` (comma-list of attachment kinds to transcribe; e.g. `voice,audio`) |
-| STT size guard | `OURS_TG_STT_MAX_BYTES`   | `5242880` (5 MB; audio over this skips STT and is forwarded as a file — cost/latency guard) |
-| STT timeout    | `OURS_TG_STT_TIMEOUT_MS`  | `60000` (per-transcription abort deadline, ms) |
-| forward voice audio | `OURS_TG_FORWARD_VOICE_AUDIO` | `false` (also `send_file` the `.ogg` alongside a successful transcript) |
+
+**Removed in this version — the nine speech-to-text settings.** `OURS_TG_STT_ENABLED`,
+`OURS_TG_STT_API_KEY`, `OURS_TG_STT_BASE_URL`, `OURS_TG_STT_MODEL`,
+`OURS_TG_STT_LANGUAGE`, `OURS_TG_STT_KINDS`, `OURS_TG_STT_MAX_BYTES`,
+`OURS_TG_STT_TIMEOUT_MS` and `OURS_TG_FORWARD_VOICE_AUDIO` (and their `config.json`
+equivalents) are **inert**. The connector no longer transcribes; the receiving
+side's ours daemon does, from the `stt` key in its own `~/.ours/config.json`. Any
+of them still set is named individually in a startup warning — see
+[Voice notes](#voice-notes-transcription-lives-in-the-ours-sdk).
 
 The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
 tokens, so do not expose the control port off-host.

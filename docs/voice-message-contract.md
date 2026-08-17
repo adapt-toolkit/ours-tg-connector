@@ -28,42 +28,63 @@ The connector generates the safe `.ogg` filename and fixed marked MIME above.
 If `send_file` fails, the envelope reports `error: "file transfer failed"` and
 does not claim a `transport` or `wire_id`.
 
-## STT decision matrix
+## Transcription: who does it, and when
 
-| Connector-side state | File forwarded? | Voice MIME marker? | Transcription block |
+**Not this connector.** It had its own speech-to-text client (`src/stt.ts`); that
+client and its nine `stt*`/`forwardVoiceAudio` settings are removed, so there is
+exactly one transcription implementation in the system and it belongs to the ours
+SDK on the receiving side.
+
+| Case | File forwarded? | Voice MIME marker? | Who transcribes |
 | --- | --- | --- | --- |
-| STT disabled | yes | yes, file + envelope | absent |
-| STT enabled without a key | yes | yes, file + envelope | `status: "error"` |
-| STT provider failure/timeout | yes | yes, file + envelope | `status: "error"` |
-| Over `sttMaxBytes` | yes | yes, file + envelope | `status: "error", error: "too_large"` |
-| STT succeeds, `forwardVoiceAudio: false` | no | not applicable | `status: "ok"`; transcript folds into text |
-| STT succeeds, `forwardVoiceAudio: true` | yes | yes, file + envelope | `status: "ok"` |
+| Semantic `kind: "voice"`, bytes resolved | **always** | yes, file + envelope | the RECEIVING daemon, on its `get_files` |
+| Semantic `kind: "voice"`, download failed/over cap | no | not applicable | nobody — the envelope reports the failure |
+| Ordinary `kind: "audio"` (even `audio/ogg`) | yes | **no** | nobody — an unmarked file is never transcribed |
 
-The ours MIME parameter is wire metadata, not a provider media type. Before an
-STT upload, the connector strips parameters and sends the provider the base
-`audio/ogg` MIME.
+Two properties this table is really asserting:
+
+- **The audio is always forwarded when it resolved.** There is no longer any
+  condition under which a successfully downloaded voice note is withheld. The old
+  `forwardVoiceAudio: false` default suppressed exactly those bytes on a successful
+  local transcription; keeping it would leave the receiving daemon nothing to work
+  with.
+- **The envelope carries no transcript.** There is no `transcription` block, and a
+  caption-less voice note arrives with `"text": ""`. The transcript reaches the
+  agent on the receiving SDK's own voice delivery line, and only if that side has
+  configured `stt` in its `~/.ours/config.json`.
+
+The marker is therefore the entire mechanism, and it is applied on semantic kind
+alone — which is also why an operator who had `sttKinds: ["voice","audio"]` loses
+transcription for `audio`: nothing marks it, so nothing transcribes it.
 
 ## Receiver evidence
 
-ours-mcp commit `c8dd602` (`packages/core/src/transcribe.ts`) recognizes the
-case-insensitive MIME parameter `x-ours-kind=voice-message` and deliberately
-rejects an unmarked `audio/ogg` file. Its
-`packages/core/test/transcribe-detect.test.mjs` test locks both behaviors.
+ours-sdk `main` (`src/transcribe.ts`) recognizes the case-insensitive MIME
+parameter `x-ours-kind=voice-message` via `isVoiceMessage()` and deliberately
+rejects an unmarked `audio/ogg` file. `src/render/adapt-to-json.ts`
+(`writeIncomingFiles`) is what runs it: every incoming file matching that detector
+is transcribed inside `getFiles()` under the receiver's `stt` config, with no
+separate call from the consumer. `test/transcribe-detect.test.mjs` and
+`test/transcribe-stt.test.mjs` lock those behaviours in that repository — not this
+one.
 
 Independent checks in this repository:
 
 ```sh
 node --import tsx tests/envelope.test.mjs
-node --import tsx tests/stt.test.mjs
+node --import tsx tests/config-stt-removed.test.mjs
 node --import tsx tests/voice.test.mjs
 ```
 
-The first two are pure local tests. The voice integration test uses placeholder
-OGG/Opus-signature bytes, a real ours daemon driven through `@ours.network/sdk`
-(the connector no longer runs an in-process ADAPT host), and a stubbed STT
-provider; it requires no Telegram token, STT token, or real media.
+The first two are pure local tests: envelope shaping, and the startup warning that
+names every removed `stt*` setting an operator still has configured. The voice
+integration test uses placeholder OGG/Opus-signature bytes and a real ours daemon
+driven through `@ours.network/sdk`; it requires no Telegram token, no STT key and
+no real media.
 
-The STT spy is scoped **by origin**, not by URL: the daemon transcribes through
-the same `openai-compatible` provider URL, so a URL-matching spy cannot tell the
-daemon's call apart from the connector's, and an assertion that "the STT provider
-was never called" would fail against a connector that correctly never called it.
+That test asserts a negative that used to need a carefully scoped spy — that **no**
+transcription endpoint is called by this process. It can now be a blanket check,
+because the connector has no transcription client to call one with. The receiving
+daemon's own transcription is not stubbed and not asserted here; with no `stt` key
+configured for the test agent, the SDK records a `configured: false` outcome and
+the bytes still land, which is the property this repository cares about.
