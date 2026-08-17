@@ -33,6 +33,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as fs from 'node:fs';
 
 import { loadConfig } from './config';
+import { serviceEnvironment } from './service-definition';
 import { looksLikeBotToken } from './routing';
 
 const CONFIG = loadConfig();
@@ -457,15 +458,9 @@ function run(cmd: string, args: string[]): boolean {
 }
 
 // Env baked into the service definition so the daemon resolves the same config.
-function serviceEnv(): Record<string, string> {
-  return {
-    OURS_TG_DAEMON_URL: CONFIG.daemonUrl,
-    OURS_TG_DAEMON_STATE_DIR: CONFIG.daemonStateDir,
-    OURS_TG_CONTROL_PORT: String(CONFIG.controlPort),
-    OURS_TG_STATE_DIR: STATE_DIR,
-    OURS_TG_POLL_TIMEOUT: String(CONFIG.pollTimeoutSec),
-  };
-}
+// An UNCHOSEN daemon selection produces no line at all — see service-definition.ts
+// for why an empty baked value is worse than an absent one.
+const serviceEnv = (): Record<string, string> => serviceEnvironment(CONFIG, STATE_DIR);
 
 function installSystemd(): void {
   const unitPath = systemdUnitPath();
