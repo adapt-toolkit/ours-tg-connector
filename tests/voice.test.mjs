@@ -20,12 +20,18 @@
 //      transcribe it.
 //   3. The envelope carries no transcript and no transcription block.
 //
-// THE DAEMON'S OWN STT IS NOT STUBBED AND NOT ASSERTED HERE. It runs on the
-// AGENT's getFiles() under the agent's own `stt` config, which is absent in this
-// test environment — so the SDK records an "unconfigured" outcome and the bytes
-// still land. Asserting the transcript itself belongs to the SDK's own suite
-// (ours-sdk test/transcribe-stt.test.mjs), not to this repo: there is exactly one
-// transcription client now and this repo does not own it.
+// THE DAEMON'S OWN STT IS PINNED TO A LOCAL STUB, and that is not optional. The
+// SDK reads `stt` from the REAL ~/.ours/config.json, and OURS_STATE_DIR does not
+// redirect it. On a host where the operator has configured transcription, an
+// unpinned run of this test uploads its audio to that operator's live provider
+// on their key — this test did exactly that once. OURS_STT_* env overrides the
+// config file field-by-field, so the block below points the receiving side at a
+// local HTTP stub: deterministic, offline, and nobody's key is spent.
+//
+// The connector-side spy is scoped BY ORIGIN, not by URL: with the daemon in this
+// same process, "was a transcription endpoint called" is true for a connector that
+// correctly never called one. Only calls made while the connector's own send is in
+// flight count against it.
 //
 // The send block below (forwardVoice) mirrors connector.ts forwardToNode's
 // remaining send decision, because connector.ts auto-runs main() on import and
@@ -49,6 +55,27 @@ process.env.OURS_API_VISIBILITY = 'open';
 const freePort = () => new Promise((res) => { const sv = createServer(); sv.listen(0, () => { const pt = sv.address().port; sv.close(() => res(pt)); }); });
 const PORT = await freePort();
 process.env.OURS_PORT = String(PORT);
+
+// The local STT stub the RECEIVING side will use. Started before the SDK import
+// because the SDK reads its config at module load.
+const STUB_TRANSCRIPT = 'ship it friday';
+let sttStubHits = 0;
+const STT_PORT = await freePort();
+const sttStub = createServer((req, res) => {
+  sttStubHits++;
+  req.resume();
+  req.on('end', () => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ text: STUB_TRANSCRIPT, language: 'en' }));
+  });
+});
+await new Promise((r) => sttStub.listen(STT_PORT, '127.0.0.1', r));
+// OURS_STT_* overrides the ~/.ours/config.json `stt` block field by field.
+process.env.OURS_STT_PROVIDER = 'openai-compatible';
+process.env.OURS_STT_BASE_URL = `http://127.0.0.1:${STT_PORT}/v1`;
+process.env.OURS_STT_MODEL = 'stub-whisper';
+process.env.OURS_STT_API_KEY = 'stub-key-not-a-real-credential';
+
 const { OursClient } = await import('@ours.network/sdk');
 // startDaemon boots the wrapper ITSELF — calling bootWrapper() as well is a
 // double init that dies naming neither call.
@@ -65,22 +92,27 @@ function assert(cond, msg) {
 // something has re-introduced a reason to withhold audio and that is the bug this
 // test exists to catch.
 async function forwardVoice(client, targetCid, m, resolved) {
-  const sendAudio = !!(resolved?.ok);
-  let fileWireId;
-  if (m.attachment && resolved?.ok && sendAudio) {
-    const meta = attachmentMeta(m.attachment, m.message_id);
-    // data_base64, not a path — the bytes came off Telegram and are in memory.
-    const r = await client.sendFile({
-      contact: targetCid,
-      data_base64: Buffer.from(resolved.bytes).toString('base64'),
-      filename: meta.filename,
-      mime: meta.mime,
-    });
-    fileWireId = 'wireId' in r ? r.wireId : undefined;
+  globalThis.__connectorSending?.(true);
+  try {
+    const sendAudio = !!(resolved?.ok);
+    let fileWireId;
+    if (m.attachment && resolved?.ok && sendAudio) {
+      const meta = attachmentMeta(m.attachment, m.message_id);
+      // data_base64, not a path — the bytes came off Telegram and are in memory.
+      const r = await client.sendFile({
+        contact: targetCid,
+        data_base64: Buffer.from(resolved.bytes).toString('base64'),
+        filename: meta.filename,
+        mime: meta.mime,
+      });
+      fileWireId = 'wireId' in r ? r.wireId : undefined;
+    }
+    const body = buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId);
+    await client.sendMessage({ contact: targetCid, text: body });
+    return { sentFile: !!fileWireId };
+  } finally {
+    globalThis.__connectorSending?.(false);
   }
-  const body = buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId);
-  await client.sendMessage({ contact: targetCid, text: body });
-  return { sentFile: !!fileWireId };
 }
 
 async function main() {
@@ -129,14 +161,20 @@ async function main() {
   const opus = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(24), Buffer.from('OpusHead'), Buffer.alloc(640)]);
   const resolvedOk = { ok: true, bytes: opus };
 
-  // A fetch spy over the WHOLE process, used only to prove a negative: this
-  // connector must not call ANY transcription endpoint. Scoping it by URL would
-  // be wrong here — the point is that the connector makes no such call at all.
+  // Prove the negative that this change is about: the CONNECTOR never calls a
+  // transcription endpoint. The daemon shares this process and legitimately does
+  // call one, so the counter is gated on the connector's own send being in flight
+  // — a blanket URL match would fail against a connector that correctly made no
+  // such call.
   const realFetch = globalThis.fetch;
-  let transcriptionCalls = 0;
+  let connectorSending = false;
+  globalThis.__connectorSending = (on) => { connectorSending = on; };
+  let connectorTranscriptionCalls = 0;
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : String(input?.url ?? input);
-    if (/audio\/transcriptions|speech-to-text|\/v1\/listen/.test(url)) transcriptionCalls++;
+    if (connectorSending && /audio\/transcriptions|speech-to-text|\/v1\/listen/.test(url)) {
+      connectorTranscriptionCalls++;
+    }
     return realFetch(input, init);
   };
 
@@ -160,18 +198,19 @@ async function main() {
       'file and envelope metadata agree exactly');
 
     console.log('\n-- the connector never calls a transcription provider --');
-    assert(transcriptionCalls === 0, 'no transcription endpoint was called by this process');
+    assert(connectorTranscriptionCalls === 0, 'the connector made no transcription call while sending');
 
-    // The receiving SDK is what decides about transcription now. With no `stt`
-    // key configured for the agent, it records an unconfigured outcome — and,
-    // critically, still delivers the audio.
+    // THE POSITIVE HALF, and the reason deleting src/stt.ts loses nothing: the
+    // transcript still reaches the agent — produced by the RECEIVING side's SDK,
+    // out of the marked file, with no request from the consumer beyond getFiles().
     console.log('\n-- transcription is the receiving SDK\'s call, not the connector\'s --');
     assert(a.files[0].kind === 'voice_message',
       'the receiving SDK classified it as a voice message from the marker alone');
-    assert(a.files[0].transcription !== undefined,
-      'the receiving SDK attached its OWN transcription outcome to the file');
-    assert(a.files[0].transcription?.configured === false,
-      'with no stt key on the receiving side, the outcome is "not configured" rather than a silent drop');
+    assert(sttStubHits > 0, 'the RECEIVING side called the transcription provider, on its own config');
+    assert(a.files[0].transcription?.configured === true && a.files[0].transcription?.status === 'succeeded',
+      'the receiving SDK attached its OWN successful transcription outcome to the file');
+    assert(a.files[0].transcription?.text === STUB_TRANSCRIPT,
+      'the transcript itself arrives with the file, without the connector transcribing anything');
 
     // Ordinary audio is NOT marked, and is therefore transcribed by nobody. This
     // is the capability an operator with sttKinds:["audio"] loses; it is asserted
@@ -185,6 +224,7 @@ async function main() {
         mime_type: 'audio/ogg', file_size: opus.length,
       },
     };
+    const hitsBeforeOrdinary = sttStubHits;
     r = await forwardVoice(connector, AGENT_NAME, ordinaryOgg, resolvedOk);
     a = await drainAgent();
     assert(r.sentFile && a.files[0].mime === 'audio/ogg' && a.files[0].filename === 'recording.ogg',
@@ -193,6 +233,8 @@ async function main() {
       'ordinary OGG envelope metadata remains non-voice');
     assert(a.files[0].kind !== 'voice_message',
       'the receiving SDK does NOT treat it as a voice message — so nothing transcribes it');
+    assert(sttStubHits === hitsBeforeOrdinary,
+      'no transcription is attempted for unmarked audio — the capability an sttKinds:["audio"] operator loses');
 
     // Voice metadata is never trusted for the filename or base MIME: Telegram's
     // semantic `voice` field is enough to select the fixed OGG/Opus contract.
@@ -213,6 +255,7 @@ async function main() {
   } finally {
     globalThis.fetch = realFetch;
     await handle.close?.();
+    await new Promise((r) => sttStub.close(r));
     rmSync(DAEMON_STATE, { recursive: true, force: true });
   }
 
