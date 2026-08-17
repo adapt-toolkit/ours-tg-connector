@@ -33,7 +33,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as fs from 'node:fs';
 
 import { loadConfig } from './config';
-import { serviceEnvironment } from './service-definition';
+import { launchdPlist, serviceEnvironment } from './service-definition';
 import { looksLikeBotToken } from './routing';
 
 const CONFIG = loadConfig();
@@ -522,31 +522,13 @@ function installLaunchd(): void {
   const plistPath = launchdPlistPath();
   fs.mkdirSync(dirname(plistPath), { recursive: true });
   const env = serviceEnv();
-  const envEntries = Object.entries(env)
-    .map(([k, v]) => `    <key>${k}</key><string>${v}</string>`)
-    .join('\n');
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${process.execPath}</string>
-    <string>${SELF}</string>
-    <string>serve</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-${envEntries}
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${LOG_PATH}</string>
-  <key>StandardErrorPath</key><string>${LOG_PATH}</string>
-</dict>
-</plist>
-`;
+  const plist = launchdPlist({
+    label: LAUNCHD_LABEL,
+    execPath: process.execPath,
+    self: SELF,
+    logPath: LOG_PATH,
+    env,
+  });
   fs.writeFileSync(plistPath, plist);
   out(`wrote ${plistPath}`);
 
