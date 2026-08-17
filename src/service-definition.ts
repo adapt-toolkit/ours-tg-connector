@@ -46,3 +46,68 @@ export function serviceEnvironment(config: ConnectorConfig, stateDir: string): R
   if (config.daemonStateDir) env.OURS_TG_DAEMON_STATE_DIR = config.daemonStateDir;
   return env;
 }
+
+// ── The launchd plist ──────────────────────────────────────────────────────────
+//
+// Every value interpolated into a plist is XML TEXT and has to be escaped as such.
+// This was interpolated raw, and a path is allowed to contain the characters that
+// makes ill-formed: `/Users/ben/Library/Ben & Co/.ours-telegram` produced
+//
+//     <key>OURS_TG_STATE_DIR</key><string>/Users/ben/Library/Ben & Co/…</string>
+//
+// which a strict XML parser rejects outright — "not well-formed (invalid token)"
+// — so `launchctl load` has nothing valid to read and the connector silently never
+// starts at boot. ours-mcp escapes the identical fields through its own xmlText
+// (packages/core/src/service-instance.ts), and the escaped form round-trips the
+// path back byte-for-byte. This is the same rule, in the second place that needs it.
+//
+// `'` is escaped as &apos; deliberately, matching ours-mcp: it is not required in
+// element text, but two implementations of one rule that differ in the details are
+// how the details drift.
+export function xmlText(value: string | number): string {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&apos;',
+  })[character]!);
+}
+
+export interface LaunchdPlistInput {
+  readonly label: string;
+  readonly execPath: string;
+  /** Absolute path to the installed cli.js the agent runs with `serve`. */
+  readonly self: string;
+  readonly logPath: string;
+  readonly env: Record<string, string>;
+}
+
+/** The launchd agent plist text. Emitted here so it is testable without launchd. */
+export function launchdPlist(input: LaunchdPlistInput): string {
+  const envEntries = Object.entries(input.env)
+    .map(([key, value]) => `    <key>${xmlText(key)}</key><string>${xmlText(value)}</string>`)
+    .join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${xmlText(input.label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xmlText(input.execPath)}</string>
+    <string>${xmlText(input.self)}</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+${envEntries}
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${xmlText(input.logPath)}</string>
+  <key>StandardErrorPath</key><string>${xmlText(input.logPath)}</string>
+</dict>
+</plist>
+`;
+}
