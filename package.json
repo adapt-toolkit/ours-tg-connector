@@ -36,7 +36,7 @@
     "test": "for f in tests/*.test.mjs; do echo \"# $f\"; node_modules/.bin/tsx \"$f\" || exit 1; done"
   },
   "dependencies": {
-    "@ours.network/sdk": "0.1.2",
+    "@ours.network/sdk": "1.5.2",
     "undici": "^7.28.0"
   },
   "devDependencies": {
