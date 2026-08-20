@@ -299,6 +299,27 @@ export function unpackInvite(b64: string): Buffer {
 }
 
 // ----- AdaptValue → plain output ----------------------------------------------
+// The sender's pointer at the message this one answers (a2a_protocol::reply_ref_t:
+// $wire_id + optional $sentence). Present only when the sender marked the message
+// a reply — which for Telegram reply threading is the whole signal.
+export interface ReplyPointer {
+  wire_id: string;
+  sentence?: number;
+}
+
+// Decode a nullable reply_ref_t. NIL (not a reply) and an empty wire_id both come
+// back undefined, so a caller never looks up the empty string.
+export function renderReplyRef(v: AdaptValue): ReplyPointer | undefined {
+  if (v.IsNil()) return undefined;
+  const wire = v.Reduce('wire_id');
+  if (wire.IsNil()) return undefined;
+  const wireId = wire.Visualize();
+  if (!wireId) return undefined;
+  const s = v.Reduce('sentence');
+  const sentence = s.IsNil() ? undefined : parseInt(s.Visualize(), 10);
+  return { wire_id: wireId, sentence: Number.isFinite(sentence as number) ? sentence : undefined };
+}
+
 export interface InboxMsg {
   msg_id: number;
   sender_id: string;
@@ -307,6 +328,7 @@ export interface InboxMsg {
   date: string;
   status: string;
   wire_id: string;
+  reply_to?: ReplyPointer;
 }
 
 export function renderInbox(v: AdaptValue): InboxMsg[] {
@@ -323,9 +345,35 @@ export function renderInbox(v: AdaptValue): InboxMsg[] {
       date: m.Reduce('date').Visualize(),
       status: m.Reduce('status').Visualize(),
       wire_id: m.Reduce('wire_id').Visualize(),
+      reply_to: renderReplyRef(m.Reduce('reply_to')),
     });
   }
   return out;
+}
+
+// One decoded `receipt_received` notify: a peer confirmed delivery or reading of
+// messages WE sent. $wire_ids can cover several messages in one event.
+export interface ReceiptEvent {
+  senderId: string;
+  kind: 'delivered' | 'read';
+  wireIds: string[];
+}
+
+export function renderReceipt(payload: AdaptValue): ReceiptEvent | null {
+  const kind = payload.Reduce('kind').Visualize();
+  if (kind !== 'delivered' && kind !== 'read') return null;
+  const wireIds: string[] = [];
+  const arr = payload.Reduce('wire_ids');
+  if (!arr.IsNil()) {
+    for (let i = 0; ; i++) {
+      const w = arr.Reduce(i);
+      if (w.IsNil()) break;
+      const id = w.Visualize();
+      if (id) wireIds.push(id);
+    }
+  }
+  if (wireIds.length === 0) return null;
+  return { senderId: payload.Reduce('sender_id').Visualize(), kind, wireIds };
 }
 
 export interface InboxFile {

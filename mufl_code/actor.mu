@@ -434,6 +434,32 @@ application actor loads libraries
                 // original, so we persist nothing (design D6). We DO emit the
                 // metadata-only "out" monitoring copy, mirroring on_message_sent.
                 return monitor_copy_actions "out" ((arg $target_id) safe global_id) (a2a_messaging::file_monitor_summary ((arg $filename) safe str) ((arg $mime) safe str) ((arg $data) safe bin)) ((arg $date) safe time).
+            },
+            // core 0.7.0 receipts. A peer confirmed delivery ("delivered") or
+            // reading ("read") of messages WE sent; the daemon turns each wire_id
+            // into a reaction on the Telegram message that produced it. Nothing is
+            // stored packet-side: receipts are best-effort UX by core's own
+            // contract, never load-bearing, so a lost notify costs one reaction and
+            // nothing else — hence no _save_state here either (core adds its own
+            // when the receipt retires an unacked-redrive entry).
+            //
+            // $wire_ids is rebuilt element by element rather than cast wholesale:
+            // core already validated the shape, and this keeps the notify payload
+            // a plain str[] the host decodes with the same loop it uses for an inbox.
+            $on_receipt_received -> fn (arg: any) -> transaction::action::type[]
+            {
+                ids is str[] = [].
+                sc (arg $wire_ids) -- ( -> w)
+                {
+                    ids (_count ids|) -> (w safe str).
+                }
+                if (_count ids|) == 0 { return []. }
+                return [ _notify_agent (
+                    $event     -> $receipt_received,
+                    $sender_id -> (arg $sender_id) safe global_id,
+                    $kind      -> (arg $kind) safe str,
+                    $wire_ids  -> ids
+                ) ].
             }
         ).
 
@@ -516,6 +542,25 @@ application actor loads libraries
                 $params  -> "",
                 $secrets -> (,)
             ).
+            // core 0.7.0 receipts. BOTH halves, and both are load-bearing here:
+            // `receive` is what makes a peer's receipt_gate let its confirmations
+            // through to us (that is what becomes a Telegram reaction), and `emit`
+            // is required by our OWN gate before we may send any — including the
+            // read receipts get_messages / get_files emit on the consumer path.
+            // Advertised in describe() for a bound control plane; the wire-level
+            // half that peers actually learn is the $advertise list below.
+            caps a2a_capabilities::cap_receipts_emit -> (
+                $cap     -> a2a_capabilities::cap_receipts_emit,
+                $version -> 1,
+                $params  -> "",
+                $secrets -> (,)
+            ).
+            caps a2a_capabilities::cap_receipts_receive -> (
+                $cap     -> a2a_capabilities::cap_receipts_receive,
+                $version -> 1,
+                $params  -> "",
+                $secrets -> (,)
+            ).
             return (
                 $version           -> 1,
                 $app_id            -> "network.ours.telegram-connector",
@@ -563,8 +608,22 @@ application actor loads libraries
             // and understands the ping. The npm version string (0.1.8-nightly.4 on the
             // running bridge) is NOT a proxy for the compiled core version; they are
             // different objects and only the packet answers this question.
+            //
+            // cap_receipts_emit / cap_receipts_receive (core 0.7.0): the pair that
+            // opens receipt_gate (a2a_messaging.mm:1408). The gate is asymmetric —
+            // a SENDER emits only when it advertises `emit` AND the peer's learned
+            // caps carry `receive`. So `receive` here is what lets an agent's node
+            // send us the delivered/read confirmations we render as reactions, and
+            // `emit` is what lets US answer with the read receipts get_messages /
+            // get_files raise on their consumer path. Safe to claim: the receipt
+            // ingest transaction and the emit builders are core-side and inherited
+            // by any actor loading a2a_messaging (pin edbb11ad, core 0.9.0 > 0.7.0),
+            // and the receive side is a real consumer here, not a stub — the
+            // $on_receipt_received hook above forwards every event to the daemon.
             $advertise  -> [ a2a_capabilities::cap_e2e, a2a_capabilities::cap_e2e_migrate,
-                             a2a_capabilities::cap_e2e_rekey ],
+                             a2a_capabilities::cap_e2e_rekey,
+                             a2a_capabilities::cap_receipts_emit,
+                             a2a_capabilities::cap_receipts_receive ],
             $handlers   -> (,),
             $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. }
         ).
@@ -612,6 +671,13 @@ application actor loads libraries
 
         fresh is message_t[] = [].
         new_inbox is message_t[] = [].
+        // core 0.7.0 READ receipts ride exactly this transition. A readonly trn
+        // cannot emit sends, so the unread->processed MARK *is* the read event: we
+        // collect the wire_ids we just flipped, grouped by sender (one receipt per
+        // peer covers many ids), and emit below. Because the ids come from the
+        // transition and not from the inbox, emission is exact-once for free — a
+        // second get_messages finds nothing unread and sends nothing.
+        read_ids is (global_id ->> str[]) = (,).
         sc inbox -- ( -> m)
         {
             if (m $status) == "unread"
@@ -628,6 +694,16 @@ application actor loads libraries
                 ).
                 fresh (_count fresh|) -> m.
                 new_inbox (_count new_inbox|) -> processed_m.
+                // "" = a pre-wire-id sender or an introduction first-message:
+                // nothing to confirm, so it is left out rather than guessed at.
+                if (m $wire_id) != ""
+                {
+                    wids is str[] = [].
+                    prev = read_ids (m $sender_id).
+                    if prev != NIL { wids -> prev?. }
+                    wids (_count wids|) -> m $wire_id.
+                    read_ids (m $sender_id) -> wids.
+                }
             }
             else
             {
@@ -636,10 +712,20 @@ application actor loads libraries
         }
         inbox -> new_inbox.
 
-        return transaction::success [
-            _return_data ($messages -> fresh),
-            _save_state NIL
-        ].
+        actions is transaction::action::type[] = [].
+        actions (_count actions|) -> _return_data ($messages -> fresh).
+        // read_receipt_actions returns [] when the gate is shut (we don't advertise
+        // emit, or the peer never said it consumes receipts), so this is appended
+        // blindly and costs nothing when receipts are not in play.
+        sc read_ids -- (peer -> wids)
+        {
+            sc a2a_messaging::read_receipt_actions peer wids -- ( -> a)
+            {
+                actions (_count actions|) -> a.
+            }
+        }
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     // Hand the agent every file it has not seen (status "unread") and flip those to
@@ -652,6 +738,9 @@ application actor loads libraries
 
         fresh is file_t[] = [].
         new_inbox is file_t[] = [].
+        // Files share the wire_id namespace with messages, so the read receipt is
+        // raised on this transition exactly as in get_messages.
+        read_ids is (global_id ->> str[]) = (,).
         sc file_inbox -- ( -> f)
         {
             if (f $status) == "unread"
@@ -670,6 +759,14 @@ application actor loads libraries
                 ).
                 fresh (_count fresh|) -> f.
                 new_inbox (_count new_inbox|) -> processed_f.
+                if (f $wire_id) != ""
+                {
+                    wids is str[] = [].
+                    prev = read_ids (f $sender_id).
+                    if prev != NIL { wids -> prev?. }
+                    wids (_count wids|) -> f $wire_id.
+                    read_ids (f $sender_id) -> wids.
+                }
             }
             else
             {
@@ -678,10 +775,17 @@ application actor loads libraries
         }
         file_inbox -> new_inbox.
 
-        return transaction::success [
-            _return_data ($files -> fresh),
-            _save_state NIL
-        ].
+        actions is transaction::action::type[] = [].
+        actions (_count actions|) -> _return_data ($files -> fresh).
+        sc read_ids -- (peer -> wids)
+        {
+            sc a2a_messaging::read_receipt_actions peer wids -- ( -> a)
+            {
+                actions (_count actions|) -> a.
+            }
+        }
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     // Two-generation garbage collection of handled messages, fired by the host on
