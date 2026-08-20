@@ -40,6 +40,10 @@
 //                        unpersisted) seed phrase used to recreate the packet
 //     state_data.bin    serialized packet state (contacts + encrypted channels)
 //     connection.json   { botName, chatId, threadId, bio, label, peerCid, ... }
+//     messages.json     wire_id -> (chat id, message id, receipt state) plus this
+//                        route's per-contact receipt settings — what makes reply
+//                        threading and delivery/read reactions survive a restart.
+//                        Ids and state only; never message content. See msgmap.ts.
 //
 // On boot the bot registry is loaded first (one TelegramClient per bot, no poll
 // yet), then every persisted route is recreated so its packet re-registers on the
@@ -76,6 +80,7 @@ import {
   renderFiles,
   renderContacts,
   renderControlRequests,
+  renderReceipt,
   withScope,
   withScopeAsync,
 } from './adapt';
@@ -86,6 +91,8 @@ import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
 import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './envelope';
 import { transcribe } from './stt';
 import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply } from './routing';
+import { MessageMap } from './msgmap';
+import { emojiFor, formatStatus, parseReceiptCommand, type ReceiptState } from './receipts';
 
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
@@ -159,6 +166,9 @@ interface Connection {
   cfg: ConnectionFile;
   bot: Bot;
   lastChat: { chatId: string; threadId: string } | null; // most recent inbound origin (reverse-delivery target for non-topic-pinned routes)
+  // wire_id ⇄ Telegram message ids + this connection's receipt settings, persisted
+  // in the route dir so reply threading and reaction state survive a restart.
+  map: MessageMap;
 }
 
 const host = new AdaptHost(CONFIG.brokerUrl, log);
@@ -167,6 +177,8 @@ const bots = new Map<string, Bot>(); // bot name -> bot
 
 // ----- per-route paths --------------------------------------------------------
 const connDir = (name: string) => join(STATE_DIR, name);
+// The route's wire_id ⇄ Telegram message map (messages.json in the route dir).
+const newMessageMap = (dir: string, name: string) => new MessageMap(dir, (m) => log(`[${name}] ${m}`));
 const keyPath = (dir: string) => join(dir, 'identity.key');
 const dataPath = (dir: string) => join(dir, 'state_data.bin');
 const metaPath = (dir: string) => join(dir, 'connection.json');
@@ -597,14 +609,29 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     // send_file. Do not manufacture an empty text message or a JSON wrapper.
     if (body === undefined) continue;
     try {
-      const { deferred, queued } = await withScopeAsync(async (lt) => {
+      const { deferred, queued, wireId } = await withScopeAsync(async (lt) => {
         const sent = await pkt.mutatingTx('::a2a_messaging::send_message', { contact: target, text: body }, lt);
         const defAv = sent.Reduce('deferred');
+        const wireAv = sent.Reduce('wire_id');
         return {
           deferred: !defAv.IsNil(),
           queued: defAv.IsNil() ? 0 : Number(sent.Reduce('queued').Visualize()),
+          wireId: wireAv.IsNil() ? '' : String(wireAv.Visualize()),
         };
       });
+      // Remember which Telegram message this wire_id IS. Two consumers: the
+      // agent's reply (reply_to.wire_id -> reply_parameters.message_id) and its
+      // receipts (delivered/read -> a reaction on this exact message). Recorded
+      // for a deferred send too — the wire_id is already minted and the queue
+      // flushes under the same id.
+      if (wireId && m.message_id > 0) {
+        conn.map.record(wireId, {
+          chatId: String(m.chat_id),
+          messageId: m.message_id,
+          contactCid: target,
+          direction: 'inbound',
+        });
+      }
       if (deferred) {
         log(`[${cfg.name}] message to ${target} queued — contact restore in progress (${queued} queued)`);
       }
@@ -641,8 +668,34 @@ async function forwardToTelegram(conn: Connection): Promise<void> {
     return;
   }
   for (const m of fresh) {
+    // Reply threading. The agent points at the message it is answering with
+    // reply_to.wire_id; we look that wire_id up in this route's map and, when it
+    // resolves to a message in the chat we are delivering to, send a real Telegram
+    // reply. No row (never mapped, or past the retention horizon) => a plain
+    // message. We NEVER fall back to a "similar" or most-recent message.
+    //
+    // This only works when the agent FILLS reply_to.wire_id. An agent that does
+    // not gets plain messages — a property of the sender, not a connector defect.
+    const row = m.reply_to ? conn.map.get(m.reply_to.wire_id) : undefined;
+    const replyToMessageId = row && row.chatId === String(target.chatId) ? row.messageId : undefined;
+    if (m.reply_to && replyToMessageId === undefined) {
+      log(`[${cfg.name}] reply pointer ${m.reply_to.wire_id.slice(0, 12)}… has no mapped Telegram message — delivering unthreaded`);
+    }
     try {
-      await bot.tg.sendMessage(target.chatId, m.text, target.threadId || undefined);
+      const ids = await bot.tg.sendMessage(target.chatId, m.text, target.threadId || undefined, {
+        replyToMessageId,
+        markdown: true,
+      });
+      // Map the delivered message back to its wire_id as well, so a receipt on an
+      // agent→Telegram message (and any future agent-driven reaction) has a target.
+      if (m.wire_id && ids[0] > 0) {
+        conn.map.record(m.wire_id, {
+          chatId: String(target.chatId),
+          messageId: ids[0],
+          contactCid: m.sender_id,
+          direction: 'outbound',
+        });
+      }
     } catch (err) {
       log(`[${cfg.name}] telegram delivery failed for #${m.msg_id}:`, String(err));
       // Hand the message back so a later attempt re-delivers it rather than
@@ -699,6 +752,85 @@ async function forwardFilesToTelegram(conn: Connection): Promise<void> {
   }
 }
 
+// receipt → Telegram reaction. Core delivered a peer's delivery/read confirmation
+// for messages we sent; each wire_id resolves to the Telegram message it came
+// from and gets the configured emoji.
+//
+// Three rules, all load-bearing:
+//   • MONOTONIC per (peer, wire_id) — applyReceipt only moves unknown < sent <
+//     delivered < read forward, so a duplicate or reordered receipt is a no-op and
+//     a "read" reaction is never walked back to "delivered".
+//   • ONE reaction per message — setMessageReaction REPLACES, so read overwrites
+//     delivered rather than sitting beside it (a bot cannot hold two).
+//   • a Telegram refusal (reactions disabled in the chat, message deleted, emoji
+//     rejected) is logged in full and goes no further. Receipts are best-effort UX
+//     by core's own contract; they must never touch message delivery.
+async function applyReceiptReactions(conn: Connection, senderCid: string, kind: ReceiptState, wireIds: string[]): Promise<void> {
+  const { cfg, bot } = conn;
+  const settings = conn.map.settingsFor(senderCid || cfg.peerCid);
+  if (!settings.receiptsEnabled) return;
+  const emoji = emojiFor(kind, settings);
+  if (!emoji) return;
+  for (const wireId of wireIds) {
+    const row = conn.map.applyReceipt(wireId, kind);
+    if (!row) continue; // unknown id, or a duplicate / out-of-order receipt
+    try {
+      await bot.tg.setMessageReaction(row.chatId, row.messageId, emoji);
+    } catch (err) {
+      log(`[${cfg.name}] reaction ${emoji} for ${kind} on ${row.chatId}/${row.messageId} refused by Telegram (delivery unaffected):`, String(err));
+    }
+  }
+}
+
+// Per-connection commands, parsed HERE in connector code — never handed to the
+// agent as a prompt, so the settings cannot be argued with by a message body.
+// Reached only after route resolution, so a command applies to the ours contact of
+// the chat it came from and `/receipts off` on one connection leaves the others
+// untouched. Returns true when the message was a command (and must not be
+// forwarded to the agent).
+async function handleReceiptCommand(conn: Connection, m: TelegramMessage): Promise<boolean> {
+  const cmd = parseReceiptCommand(m.text, conn.bot.username);
+  if (!cmd) return false;
+  const { cfg } = conn;
+  const cid = cfg.peerCid;
+  let reply: string;
+  switch (cmd.kind) {
+    case 'receipts': {
+      const s = conn.map.updateSettings(cid, { receiptsEnabled: cmd.on });
+      log(`[${cfg.name}] receipts turned ${cmd.on ? 'on' : 'off'} for this connection`);
+      reply = formatStatus(s, cfg.name, !!cid);
+      break;
+    }
+    case 'emoji': {
+      const patch = cmd.slot === 'delivered' ? { emojiDelivered: cmd.emoji } : { emojiRead: cmd.emoji };
+      const s = conn.map.updateSettings(cid, patch);
+      log(`[${cfg.name}] ${cmd.slot} reaction set to ${cmd.emoji}`);
+      reply = formatStatus(s, cfg.name, !!cid);
+      break;
+    }
+    case 'reset': {
+      const s = conn.map.resetSettings(cid);
+      log(`[${cfg.name}] reaction emoji reset to defaults`);
+      reply = formatStatus(s, cfg.name, !!cid);
+      break;
+    }
+    case 'status':
+      reply = formatStatus(conn.map.settingsFor(cid), cfg.name, !!cid);
+      break;
+    case 'error':
+      reply = cmd.message;
+      break;
+  }
+  try {
+    // Plain text (no markdown): the emoji list and the usage lines are full of
+    // MarkdownV2-reserved characters and must not be able to fail their own send.
+    await conn.bot.tg.sendMessage(m.chat_id, reply, m.thread_id);
+  } catch (err) {
+    log(`[${cfg.name}] failed to answer ${m.text.split(/\s+/)[0]}:`, String(err));
+  }
+  return true;
+}
+
 // One bot's single poll handler: demux each update to its route and forward to the
 // agent. An update for a chat with no route is dropped (a bot may sit in many
 // groups it does not serve); the classic single-route deny is preserved only when
@@ -743,6 +875,8 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
     return;
   }
   conn.lastChat = { chatId: String(m.chat_id), threadId: m.thread_id ? String(m.thread_id) : '' };
+  // Per-connection settings commands are answered here and never forwarded.
+  if (await handleReceiptCommand(conn, m)) return;
   await forwardToNode(conn, m);
 }
 
@@ -762,6 +896,12 @@ function activateRoute(conn: Connection): void {
           process.nextTick(() => void forwardFilesToTelegram(conn));
         } else if (event === 'control_request') {
           process.nextTick(() => void processControlRequests(conn));
+        } else if (event === 'receipt_received') {
+          // core 0.7.0 receipts: a peer confirmed delivery/read of what we sent.
+          // Decoded synchronously (the payload is freed when this handler returns)
+          // and applied off the notify tick.
+          const ev = renderReceipt(payload);
+          if (ev) process.nextTick(() => void applyReceiptReactions(conn, ev.senderId, ev.kind, ev.wireIds));
         } else if (event === 'contact_accepted' || event === 'sibling_contact_added') {
           const cid = payload.Reduce('container_id').Visualize();
           const name = payload.Reduce('name').Visualize();
@@ -927,7 +1067,7 @@ async function createConnection(args: {
       peerCid: '',
       createdAt: new Date().toISOString(),
     };
-    const conn: Connection = { pkt, dir, cfg, bot, lastChat: null };
+    const conn: Connection = { pkt, dir, cfg, bot, lastChat: null, map: newMessageMap(dir, args.name) };
     connections.set(args.name, conn);
     // Wire handlers BEFORE the first mutating tx so save_state/notify route.
     activateRoute(conn);
@@ -969,7 +1109,7 @@ async function restoreConnection(name: string): Promise<void> {
   // irrelevant once reseed_identity_from_secret overwrites the container id.
   const secret = fs.readFileSync(keyPath(dir), 'utf8').trim();
   const pkt = await host.createPacket(name, '', secret);
-  const conn: Connection = { pkt, dir, cfg, bot, lastChat: null };
+  const conn: Connection = { pkt, dir, cfg, bot, lastChat: null, map: newMessageMap(dir, name) };
   connections.set(name, conn);
   activateRoute(conn);
   const conflict = registerRoute(conn);
@@ -1115,7 +1255,14 @@ function describeBot(bot: Bot): Record<string, unknown> {
 function describeConnection(conn: Connection): Record<string, unknown> {
   const contacts = withScope((lt) => renderContacts(conn.pkt.readonlyTx('::a2a_messaging::list_contacts', lt)));
   const mon = monitoringStatus(conn.pkt);
+  const receipts = conn.map.settingsFor(conn.cfg.peerCid);
   return {
+    receipts: {
+      enabled: receipts.receiptsEnabled,
+      emojiDelivered: receipts.emojiDelivered,
+      emojiRead: receipts.emojiRead,
+      mappedMessages: conn.map.size(),
+    },
     name: conn.cfg.name,
     cid: conn.pkt.cid,
     botName: conn.cfg.botName,
