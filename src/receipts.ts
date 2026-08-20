@@ -127,9 +127,38 @@ export type ReceiptCommand =
   | { kind: 'status' }
   | { kind: 'emoji'; slot: 'delivered' | 'read'; emoji: string }
   | { kind: 'reset' }
+  | { kind: 'help' }
   | { kind: 'error'; message: string };
 
-const CMD_RE = /^\/(receipts|emoji)(?:@([A-Za-z0-9_]+))?$/i;
+const CMD_RE = /^\/(receipts|emoji|help)(?:@([A-Za-z0-9_]+))?$/i;
+
+// ----- the connector's own command list ---------------------------------------
+// THE single source of truth for "which commands are the connector's": it drives
+// both the `/help` listing and the setMyCommands registration that puts them in
+// the client's slash menu, so the menu can never advertise a command the parser
+// does not implement. `/id` is parsed in routing.ts (it answers before route
+// resolution) but is listed here because it is the same surface to a user.
+//
+// `command` is bare (no slash) and must satisfy Telegram's rule for a command
+// name — 1-32 chars of [a-z0-9_]; `description` is what the slash menu shows and
+// is capped at 256 chars. Both are asserted in tests/receipts.test.mjs.
+export interface ConnectorCommand {
+  command: string;
+  args?: string; // argument shape — shown by /help, not by the slash menu
+  description: string;
+}
+
+export const CONNECTOR_COMMANDS: readonly ConnectorCommand[] = [
+  { command: 'help', description: 'What this connector handles here, and the current receipt settings' },
+  { command: 'id', description: "This chat's ids, for wiring up a new connection" },
+  { command: 'receipts', args: 'on | off | status', description: 'Delivery/read receipts, shown as reactions' },
+  { command: 'emoji', args: 'delivered <emoji> | read <emoji> | reset', description: 'Which emoji a receipt reacts with' },
+];
+
+// What setMyCommands wants: bare name + description, nothing else.
+export function telegramCommandList(): { command: string; description: string }[] {
+  return CONNECTOR_COMMANDS.map((c) => ({ command: c.command, description: c.description }));
+}
 
 function invalidEmoji(input: string): ReceiptCommand {
   return {
@@ -152,6 +181,16 @@ export function parseReceiptCommand(text: string, botUsername = ''): ReceiptComm
   if (addressed && botUsername && addressed.toLowerCase() !== botUsername.toLowerCase()) return null;
   const args = tokens.slice(1);
 
+  // `/help` — and ONLY a bare `/help`. Anything after the verb ("/help me write
+  // the release note") is a message for the agent that happens to start with a
+  // slash, so it falls through untouched rather than being swallowed here. This
+  // is deliberately stricter than /receipts and /emoji, which own their whole
+  // argument space and answer a bad argument with a usage line.
+  if (verb.toLowerCase() === 'help') {
+    if (args.length) return null;
+    return { kind: 'help' };
+  }
+
   if (verb.toLowerCase() === 'receipts') {
     const a = (args[0] ?? '').toLowerCase();
     if (a === 'on') return { kind: 'receipts', on: true };
@@ -173,9 +212,9 @@ export function parseReceiptCommand(text: string, botUsername = ''): ReceiptComm
   return { kind: 'emoji', slot, emoji: canon };
 }
 
-// The reply to `/receipts status`. Plain text on purpose (no parse_mode) so a
-// stray character in it can never fail its own send.
-export function formatStatus(s: ConnectionReceiptSettings, routeName: string, peerKnown: boolean): string {
+// The settings block, shared by `/receipts status` and `/help` so the two can
+// never drift apart.
+function settingsLines(s: ConnectionReceiptSettings, routeName: string, peerKnown: boolean): string[] {
   const lines = [
     `Receipts for this connection ("${routeName}"):`,
     `• delivery/read reactions: ${s.receiptsEnabled ? 'on' : 'off'}`,
@@ -183,6 +222,38 @@ export function formatStatus(s: ConnectionReceiptSettings, routeName: string, pe
     `• read: ${s.emojiRead}`,
   ];
   if (!peerKnown) lines.push('• no agent connected yet — nothing to receive receipts from');
+  return lines;
+}
+
+// The reply to `/receipts status`. Plain text on purpose (no parse_mode) so a
+// stray character in it can never fail its own send.
+export function formatStatus(s: ConnectionReceiptSettings, routeName: string, peerKnown: boolean): string {
+  const lines = settingsLines(s, routeName, peerKnown);
   lines.push('', 'Change with: /receipts on|off, /emoji delivered <emoji>, /emoji read <emoji>, /emoji reset');
+  return lines.join('\n');
+}
+
+// The reply to `/help`: what the CONNECTOR itself handles, then the live
+// settings for this connection. Answered locally — it is never forwarded, so it
+// costs the agent nothing and works even when no agent is connected yet.
+//
+// `settings` is null when the message came from a chat with no route (the same
+// chats where `/id` still answers): there is no connection to report on, so the
+// command list is all we can honestly show.
+//
+// Plain text, same as formatStatus — the usage lines are full of MarkdownV2
+// metacharacters and must not be able to fail their own send.
+export function formatHelp(
+  settings: ConnectionReceiptSettings | null,
+  routeName: string,
+  peerKnown: boolean,
+): string {
+  const lines = ['Commands handled by this connector (answered here, never sent to the agent):'];
+  for (const c of CONNECTOR_COMMANDS) {
+    lines.push(`• /${c.command}${c.args ? ` ${c.args}` : ''} — ${c.description}`);
+  }
+  lines.push('', 'Anything else you send is relayed to the agent exactly as typed — including text that starts with a slash.', '');
+  if (settings) lines.push(...settingsLines(settings, routeName, peerKnown));
+  else lines.push('This chat has no route yet, so there are no receipt settings to show. Run /id to get the ids needed to add one.');
   return lines.join('\n');
 }

@@ -169,6 +169,23 @@ answered in the chat. An emoji is validated against Telegram's fixed
 bot-reaction list **before** it is saved, with the valid set in the error —
 note that ✅ is *not* on that list, which is why the `read` default is 👌.
 
+### `/help` and the slash menu
+
+**`/help`** is answered by the connector itself: it lists the commands the
+connector owns (`/help`, `/id`, `/receipts`, `/emoji`) and the current receipt
+settings for that connection. It works in a chat with no route yet too — you get
+the command list and a pointer to `/id`.
+
+The same list is registered with Telegram via `setMyCommands` at **default
+scope** when a bot starts polling, so a client offers the commands in its slash
+menu as you type. Registration is cosmetic and best-effort: if it fails it is
+logged, and every command still works when typed by hand.
+
+> **Only these four commands are intercepted.** Everything else you send is
+> relayed to the agent exactly as typed, *including* text that starts with a
+> slash — `/deploy prod` reaches the agent, and so does `/help me write the
+> release note`, because only a **bare** `/help` is treated as the command.
+
 ### Message formatting
 
 Formatting is preserved **in both directions**.

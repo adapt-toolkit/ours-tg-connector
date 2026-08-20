@@ -24,6 +24,9 @@ import {
   normalizeSettings,
   parseReceiptCommand,
   formatStatus,
+  formatHelp,
+  CONNECTOR_COMMANDS,
+  telegramCommandList,
   DEFAULT_EMOJI_DELIVERED,
   DEFAULT_EMOJI_READ,
 } from '../src/receipts.ts';
@@ -110,6 +113,55 @@ console.log('\n=== per-connection commands (parsed in code, never in a prompt) =
   const status = formatStatus(defaultSettings('now'), 'my-route', true);
   assert(status.includes('my-route') && status.includes('on') && status.includes('👀'), 'status names the connection and its settings');
   assert(formatStatus(defaultSettings('now'), 'r', false).includes('no agent connected yet'), 'status says so when no agent is paired');
+}
+
+console.log('\n=== /help: handled locally, and NOT a text-swallower ===');
+{
+  eq(parseReceiptCommand('/help').kind, 'help', 'bare /help is the connector\'s own command');
+  eq(parseReceiptCommand('/HELP').kind, 'help', '/help is case-insensitive like the rest');
+  eq(parseReceiptCommand('  /help  ').kind, 'help', 'surrounding whitespace does not hide the command');
+  eq(parseReceiptCommand('/help@mybot', 'mybot').kind, 'help', '/help@thisbot is handled in a multi-bot group');
+  eq(parseReceiptCommand('/help@otherbot', 'mybot'), null, '/help@otherbot belongs to the other bot');
+
+  // THE GUARD RAIL: /help must not start eating messages meant for the agent.
+  eq(parseReceiptCommand('/help me write the release note'), null, '/help WITH ARGS is a message for the agent, not a command');
+  eq(parseReceiptCommand('/help me'), null, 'even a single trailing word falls through to the agent');
+  eq(parseReceiptCommand('/helpme'), null, '/helpme is not /help');
+  eq(parseReceiptCommand('/help_desk'), null, 'a longer slash word starting with help is not ours');
+  eq(parseReceiptCommand('please /help'), null, '/help must be the first token, as Telegram delivers commands');
+  eq(parseReceiptCommand('/start'), null, 'a slash word the connector does not own is relayed unchanged');
+  eq(parseReceiptCommand('/deploy prod'), null, 'an arbitrary slash command is relayed unchanged');
+
+  // The reply: the command list, then the live settings for this connection.
+  const help = formatHelp(defaultSettings('now'), 'my-route', true);
+  for (const c of CONNECTOR_COMMANDS) assert(help.includes(`/${c.command}`), `/help lists /${c.command}`);
+  assert(help.includes('my-route') && help.includes('👀') && help.includes('👌'), '/help reports the current receipt settings');
+  assert(help.includes('relayed to the agent'), '/help says plainly that everything else goes to the agent');
+  assert(!help.includes('*') && !help.includes('_'), '/help is plain text — no markdown that could fail its own send');
+
+  // No route yet: the command list still answers, without inventing settings.
+  const noRoute = formatHelp(null, '', false);
+  assert(noRoute.includes('/id') && noRoute.includes('no route yet'), '/help in an unrouted chat lists commands and says there is no route');
+  assert(!noRoute.includes('delivery/read reactions'), 'and does not report settings it does not have');
+}
+
+console.log('\n=== the slash-menu command list ===');
+{
+  assert(CONNECTOR_COMMANDS.length > 0, 'there is a command list to register');
+  for (const c of CONNECTOR_COMMANDS) {
+    assert(/^[a-z0-9_]{1,32}$/.test(c.command), `"${c.command}" satisfies Telegram's command-name rule (no slash, 1-32 [a-z0-9_])`);
+    assert(c.description.length > 0 && c.description.length <= 256, `"${c.command}" has a description within Telegram's 256-char limit`);
+  }
+  // Every registered command must actually be intercepted somewhere, or the menu
+  // advertises a command that falls through to the agent as text.
+  for (const c of CONNECTOR_COMMANDS) {
+    const parsed = parseReceiptCommand(`/${c.command}`);
+    const isIdProbe = c.command === 'id'; // parsed in routing.ts, before route resolution
+    assert(parsed !== null || isIdProbe, `/${c.command} is claimed by the connector, not relayed`);
+  }
+  const list = telegramCommandList();
+  eq(list.length, CONNECTOR_COMMANDS.length, 'the registration list covers every command');
+  assert(list.every((c) => Object.keys(c).sort().join(',') === 'command,description'), 'setMyCommands gets exactly {command, description}');
 }
 
 console.log('\n=== settings normalisation (hand-edited / stale file) ===');
@@ -285,6 +337,28 @@ console.log('\n=== TelegramClient: reply_parameters, reactions, markdown fallbac
   let reactThrew = false;
   try { await c.setMessageReaction(-1001, 42, '👀'); } catch (e) { reactThrew = /REACTIONS_NOT_ALLOWED/.test(String(e)); }
   assert(reactThrew, 'a Telegram reaction refusal is raised with its full text for the caller to log');
+
+  // setMyCommands: the slash menu, registered at DEFAULT scope.
+  calls.length = 0;
+  c = client(() => jsonResponse({ ok: true, result: true }));
+  await c.setMyCommands(telegramCommandList());
+  eq(calls[0].url.endsWith('/setMyCommands'), true, 'setMyCommands is the API method used');
+  eq(calls[0].body.scope, undefined, 'NO scope field — the default scope covers every chat the bot serves');
+  eq(calls[0].body.commands.length, CONNECTOR_COMMANDS.length, 'every connector command is registered');
+  assert(calls[0].body.commands.every((x) => !x.command.startsWith('/')), 'commands are registered without the leading slash');
+  assert(calls[0].dispatcher instanceof Agent, 'the registration call rides the IPv4-forced dispatcher too');
+
+  // A refusal must surface (the caller logs it and keeps polling).
+  c = client(() => jsonResponse({ ok: false, description: 'Bad Request: BOT_COMMAND_INVALID' }, 400));
+  let cmdThrew = false;
+  try { await c.setMyCommands([{ command: 'Bad Cmd', description: 'x' }]); } catch (e) { cmdThrew = /BOT_COMMAND_INVALID/.test(String(e)); }
+  assert(cmdThrew, 'a rejected command list is raised, not silently reported as registered');
+
+  // …including the 200-with-ok:false shape.
+  c = client(() => jsonResponse({ ok: false, description: 'nope' }, 200));
+  let softThrew = false;
+  try { await c.setMyCommands(telegramCommandList()); } catch (e) { softThrew = /nope/.test(String(e)); }
+  assert(softThrew, 'an HTTP 200 carrying ok:false is still treated as a failure');
 }
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);

@@ -460,6 +460,33 @@ export class TelegramClient {
     return parsed?.result?.message_id ?? 0;
   }
 
+  // Publish the connector's own commands so a Telegram client offers them in its
+  // slash menu while the user types. DEFAULT SCOPE on purpose (no `scope` field):
+  // the list is a property of the bot, identical in every chat it serves, and a
+  // token belongs to exactly one connector instance — so one call per bot start
+  // covers every chat, including ones routed later, with no per-chat bookkeeping.
+  //
+  // Purely cosmetic: parseReceiptCommand, not this list, decides what is actually
+  // intercepted. Throws for the caller to log — a bot whose menu did not publish
+  // must still poll and still answer the commands typed by hand.
+  async setMyCommands(commands: { command: string; description: string }[]): Promise<void> {
+    const resp = await this.tgFetch(this.url('setMyCommands'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commands }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`setMyCommands failed (HTTP ${resp.status}): ${body}`);
+    }
+    // Telegram normally reports a bad command list as HTTP 400, but a 200 with
+    // ok:false is still a refusal — do not report it as success.
+    const parsed = (await resp.json().catch(() => null)) as { ok?: boolean; description?: string } | null;
+    if (parsed && parsed.ok === false) {
+      throw new Error(`setMyCommands failed: ${parsed.description ?? 'unknown error'}`);
+    }
+  }
+
   // Set (or, with a null emoji, clear) THE reaction on a message. A bot holds at
   // most one reaction per message, so this replaces whatever was there — which is
   // exactly why a read receipt overwrites the delivered one.
