@@ -109,6 +109,85 @@ In a **privacy-mode** group only the `/id@<bot_username>` form is delivered (see
 note above); in DMs and privacy-off groups bare `/id` works too. In a group with
 several bots, only the one named in `/id@<bot_username>` answers.
 
+### Reply threading
+
+An agent's answer can arrive in Telegram **as a reply to the message that prompted
+it**, so a busy group chat stays readable. The mechanism is one mapping:
+
+1. an inbound Telegram message is sent to the agent as ours `wire_id` **W**, and the
+   route records `W → (chat id, message id)` in `messages.json` in its state dir;
+2. the agent answers with `reply_to_wire_id = W` (the `send_message` tool already
+   supports it);
+3. the connector resolves **W** back to that Telegram message and sends with
+   `reply_parameters.message_id`.
+
+**It only works when the agent fills `reply_to_wire_id`.** An agent that does not
+gets ordinary un-threaded messages — that is a property of the sender, not a
+connector fault, so it is worth putting in the persona of any role that writes to
+Telegram. If a pointer resolves to nothing (never mapped, or older than the 30-day
+retention below) the message is delivered **plain**; a "similar" or most-recent
+message is never substituted.
+
+The map is persistent (it survives a daemon restart), holds **no message content** —
+only chat/message ids, the contact id and the receipt state — and is pruned at
+**30 days** / 2000 rows per route, oldest first.
+
+### Delivery & read receipts as reactions
+
+When the agent's node confirms a message, the connector puts a **reaction** on the
+originating Telegram message: 👀 when it was **delivered**, then 👌 once the agent
+has **read** it (its `get` path). Because a bot may hold **at most one reaction per
+message**, read *replaces* delivered rather than sitting beside it.
+
+The confirmations themselves are core 0.7.0 receipts, not something the connector
+invents: emission is gated on both sides' `core.receipts.*` capabilities (the
+connector declares `emit` and `receive`), and application is **monotonic** per
+(peer, message) over `unknown < sent < delivered < read` — a duplicate or
+out-of-order receipt changes nothing. Receipts are **best-effort UX**: a missing
+reaction does **not** mean the message failed to arrive, and a Telegram refusal on a
+reaction (reactions disabled in the chat, message deleted) is logged and never
+affects message delivery.
+
+> **The agent side has to emit them.** A peer only sends receipts if *it* advertises
+> `core.receipts.emit`. Against an agent node that does not, the reactions simply
+> never appear — everything else keeps working.
+
+Per **connection** (not per bot — `/receipts off` on one route leaves the others
+alone), in the route's own chat:
+
+```
+/receipts on            # turn delivery/read reactions on for this connection
+/receipts off           # …and off
+/receipts status        # show the current setting and emoji
+/emoji delivered <e>    # set the "delivered" reaction
+/emoji read <e>         # set the "read" reaction
+/emoji reset            # back to 👀 / 👌
+```
+
+Commands are parsed **in connector code**, never passed to the agent, and are
+answered in the chat. An emoji is validated against Telegram's fixed
+bot-reaction list **before** it is saved, with the valid set in the error —
+note that ✅ is *not* on that list, which is why the `read` default is 👌.
+
+### Message formatting
+
+Formatting is preserved **in both directions**.
+
+- **Telegram → agent.** A message's `entities` / `caption_entities` (bold, italic,
+  underline, strikethrough, spoiler, code, `pre` with its language, blockquote,
+  links and mentions) are folded into **Markdown** in the message text, so the
+  agent reads the formatting instead of losing it. Offsets are UTF-16 code units
+  and are treated as such. A `custom_emoji` is premium-only and degrades to the
+  stand-in glyph Telegram already put in the text. A message with no entities is
+  passed through byte-for-byte.
+- **Agent → Telegram.** The agent's Markdown is rendered as `MarkdownV2`, escaping
+  the **text leaves only** (all 18 reserved characters — one unescaped `.` would
+  fail the whole send). Emphasis is deliberately conservative: `foo_bar_baz` and
+  `2*3*4` stay literal. The 4096-character limit is applied to the **escaped**
+  text. **If Telegram rejects the markup, the same text is resent with no
+  `parse_mode`** and the original refusal is logged — the message always wins over
+  its styling.
+
 ### Message envelope
 
 Each inbound Telegram message is forwarded to the agent as a single **JSON

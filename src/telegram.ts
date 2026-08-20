@@ -17,6 +17,14 @@
 
 import { Agent, type Dispatcher } from 'undici';
 
+import {
+  entitiesToMarkdown,
+  isParseEntitiesError,
+  toMarkdownV2,
+  TELEGRAM_TEXT_LIMIT,
+  type TelegramEntity,
+} from './format';
+
 const API_BASE = 'https://api.telegram.org';
 
 // Init accepted by Node's global fetch plus undici's non-standard `dispatcher`
@@ -208,7 +216,15 @@ interface RawMessage {
   from?: RawUser;
   text?: string;
   caption?: string;
-  reply_to_message?: { message_id: number; text?: string; caption?: string };
+  entities?: TelegramEntity[];
+  caption_entities?: TelegramEntity[];
+  reply_to_message?: {
+    message_id: number;
+    text?: string;
+    caption?: string;
+    entities?: TelegramEntity[];
+    caption_entities?: TelegramEntity[];
+  };
   // forward provenance — modern union (Bot API 7.0+) + legacy fields.
   forward_origin?: RawForwardOrigin;
   forward_from?: RawUser;
@@ -273,11 +289,32 @@ export function pickAttachment(m: {
   return undefined;
 }
 
-// The message this one replies to, with the replied text/caption snapshot.
-export function parseReply(m: { reply_to_message?: { message_id: number; text?: string; caption?: string } }): ReplyRef | undefined {
+// The message this one replies to, with the replied text/caption snapshot. The
+// snapshot keeps its own formatting: the replied message carries its own
+// entities, folded into Markdown exactly like the message body.
+export function parseReply(m: {
+  reply_to_message?: {
+    message_id: number;
+    text?: string;
+    caption?: string;
+    entities?: TelegramEntity[];
+    caption_entities?: TelegramEntity[];
+  };
+}): ReplyRef | undefined {
   const r = m.reply_to_message;
   if (!r) return undefined;
-  return { message_id: r.message_id, text: r.text ?? r.caption };
+  const body = r.text ?? r.caption;
+  if (body === undefined) return { message_id: r.message_id };
+  return { message_id: r.message_id, text: entitiesToMarkdown(body, r.entities ?? r.caption_entities) };
+}
+
+// The message text with its Telegram entities folded back into Markdown, so the
+// agent reads bold/code/links/quotes instead of losing them. A message with no
+// entities comes back byte-for-byte unchanged.
+export function messageMarkdown(m: { text?: string; caption?: string; entities?: TelegramEntity[]; caption_entities?: TelegramEntity[] }): string {
+  const body = m.text ?? m.caption ?? '';
+  if (body === '') return '';
+  return entitiesToMarkdown(body, m.text !== undefined ? m.entities : m.caption_entities);
 }
 
 // The original source of a forwarded message. Prefers the modern
@@ -354,20 +391,95 @@ export class TelegramClient {
 
   // Deliver text to a chat, optionally into a specific forum topic. Passing a
   // threadId routes the reply back into the same topic it came from; omitting it
-  // posts to the chat's General/main thread.
-  async sendMessage(chatId: number | string, text: string, threadId?: number | string): Promise<void> {
+  // posts to the chat's General/main thread. Returns the message_id of every
+  // message actually posted, so the caller can map them back to a wire_id.
+  //
+  // `replyToMessageId` makes this a Telegram reply (reply_parameters), which is
+  // how an agent's ours-level reply becomes a visible thread. `markdown` renders
+  // the text as MarkdownV2 — with the mandatory fallback below.
+  async sendMessage(
+    chatId: number | string,
+    text: string,
+    threadId?: number | string,
+    opts: { replyToMessageId?: number; markdown?: boolean } = {},
+  ): Promise<number[]> {
     const thread = threadId === undefined || threadId === '' ? undefined : Number(threadId);
-    // Telegram caps a single text message at 4096 chars; split conservatively.
-    for (const chunk of chunkText(text, 4000)) {
-      const resp = await this.tgFetch(this.url('sendMessage'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: chunk, ...(thread !== undefined ? { message_thread_id: thread } : {}) }),
-      });
-      if (!resp.ok) {
-        const body = await resp.text();
-        throw new Error(`sendMessage failed (HTTP ${resp.status}): ${body}`);
+    // Telegram caps a single message at 4096 characters, counted on what is
+    // actually sent — so a formatted message is split by its RENDERED length.
+    const pieces = opts.markdown ? splitForMarkdownV2(text) : chunkText(text, 4000);
+    const ids: number[] = [];
+    for (let i = 0; i < pieces.length; i += 1) {
+      const piece = pieces[i];
+      // The reply pointer belongs on the first piece only — the rest continue it.
+      const replyTo = i === 0 ? opts.replyToMessageId : undefined;
+      if (opts.markdown) {
+        try {
+          ids.push(await this.postMessage(chatId, toMarkdownV2(piece), thread, replyTo, 'MarkdownV2'));
+          continue;
+        } catch (err) {
+          // MANDATORY FALLBACK: Telegram rejected our markup. The message matters
+          // more than its styling — resend the SAME text with no parse_mode and
+          // log the original refusal. Any other failure is the caller's problem.
+          if (!isParseEntitiesError(err)) throw err;
+          this.log(`markdown rejected, resending as plain text: ${String(err)}`);
+        }
       }
+      ids.push(await this.postMessage(chatId, piece, thread, replyTo, undefined));
+    }
+    return ids;
+  }
+
+  // One sendMessage call. Returns the new message's id (0 if Telegram omitted it).
+  private async postMessage(
+    chatId: number | string,
+    text: string,
+    thread: number | undefined,
+    replyToMessageId: number | undefined,
+    parseMode: 'MarkdownV2' | undefined,
+  ): Promise<number> {
+    const resp = await this.tgFetch(this.url('sendMessage'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        ...(thread !== undefined ? { message_thread_id: thread } : {}),
+        ...(parseMode ? { parse_mode: parseMode } : {}),
+        // allow_sending_without_reply: the referenced message may have been
+        // deleted; the reply is then posted unthreaded instead of failing.
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } }
+          : {}),
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`sendMessage failed (HTTP ${resp.status}): ${body}`);
+    }
+    const parsed = (await resp.json().catch(() => null)) as { result?: { message_id?: number } } | null;
+    return parsed?.result?.message_id ?? 0;
+  }
+
+  // Set (or, with a null emoji, clear) THE reaction on a message. A bot holds at
+  // most one reaction per message, so this replaces whatever was there — which is
+  // exactly why a read receipt overwrites the delivered one.
+  //
+  // Throws on refusal (reactions disabled in the chat, message deleted, emoji not
+  // on Telegram's list) for the caller to log. A receipt is best-effort UX: it must
+  // never affect message delivery.
+  async setMessageReaction(chatId: number | string, messageId: number, emoji: string | null): Promise<void> {
+    const resp = await this.tgFetch(this.url('setMessageReaction'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: emoji ? [{ type: 'emoji', emoji }] : [],
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`setMessageReaction failed (HTTP ${resp.status}): ${body}`);
     }
   }
 
@@ -478,7 +590,10 @@ export class TelegramClient {
               from: senderLabel(m),
               from_id: m.from?.id,
               from_username: m.from?.username,
-              text: m.text ?? m.caption ?? '',
+              // Entities folded into Markdown here, at the parse boundary, so
+              // every consumer downstream (envelope, plain payload, STT) sees the
+              // formatting as text rather than losing it.
+              text: messageMarkdown(m),
               date: m.date,
               reply_to: parseReply(m),
               forwarded_from: parseForwardOrigin(m),
@@ -513,6 +628,35 @@ function chunkText(text: string, size: number): string[] {
   if (text.length <= size) return [text];
   const out: string[] = [];
   for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
+  return out;
+}
+
+// Split the agent's Markdown SOURCE into pieces whose RENDERED MarkdownV2 fits
+// Telegram's limit. Splitting the source (not the rendered string) is what makes
+// the plain-text fallback exact: each piece can be resent verbatim with no
+// parse_mode. Escaping can nearly double a piece's length, so the boundary is
+// found by bisecting on the rendered size, then backed off to a line or word
+// boundary. A prefix that cuts through `**bold**` is still valid MarkdownV2 —
+// the orphaned marker renders as an escaped literal.
+export function splitForMarkdownV2(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
+  if (toMarkdownV2(text).length <= limit) return [text];
+  const out: string[] = [];
+  let rest = text;
+  while (rest.length > 0 && toMarkdownV2(rest).length > limit) {
+    let lo = 1;
+    let hi = rest.length;
+    let fit = 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (toMarkdownV2(rest.slice(0, mid)).length <= limit) { fit = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    const nl = rest.lastIndexOf('\n', fit);
+    const sp = rest.lastIndexOf(' ', fit);
+    const cut = nl > fit / 2 ? nl + 1 : sp > fit / 2 ? sp + 1 : fit;
+    out.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest) out.push(rest);
   return out;
 }
 
