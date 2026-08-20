@@ -92,7 +92,7 @@ import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './env
 import { transcribe } from './stt';
 import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply } from './routing';
 import { MessageMap } from './msgmap';
-import { emojiFor, formatStatus, parseReceiptCommand, type ReceiptState } from './receipts';
+import { emojiFor, formatHelp, formatStatus, parseReceiptCommand, telegramCommandList, type ReceiptState } from './receipts';
 
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
@@ -782,19 +782,37 @@ async function applyReceiptReactions(conn: Connection, senderCid: string, kind: 
   }
 }
 
-// Per-connection commands, parsed HERE in connector code — never handed to the
-// agent as a prompt, so the settings cannot be argued with by a message body.
-// Reached only after route resolution, so a command applies to the ours contact of
-// the chat it came from and `/receipts off` on one connection leaves the others
-// untouched. Returns true when the message was a command (and must not be
-// forwarded to the agent).
-async function handleReceiptCommand(conn: Connection, m: TelegramMessage): Promise<boolean> {
-  const cmd = parseReceiptCommand(m.text, conn.bot.username);
+// The connector's own commands, parsed HERE in connector code — never handed to
+// the agent as a prompt, so the settings cannot be argued with by a message body.
+// A command applies to the ours contact of the chat it came from, so `/receipts
+// off` on one connection leaves the others untouched. Returns true when the
+// message was one of ours (and must not be forwarded to the agent).
+//
+// ONLY the commands parseReceiptCommand claims are intercepted. Anything else —
+// including any other slash word — returns false here and is relayed verbatim.
+//
+// `conn` is null for a chat with no route. Only `/help` can answer then (there is
+// no connection to read settings from, and nothing to configure); the settings
+// commands decline, leaving the existing no-route handling in charge.
+async function handleConnectorCommand(bot: Bot, conn: Connection | null, m: TelegramMessage): Promise<boolean> {
+  const cmd = parseReceiptCommand(m.text, bot.username);
   if (!cmd) return false;
+  if (!conn) {
+    if (cmd.kind !== 'help') return false;
+    try {
+      await bot.tg.sendMessage(m.chat_id, formatHelp(null, '', false), m.thread_id);
+    } catch (err) {
+      log(`[bot ${botLabel(bot)}] failed to answer /help in unrouted chat ${m.chat_id}:`, String(err));
+    }
+    return true;
+  }
   const { cfg } = conn;
   const cid = cfg.peerCid;
   let reply: string;
   switch (cmd.kind) {
+    case 'help':
+      reply = formatHelp(conn.map.settingsFor(cid), cfg.name, !!cid);
+      break;
     case 'receipts': {
       const s = conn.map.updateSettings(cid, { receiptsEnabled: cmd.on });
       log(`[${cfg.name}] receipts turned ${cmd.on ? 'on' : 'off'} for this connection`);
@@ -861,6 +879,12 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
   }
 
   const conn = resolveRoute(bot.exact, bot.catchAll, m.chat_id, m.thread_id);
+  if (conn) conn.lastChat = { chatId: String(m.chat_id), threadId: m.thread_id ? String(m.thread_id) : '' };
+  // The connector's own commands are answered here and never forwarded. Run
+  // before the no-route handling so `/help` answers in an unrouted chat too,
+  // exactly like `/id` above — the slash menu offers it in every chat the bot is
+  // in, so it must not be silently ignored in some of them.
+  if (await handleConnectorCommand(bot, conn, m)) return;
   if (!conn) {
     const only = bot.exact.size === 1 && !bot.catchAll ? [...bot.exact.values()][0] : null;
     if (only && only.cfg.deniedMessage) {
@@ -874,9 +898,6 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
     }
     return;
   }
-  conn.lastChat = { chatId: String(m.chat_id), threadId: m.thread_id ? String(m.thread_id) : '' };
-  // Per-connection settings commands are answered here and never forwarded.
-  if (await handleReceiptCommand(conn, m)) return;
   await forwardToNode(conn, m);
 }
 
@@ -982,6 +1003,20 @@ function activateRoute(conn: Connection): void {
 function activateBot(bot: Bot): void {
   if (bot.pollHandle) return;
   bot.pollHandle = bot.tg.poll((m) => onBotMessage(bot, m));
+  void publishBotCommands(bot); // discoverability only — never gates the poll
+}
+
+// Publish the connector's commands to Telegram's slash menu, once per bot as its
+// poll starts (activateBot is idempotent, so this fires once too). Best-effort by
+// construction: the list is cosmetic, so a refusal is logged and the bot keeps
+// polling and keeps answering the commands typed by hand.
+async function publishBotCommands(bot: Bot): Promise<void> {
+  try {
+    await bot.tg.setMyCommands(telegramCommandList());
+    log(`[bot ${botLabel(bot)}] slash menu registered: ${telegramCommandList().map((c) => `/${c.command}`).join(' ')}`);
+  } catch (err) {
+    log(`[bot ${botLabel(bot)}] setMyCommands failed (commands still work when typed):`, String(err));
+  }
 }
 
 // ----- control plane (ours messenger) --------------------------------------
