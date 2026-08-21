@@ -164,7 +164,7 @@ try {
   await agent.sendMessage({ contact: created.cid, text: 'delivery after stable-lease restart' });
   await waitFor('post-restart delivery to reach connector', () => {
     const freshOutput = connector.output.slice(outputBeforeMessage);
-    return /\[OwnedRoute\] telegram delivery failed for #\d+:/.test(freshOutput) ? true : undefined;
+    return /\[OwnedRoute\] ordered Telegram message drain stopped/.test(freshOutput) ? true : undefined;
   });
 
   const removedResponse = await fetch(`${controlUrl}/connections/OwnedRoute`, { method: 'DELETE' });

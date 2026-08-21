@@ -17,6 +17,14 @@
 
 import { Agent, type Dispatcher } from 'undici';
 
+import {
+  entitiesToMarkdown,
+  isParseEntitiesError,
+  toMarkdownV2,
+  TELEGRAM_TEXT_LIMIT,
+  type TelegramEntity,
+} from './format';
+
 const API_BASE = 'https://api.telegram.org';
 
 // Init accepted by Node's global fetch plus undici's non-standard `dispatcher`
@@ -208,7 +216,15 @@ interface RawMessage {
   from?: RawUser;
   text?: string;
   caption?: string;
-  reply_to_message?: { message_id: number; text?: string; caption?: string };
+  entities?: TelegramEntity[];
+  caption_entities?: TelegramEntity[];
+  reply_to_message?: {
+    message_id: number;
+    text?: string;
+    caption?: string;
+    entities?: TelegramEntity[];
+    caption_entities?: TelegramEntity[];
+  };
   // forward provenance — modern union (Bot API 7.0+) + legacy fields.
   forward_origin?: RawForwardOrigin;
   forward_from?: RawUser;
@@ -273,11 +289,36 @@ export function pickAttachment(m: {
   return undefined;
 }
 
-// The message this one replies to, with the replied text/caption snapshot.
-export function parseReply(m: { reply_to_message?: { message_id: number; text?: string; caption?: string } }): ReplyRef | undefined {
+// The message this one replies to, with the replied text/caption snapshot. The
+// snapshot keeps its own formatting: the replied message carries its own
+// entities, folded into Markdown exactly like the message body.
+export function parseReply(m: {
+  reply_to_message?: {
+    message_id: number;
+    text?: string;
+    caption?: string;
+    entities?: TelegramEntity[];
+    caption_entities?: TelegramEntity[];
+  };
+}): ReplyRef | undefined {
   const r = m.reply_to_message;
   if (!r) return undefined;
-  return { message_id: r.message_id, text: r.text ?? r.caption };
+  const body = r.text ?? r.caption;
+  if (body === undefined) return { message_id: r.message_id };
+  return { message_id: r.message_id, text: entitiesToMarkdown(body, r.entities ?? r.caption_entities) };
+}
+
+// The message text with its Telegram entities folded back into Markdown, so the
+// agent reads bold/code/links/quotes instead of losing it.
+export function messageMarkdown(m: {
+  text?: string;
+  caption?: string;
+  entities?: TelegramEntity[];
+  caption_entities?: TelegramEntity[];
+}): string {
+  const body = m.text ?? m.caption ?? '';
+  if (body === '') return '';
+  return entitiesToMarkdown(body, m.text !== undefined ? m.entities : m.caption_entities);
 }
 
 // The original source of a forwarded message. Prefers the modern
@@ -354,20 +395,91 @@ export class TelegramClient {
 
   // Deliver text to a chat, optionally into a specific forum topic. Passing a
   // threadId routes the reply back into the same topic it came from; omitting it
-  // posts to the chat's General/main thread.
-  async sendMessage(chatId: number | string, text: string, threadId?: number | string): Promise<void> {
+  // posts to the chat's General/main thread. Returns every posted message id so
+  // callers can map an ours wire id back to Telegram.
+  async sendMessage(
+    chatId: number | string,
+    text: string,
+    threadId?: number | string,
+    opts: { replyToMessageId?: number; markdown?: boolean } = {},
+  ): Promise<number[]> {
     const thread = threadId === undefined || threadId === '' ? undefined : Number(threadId);
-    // Telegram caps a single text message at 4096 chars; split conservatively.
-    for (const chunk of chunkText(text, 4000)) {
-      const resp = await this.tgFetch(this.url('sendMessage'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: chunk, ...(thread !== undefined ? { message_thread_id: thread } : {}) }),
-      });
-      if (!resp.ok) {
-        const body = await resp.text();
-        throw new Error(`sendMessage failed (HTTP ${resp.status}): ${body}`);
+    const pieces = opts.markdown ? splitForMarkdownV2(text) : chunkText(text, 4000);
+    const ids: number[] = [];
+    for (let i = 0; i < pieces.length; i += 1) {
+      const piece = pieces[i];
+      const replyTo = i === 0 ? opts.replyToMessageId : undefined;
+      if (opts.markdown) {
+        try {
+          ids.push(await this.postMessage(chatId, toMarkdownV2(piece), thread, replyTo, 'MarkdownV2'));
+          continue;
+        } catch (err) {
+          if (!isParseEntitiesError(err)) throw err;
+          this.log(`markdown rejected, resending as plain text: ${String(err)}`);
+        }
       }
+      ids.push(await this.postMessage(chatId, piece, thread, replyTo, undefined));
+    }
+    return ids;
+  }
+
+  private async postMessage(
+    chatId: number | string,
+    text: string,
+    thread: number | undefined,
+    replyToMessageId: number | undefined,
+    parseMode: 'MarkdownV2' | undefined,
+  ): Promise<number> {
+    const resp = await this.tgFetch(this.url('sendMessage'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        ...(thread !== undefined ? { message_thread_id: thread } : {}),
+        ...(parseMode ? { parse_mode: parseMode } : {}),
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } }
+          : {}),
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`sendMessage failed (HTTP ${resp.status}): ${body}`);
+    }
+    const parsed = (await resp.json().catch(() => null)) as { result?: { message_id?: number } } | null;
+    return parsed?.result?.message_id ?? 0;
+  }
+
+  async setMyCommands(commands: { command: string; description: string }[]): Promise<void> {
+    const resp = await this.tgFetch(this.url('setMyCommands'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commands }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`setMyCommands failed (HTTP ${resp.status}): ${body}`);
+    }
+    const parsed = (await resp.json().catch(() => null)) as { ok?: boolean; description?: string } | null;
+    if (parsed && parsed.ok === false) {
+      throw new Error(`setMyCommands failed: ${parsed.description ?? 'unknown error'}`);
+    }
+  }
+
+  async setMessageReaction(chatId: number | string, messageId: number, emoji: string | null): Promise<void> {
+    const resp = await this.tgFetch(this.url('setMessageReaction'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: emoji ? [{ type: 'emoji', emoji }] : [],
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`setMessageReaction failed (HTTP ${resp.status}): ${body}`);
     }
   }
 
@@ -381,11 +493,18 @@ export class TelegramClient {
     filename: string,
     mime: string | undefined,
     threadId?: number | string,
-  ): Promise<void> {
+    opts: { replyToMessageId?: number } = {},
+  ): Promise<number> {
     const thread = threadId === undefined || threadId === '' ? undefined : Number(threadId);
     const form = new FormData();
     form.set('chat_id', String(chatId));
     if (thread !== undefined) form.set('message_thread_id', String(thread));
+    if (opts.replyToMessageId !== undefined) {
+      form.set('reply_parameters', JSON.stringify({
+        message_id: opts.replyToMessageId,
+        allow_sending_without_reply: true,
+      }));
+    }
     // Copy into a fresh Uint8Array: a Buffer is typed ArrayBufferLike (possibly
     // SharedArrayBuffer-backed) which is not a valid BlobPart; the copy is a plain
     // ArrayBuffer-backed view and preserves the bytes exactly.
@@ -396,6 +515,8 @@ export class TelegramClient {
       const body = await resp.text();
       throw new Error(`sendDocument failed (HTTP ${resp.status}): ${body}`);
     }
+    const parsed = (await resp.json().catch(() => null)) as { result?: { message_id?: number } } | null;
+    return parsed?.result?.message_id ?? 0;
   }
 
   // Resolve a file_id to its temporary download path (and size, when Telegram
@@ -478,7 +599,7 @@ export class TelegramClient {
               from: senderLabel(m),
               from_id: m.from?.id,
               from_username: m.from?.username,
-              text: m.text ?? m.caption ?? '',
+              text: messageMarkdown(m),
               date: m.date,
               reply_to: parseReply(m),
               forwarded_from: parseForwardOrigin(m),
@@ -513,6 +634,31 @@ function chunkText(text: string, size: number): string[] {
   if (text.length <= size) return [text];
   const out: string[] = [];
   for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
+  return out;
+}
+
+// Split the Markdown source so each rendered MarkdownV2 piece fits Telegram.
+// Keeping source pieces is what makes the plain-text fallback exact.
+export function splitForMarkdownV2(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
+  if (toMarkdownV2(text).length <= limit) return [text];
+  const out: string[] = [];
+  let rest = text;
+  while (rest.length > 0 && toMarkdownV2(rest).length > limit) {
+    let lo = 1;
+    let hi = rest.length;
+    let fit = 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (toMarkdownV2(rest.slice(0, mid)).length <= limit) { fit = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    const nl = rest.lastIndexOf('\n', fit);
+    const sp = rest.lastIndexOf(' ', fit);
+    const cut = nl > fit / 2 ? nl + 1 : sp > fit / 2 ? sp + 1 : fit;
+    out.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest) out.push(rest);
   return out;
 }
 

@@ -1,6 +1,6 @@
 // tests/attach-daemon.test.mjs
 //
-// THE CHECKPOINT: the connector runs on the PUBLISHED @ours.network/sdk, attached
+// THE CHECKPOINT: the connector runs on the installed @ours.network/sdk contract, attached
 // to a daemon it did not start, and the attachment is proved BEHAVIOURALLY rather
 // than by configuration.
 //
@@ -83,28 +83,26 @@ ok(true, 'the proxy agent redeemed the invite and the contact settled');
 
 // agent -> route, which is the direction the connector forwards TO Telegram.
 await agent.sendMessage({ contact: 'TgRoute', text: 'hello from the agent' });
-const arrived = await until('the message to reach the route identity', async () => {
-  const v = await route.getMessages();
-  return v.count > 0 ? v : undefined;
+const incoming = await until('the message to reach the route identity', async () => {
+  const v = await route.listIncomingMessages();
+  return v.length > 0 ? v : undefined;
 });
-ok(arrived.messages.at(-1).text === 'hello from the agent',
-   'the route received it through the daemon — the path forwardToTelegram reads');
-
-// …and the defer path the connector uses when Telegram refuses a delivery.
-const back = await route.deferMessages({ msg_ids: arrived.messages.map((m) => Number(m.msg_id)) });
-ok(Number(back.deferred) >= 1, 'deferMessages hands an undelivered message back to the queue');
-const again = await route.getMessages();
-ok(again.count >= 1, 'and it is readable again — a Telegram outage does not lose it');
+const exact = await route.getHistoryItem({ wire_id: incoming[0].wire_id });
+ok(exact?.body === 'hello from the agent' && exact.inbox_state === 'unread',
+   'read-only inspection resolves the exact unread body without consuming it');
+const arrived = await route.getMessages({ limit: 1 });
+ok(arrived.messages.length === 1 && arrived.messages[0].wire_id === incoming[0].wire_id,
+   'post-delivery acknowledgement consumes exactly the oldest inspected message');
 
 // route -> agent, the direction forwardToNode sends.
 await route.sendMessage({ contact: 'Agent', text: 'hello from telegram' });
 const atAgent = await until('the reply to reach the agent', async () => {
   const v = await agent.getMessages();
-  return v.count > 0 ? v : undefined;
+  return v.messages.length > 0 ? v : undefined;
 });
 ok(atAgent.messages.at(-1).text === 'hello from telegram', 'the round trip completed in both directions');
 
 await handle.close();
 rmSync(DAEMON_STATE, { recursive: true, force: true });
-console.log(`\nattach-daemon OK (${pass} checks) — the connector's ours half runs entirely on the published SDK`);
+console.log(`\nattach-daemon OK (${pass} checks) — the connector's ours half runs entirely on the SDK client boundary`);
 process.exit(0);
