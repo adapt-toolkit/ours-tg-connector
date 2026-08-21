@@ -14,11 +14,10 @@
 // The Telegram side is a local fake: this proves the ours half, and there is no
 // bot token to be had in CI.
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { startExternalDaemon } from './external-daemon.mjs';
 
 let pass = 0;
 const ok = (c, m) => { assert.ok(c, m); pass++; console.log('  ✓', m); };
@@ -34,40 +33,23 @@ const until = async (label, fn, ms = 120_000) => {
 };
 
 // ----- a daemon this test starts, and the connector does NOT ------------------
-// EVERY ENV VAR IS SET BEFORE THE FIRST SDK IMPORT, and that ordering is
-// load-bearing rather than stylistic: the SDK reads its config at MODULE LOAD
-// (`const CONFIG = loadConfig()`), so importing first and configuring after
-// silently boots against ~/.ours and the public broker. The first version of this
-// file did exactly that and died with "Failed to invoke initializer in ADAPT
-// environment" — an error that names neither the env nor the ordering.
+// SDK 2 deliberately has no public daemon import. The test harness launches the
+// released operator CLI in a separate process, exactly like an operator-managed
+// foreground daemon; connector clients only use the public attach path.
 const DAEMON_STATE = mkdtempSync(join(tmpdir(), 'tg-attach-daemon-'));
-process.env.OURS_STATE_DIR = DAEMON_STATE;
-process.env.OURS_BROKER_URL = 'wss://invalid.local/none';
-process.env.OURS_API_VISIBILITY = 'open';
-const freePort = () => new Promise((res) => { const s = createServer(); s.listen(0, () => { const p = s.address().port; s.close(() => res(p)); }); });
-const PORT = await freePort();
-process.env.OURS_PORT = String(PORT);
+const handle = await startExternalDaemon({ stateDir: DAEMON_STATE });
+const URL_ = handle.url;
 
-const { OursClient, resolveDaemonConfig, assertDaemonStateDir } = await import('@ours.network/sdk');
-const { startDaemon } = await import('@ours.network/sdk/daemon');
-
-// startDaemon BOOTS THE WRAPPER ITSELF. Calling bootWrapper() first and then
-// startDaemon() initialises the ADAPT environment TWICE in one process and dies
-// with "Failed to invoke initializer in ADAPT environment" — an error that names
-// neither the double init nor which call was the second. bootWrapper is for the
-// stdio path, where there is no HTTP daemon; the two are alternatives, not steps.
-const handle = await startDaemon({ version: 'test' });
-const URL_ = `http://127.0.0.1:${PORT}`;
+const { attachOursClient, resolveDaemonConfig } = await import('@ours.network/sdk');
 
 // ----- the connector attaches, using the SDK's own selection ------------------
 // Exactly what src/connector.ts's attachToDaemon does, including the proof step.
 const selection = resolveDaemonConfig({ endpoint: URL_, stateDir: DAEMON_STATE });
-await assertDaemonStateDir(selection);
 ok(selection.baseUrl.source === 'explicit' && selection.stateDir.source === 'explicit',
    'the selection is coherent: endpoint AND state dir both explicitly chosen');
 
 const routeToken = 'route-lease-tok';
-const route = new OursClient({ url: URL_, leaseToken: routeToken });
+const route = await attachOursClient({ endpoint: URL_, stateDir: DAEMON_STATE, leaseToken: routeToken });
 
 // ----- create a route identity and mint its invite ---------------------------
 const made = await route.createIdentity({ name: 'TgRoute', bio: 'the group chat', exposeLocal: false, localAutoAccept: true });
@@ -78,7 +60,9 @@ ok(typeof invite.blob === 'string' && invite.blob.length > 40, 'the route printe
 // ----- THE ATTACHMENT PROOF --------------------------------------------------
 // A different lease token is a different session to every session-scoped
 // operation. If the connector had its own engine, this client would see nothing.
-const observer = new OursClient({ url: URL_, leaseToken: 'a-completely-different-session' });
+const observer = await attachOursClient({
+  endpoint: URL_, stateDir: DAEMON_STATE, leaseToken: 'a-completely-different-session',
+});
 const seenByOther = await observer.listIdentities();
 ok(seenByOther.some((r) => r.name === 'TgRoute'),
    'A SECOND CLIENT ON A DIFFERENT LEASE SEES THE ROUTE IDENTITY — the daemon is genuinely shared');
@@ -88,7 +72,7 @@ ok(seenByOther.find((r) => r.name === 'TgRoute').session === 'other-live',
 // ----- round-trip one message ------------------------------------------------
 // The agent side: a second identity in the SAME daemon, redeeming the invite —
 // which is the proxy agent's role in production.
-const agent = new OursClient({ url: URL_, leaseToken: 'agent-lease-tok' });
+const agent = await attachOursClient({ endpoint: URL_, stateDir: DAEMON_STATE, leaseToken: 'agent-lease-tok' });
 await agent.createIdentity({ name: 'Agent', bio: '', exposeLocal: false, localAutoAccept: true });
 await agent.addContact({ invite: invite.blob });
 await until('the agent to see the route as a contact', async () => {
@@ -120,7 +104,7 @@ const atAgent = await until('the reply to reach the agent', async () => {
 });
 ok(atAgent.messages.at(-1).text === 'hello from telegram', 'the round trip completed in both directions');
 
-await handle.close?.();
+await handle.close();
 rmSync(DAEMON_STATE, { recursive: true, force: true });
 console.log(`\nattach-daemon OK (${pass} checks) — the connector's ours half runs entirely on the published SDK`);
 process.exit(0);

@@ -24,8 +24,8 @@
 //           whole chat (`chatId`) or a single forum topic (`chatId:threadId`). The
 //           route bridges that chat-key to one proxy agent:
 //
-//   Telegram chat/topic ──getUpdates──▶ bot demux ──▶ route packet ──send_message──▶ agent
-//   Telegram chat/topic ◀─sendMessage── bot ◀── route packet ◀──(encrypted)─── agent
+//   Telegram chat/topic ──getUpdates──▶ bot demux ──▶ route identity ──send_message──▶ agent
+//   Telegram chat/topic ◀─sendMessage── bot ◀── route identity ◀──(encrypted)─── agent
 //
 // Because each route's identity is pinned to exactly one chat-key, reverse
 // delivery is structural: an agent's reply arrives on the identity that *is* the
@@ -40,7 +40,7 @@
 // in exactly one place. Setup is then one command per route (`add_new_connection
 // --bot <name>`): the connector mints a fresh identity, sets its name + bio,
 // generates an invite, and returns it. The human pastes that invite into the proxy
-// agent's `add_contact`; the packet — already live on the broker — completes the
+// agent's `add_contact`; the route identity — already live through the daemon — completes the
 // handshake and the bridge is open. Routes naming the same bot share its single
 // poll loop.
 //
@@ -52,7 +52,9 @@
 //
 // identity.key and state_data.bin ARE GONE. The daemon owns identity material and
 // packet state; this process holds nothing an attacker would want except the
-// Telegram bot tokens and its own lease tokens. `leaseToken` is new and is what
+// Telegram bot tokens, its lease tokens, and the simple list of route names it
+// created. That list is application bookkeeping, not an authorization or
+// provenance boundary. `leaseToken` is what
 // makes a route's daemon session survive a connector restart: it IS the session,
 // so a route that regenerated one on every boot would look like a new client to
 // the daemon's lease table every time.
@@ -74,13 +76,12 @@ import * as fs from 'node:fs';
 
 import { loadConfig } from './config';
 import {
-  OursClient,
   OursError,
+  attachOursClient,
   resolveDaemonConfig,
   describeDaemonConfig,
-  assertDaemonStateDir,
 } from '@ours.network/sdk';
-import type { ResolvedDaemonConfig } from '@ours.network/sdk';
+import type { OursClient, ResolvedDaemonConfig, ResolveDaemonConfigOptions } from '@ours.network/sdk';
 import { TelegramClient } from './telegram';
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
@@ -169,16 +170,32 @@ interface Connection {
 // reproduced credential-disclosure bug (ours-sdk 43ca743), and a second
 // implementation here is exactly how it would come back.
 let daemon: ResolvedDaemonConfig | null = null;
+// A one-shot view of the daemon's GLOBAL identity names. It is used only to
+// report the connector-owned subset at boot; chooseIdentity remains the
+// authoritative per-route check and is never gated by this snapshot.
+let daemonIdentityNames = new Set<string>();
 
-async function attachToDaemon(): Promise<ResolvedDaemonConfig> {
-  const cfg = resolveDaemonConfig({
+// The connector's complete ownership bookkeeping: names of persisted routes,
+// plus a newly-created live route between createIdentity and writeMeta. This is
+// deliberately a simple name set, not provenance or an authorization boundary.
+const ownedIdentityNames = new Set<string>();
+
+function daemonSelectionOptions(): ResolveDaemonConfigOptions {
+  return {
     ...(CONFIG.daemonUrl ? { endpoint: CONFIG.daemonUrl } : {}),
     ...(CONFIG.daemonStateDir ? { stateDir: CONFIG.daemonStateDir } : {}),
-  });
-  // Prove WHICH daemon answered before any credential is sent. The probe is the
-  // unauthenticated /state-dir route, which is why it is safe to send it to an
-  // address that has not identified itself yet.
-  await assertDaemonStateDir(cfg);
+  };
+}
+
+async function attachToDaemon(): Promise<ResolvedDaemonConfig> {
+  const options = daemonSelectionOptions();
+  const cfg = resolveDaemonConfig(options);
+  // SDK 2's supported application boundary resolves the coherent selection,
+  // proves /state-dir, and only then constructs a credential-bearing client.
+  // This boot probe deliberately remains unbound; each route attaches below
+  // with its own stable lease because one lease has one current identity.
+  const client = await attachOursClient(options);
+  daemonIdentityNames = new Set((await client.identities()).map((row) => row.name));
   log(`attached to daemon ${JSON.stringify(describeDaemonConfig(cfg))}`);
   return cfg;
 }
@@ -188,12 +205,11 @@ async function attachToDaemon(): Promise<ResolvedDaemonConfig> {
  * (see ConnectionFile.leaseToken) so a restart RESUMES the session rather than
  * arriving as a new client.
  */
-function clientFor(cfg: ConnectionFile): OursClient {
+async function clientFor(cfg: ConnectionFile): Promise<OursClient> {
   if (!daemon) throw new Error('not attached to a daemon yet');
-  return new OursClient({
-    url: daemon.baseUrl.value,
+  return attachOursClient({
+    ...daemonSelectionOptions(),
     leaseToken: cfg.leaseToken!,
-    ...(daemon.token ? { apiToken: daemon.token.value } : {}),
   });
 }
 const connections = new Map<string, Connection>(); // route name -> route
@@ -727,7 +743,7 @@ function activateBot(bot: Bot): void {
 }
 
 // ----- create / restore / remove ----------------------------------------------
-// Create a brand-new route live on an already-registered bot: mint a fresh packet,
+// Create a brand-new route live on an already-registered bot: mint a fresh daemon identity,
 // set display name + bio, persist, register in the demux, ensure the bot poll is
 // running, generate an invite, return the blob to hand out.
 async function createConnection(args: {
@@ -741,6 +757,8 @@ async function createConnection(args: {
 }): Promise<{ cid: string; invite: string; botUsername: string }> {
   const bot = bots.get(args.botName);
   if (!bot) throw new Error(`no bot named "${args.botName}" — register it with add_bot`);
+  let conn: Connection | null = null;
+  let identityCreated = false;
   try {
     // Fail before minting an identity if the slot is taken.
     const slotErr = routeSlotConflict(bot, args.chatId, args.threadId);
@@ -763,8 +781,8 @@ async function createConnection(args: {
       leaseToken: randomBytes(24).toString('hex'),
       createdAt: new Date().toISOString(),
     };
-    const client = clientFor(cfg);
-    const conn: Connection = { client, dir, cfg, bot, lastChat: null, watch: null };
+    const client = await clientFor(cfg);
+    conn = { client, dir, cfg, bot, lastChat: null, watch: null };
     connections.set(args.name, conn);
     const conflict = registerRoute(conn);
     if (conflict) throw new Error(conflict);
@@ -775,6 +793,9 @@ async function createConnection(args: {
     const made = await client.createIdentity({
       name: args.name, bio: args.bio, exposeLocal: false, localAutoAccept: true,
     });
+    identityCreated = true;
+    ownedIdentityNames.add(args.name);
+    daemonIdentityNames.add(args.name);
     writeMeta(dir, cfg);
     watchRoute(conn);
     activateBot(bot); // idempotent — the bot already polls from add_bot
@@ -785,9 +806,20 @@ async function createConnection(args: {
     log(`[${args.name}] route created (bot ${botLabel(bot)}, ${key})`);
     return { cid: made.info.cid, invite: invite.blob, botUsername: bot.username };
   } catch (err) {
-    // Roll back the half-created route so a retry with the same name works. The
-    // bot keeps polling regardless — it polls from registration so /id stays live.
-    if (connections.has(args.name)) await removeConnection(args.name);
+    // Roll back a completed create so a normal retry with the same name works.
+    // A hard process crash between createIdentity and writeMeta can leave a
+    // name-only orphan in the global daemon; that accepted residual is repaired
+    // explicitly with the operator CLI rather than a recovery/provenance layer.
+    if (conn && identityCreated) {
+      const cleanup = await removeConnection(args.name);
+      if (cleanup.error) log(`[${args.name}] cleanup after create failure: ${cleanup.error}`);
+    } else if (conn) {
+      unregisterRoute(conn);
+      conn.watch?.abort();
+      connections.delete(args.name);
+      try { await conn.client.releaseLease(); } catch { /* best effort */ }
+      try { fs.rmSync(connDir(args.name), { recursive: true, force: true }); } catch { /* best effort */ }
+    }
     throw err;
   }
 }
@@ -806,13 +838,12 @@ async function restoreConnection(name: string): Promise<void> {
     writeMeta(dir, cfg);
     log(`[${name}] minted a lease token (route predates the daemon-attach conversion)`);
   }
-  const client = clientFor(cfg);
+  const client = await clientFor(cfg);
   const conn: Connection = { client, dir, cfg, bot, lastChat: null, watch: null };
 
-  // BIND, DO NOT CREATE. The identity lives in the daemon and survived this
-  // process restarting; choose_identity re-attaches this session to it. `force`
-  // is false on purpose — if another live session holds it, that is a real
-  // conflict and the route must say so rather than steal the binding.
+  // Bind by the recorded route name regardless of the one-shot global inventory.
+  // chooseIdentity is authoritative for route liveness; the inventory is only
+  // reporting and must never cause this call to be skipped.
   try {
     await client.chooseIdentity({ name, force: false });
   } catch (err) {
@@ -823,6 +854,7 @@ async function restoreConnection(name: string): Promise<void> {
         'recreated, because that would mint a new container id and silently break every contact.',
       );
     }
+    // In particular BOUND_ELSEWHERE is a hard error. Never force or adopt.
     throw err;
   }
   connections.set(name, conn);
@@ -836,30 +868,89 @@ async function restoreConnection(name: string): Promise<void> {
   log(`[${name}] route restored (bot ${botLabel(bot)})`);
 }
 
-async function removeConnection(name: string): Promise<string | null> {
+interface RemoveConnectionResult {
+  found: boolean;
+  localRemoved: boolean;
+  identityRemoved: boolean;
+  identityLeftBehind: boolean;
+  error?: string;
+}
+
+async function removeConnection(name: string): Promise<RemoveConnectionResult> {
   const conn = connections.get(name);
-  if (!conn) return `no connection named "${name}"`;
-  unregisterRoute(conn);
-  conn.watch?.abort();
-  conn.watch = null;
-  // RELEASE THE LEASE, DO NOT DELETE THE IDENTITY. As a host, removing a route
-  // destroyed its packet — the identity WAS the route. Attached, the identity
-  // lives in a daemon this connector shares with other clients, so tearing it
-  // down here would delete something that is not ours to delete. The route's
-  // config goes; the identity stays until someone removes it deliberately.
+  if (!conn) {
+    // An unrestorable route is absent from the live map. Without its bound
+    // session there is no lease to release, so discard the local record and
+    // surface the global identity for explicit operator cleanup.
+    const dir = connDir(name);
+    if (!fs.existsSync(metaPath(dir))) {
+      return { found: false, localRemoved: false, identityRemoved: false, identityLeftBehind: false, error: `no connection named "${name}"` };
+    }
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      return {
+        found: true, localRemoved: false, identityRemoved: false, identityLeftBehind: true,
+        error: `deleting ${dir} failed: ${String(err)}`,
+      };
+    }
+    ownedIdentityNames.delete(name);
+    const reason = `route "${name}" was not live, so its daemon lease could not be released; identity "${name}" was left behind`;
+    log(`[${name}] ${reason}`);
+    return {
+      found: true, localRemoved: true, identityRemoved: false, identityLeftBehind: true, error: reason,
+    };
+  }
+
+  let releaseError = '';
   try {
     await conn.client.releaseLease();
   } catch (err) {
-    log(`[${name}] releasing the daemon lease failed:`, String(err));
+    releaseError = `releasing the daemon lease for identity "${name}" failed: ${String(err)}`;
   }
+
+  let identityRemoved = false;
+  let removalError = releaseError;
+  if (!releaseError && ownedIdentityNames.has(name)) {
+    try {
+      // Name-only deletion is deliberately organizational bookkeeping, not an
+      // authorization boundary. If an operator removed and externally recreated
+      // this same name, removal can delete that replacement; the approved model
+      // accepts that outcome and adds no CID/provenance machinery around it.
+      await conn.client.removeIdentity({ name });
+      identityRemoved = true;
+    } catch (err) {
+      removalError = `route "${name}" was removed locally, but daemon identity "${name}" was left behind: ${String(err)}`;
+    }
+  } else if (!releaseError) {
+    removalError = `route "${name}" was removed locally, but identity "${name}" was not in the connector-owned name list and was left behind`;
+  }
+
+  unregisterRoute(conn);
+  conn.watch?.abort();
+  conn.watch = null;
   connections.delete(name);
   try {
     fs.rmSync(conn.dir, { recursive: true, force: true });
   } catch (err) {
-    return `deleting ${conn.dir} failed: ${String(err)}`;
+    return {
+      found: true, localRemoved: false, identityRemoved, identityLeftBehind: !identityRemoved,
+      error: `deleting ${conn.dir} failed: ${String(err)}`,
+    };
   }
-  log(`[${name}] route removed (its identity remains in the daemon)`);
-  return null;
+  ownedIdentityNames.delete(name);
+  if (identityRemoved) {
+    daemonIdentityNames.delete(name);
+    log(`[${name}] route and daemon identity removed`);
+  }
+  else log(`[${name}] route removed locally; ${removalError}`);
+  return {
+    found: true,
+    localRemoved: true,
+    identityRemoved,
+    identityLeftBehind: !identityRemoved,
+    ...(removalError ? { error: removalError } : {}),
+  };
 }
 
 // ----- control HTTP API (localhost) -------------------------------------------
@@ -1006,9 +1097,18 @@ function startControlServer(): void {
       const delMatch = url.pathname.match(/^\/connections\/(.+)$/);
       if (req.method === 'DELETE' && delMatch) {
         const name = decodeURIComponent(delMatch[1]);
-        const fail = await removeConnection(name);
-        if (fail) return sendJson(res, fail.startsWith('no connection') ? 404 : 500, { ok: false, error: fail });
-        return sendJson(res, 200, { ok: true, removed: name });
+        const result = await removeConnection(name);
+        if (!result.found) return sendJson(res, 404, { ok: false, error: result.error });
+        if (result.error) {
+          return sendJson(res, 409, {
+            ok: false,
+            removed: result.localRemoved ? name : null,
+            identityRemoved: result.identityRemoved,
+            identityLeftBehind: result.identityLeftBehind,
+            error: result.error,
+          });
+        }
+        return sendJson(res, 200, { ok: true, removed: name, identityRemoved: true, identityLeftBehind: false });
       }
 
       sendJson(res, 404, { ok: false, error: 'not found' });
@@ -1061,6 +1161,13 @@ async function main(): Promise<void> {
 
   // 2. Restore persisted routes; each resolves its bot by name.
   const names = listPersistedNames();
+  for (const name of names) ownedIdentityNames.add(name);
+  const visibleOwned = names.filter((name) => daemonIdentityNames.has(name));
+  const missingOwned = names.filter((name) => !daemonIdentityNames.has(name));
+  if (visibleOwned.length) log(`daemon inventory includes connector routes: ${visibleOwned.join(', ')}`);
+  if (missingOwned.length) {
+    log(`daemon inventory does not include connector routes: ${missingOwned.join(', ')} — attempting authoritative chooseIdentity for each`);
+  }
   if (names.length === 0) {
     log('no persisted routes — add a bot with `add_bot`, then a route with `add_new_connection`');
   } else {

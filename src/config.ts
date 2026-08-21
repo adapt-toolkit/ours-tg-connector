@@ -15,6 +15,8 @@ export interface ConnectorConfig {
   // is refused by that resolver before any credential is read — that is the
   // reproduced credential-disclosure case (ours-sdk 43ca743), and it is refused
   // there rather than here so there is exactly one implementation of the rule.
+  // SDK 2 also rejects legacy OURS_INSTANCE and ignores OURS_AUTOSTART/autoStart:
+  // the connector always attaches and never starts or embeds a daemon.
   daemonUrl: string;      // '' => the SDK's default selection
   daemonStateDir: string; // '' => the SDK's default selection
   controlPort: number; // localhost JSON control API (add/list/remove connections)

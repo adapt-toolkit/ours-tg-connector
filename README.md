@@ -12,7 +12,7 @@ loop.
  chat B ─┤  Telegram   │        (demux by chat-key)     │
  topic#7 ┘             └──┬──────────┬──────────┬───────┘
                           ▼          ▼          ▼
-                    identity A  identity B  identity C   ← one packet per chat-key
+                    identity A  identity B  identity C   ← daemon identity per chat-key
                           │          │          │  send_message
                           ▼          ▼          ▼
                       Agent X     Agent X     Agent Y    ← same agent can serve many
@@ -24,7 +24,7 @@ Two layers:
   (`add_bot`). One token == one `getUpdates` poll loop (Telegram allows only one
   consumer per token). The loop demultiplexes each update to a route by **chat-key**
   (`chatId`, or `chatId:threadId` for a forum topic).
-- **Route** — one self-sovereign ADAPT identity (a packet) pinned to one chat-key,
+- **Route** — one ours identity in the shared daemon pinned to one chat-key,
   bridged to one proxy agent. A route **references its bot by name**, so the token
   lives in exactly one place; many routes share a bot. The invite a route emits is
   byte-compatible with the ours `add_contact` tool.
@@ -47,7 +47,7 @@ customers; escalate refunds to a human").
    context). The connector mints a fresh identity, sets its name + bio, and prints
    an **invite blob**.
 3. You paste that blob into your proxy agent via its `add_contact`. The connector
-   packet — already live on the broker — completes the encrypted-channel handshake.
+   route identity — already live through the daemon — completes the encrypted-channel handshake.
 4. From then on:
    - every message in that chat/topic is forwarded to its agent as a JSON
      **message envelope** (sender + chat metadata, reply/forward context, and any
@@ -67,11 +67,13 @@ both modes; Telegram voice notes retain the protocol MIME marker
 `audio/ogg; x-ours-kind=voice-message`, allowing the receiving daemon to invoke
 its native voice-transcription path even when no companion text is sent.
 
-Messages are end-to-end encrypted between the connector packet and the agent (ADAPT
+Messages are end-to-end encrypted between the connector's route identity and the agent (ADAPT
 encrypted channels). The connector never persists message bodies to disk — only the
-bot registry (`bot name`, `token`, `@username`), the per-route seed + serialized
-packet state, and the route's Telegram side (`bot name`, `chat id`, `thread id`,
-`bio`, `peer cid`).
+bot registry (`bot name`, `token`, `@username`) and route metadata (`bot name`,
+`chat id`, `thread id`, `bio`, `peer cid`, and stable daemon lease). Those
+persisted route names are also the connector's simple list of identities it
+created. The list is organizational bookkeeping, not an authorization or
+provenance boundary; identity keys and packet state stay in the shared daemon.
 
 ### Routing rules
 
@@ -163,7 +165,7 @@ distinct from `send_message`, so files and text are always separate messages.
   read files from the file channel and correlate by `attachment.wire_id`** — an
   agent that still expects inline base64 will not see the bytes.
 - **Outbound (agent → Telegram).** A file the agent sends arrives via
-  `receive_file`, is stored in the packet's file inbox (same unread → processed →
+  `receive_file`, is stored in the daemon identity's file inbox (same unread → processed →
   gc lifecycle as messages, bytes included), and is delivered to the chat (and
   forum topic, if pinned) with Telegram **`sendDocument`** — preserving the
   original filename. Agent → Telegram file sending was previously unsupported.
@@ -279,7 +281,8 @@ ours-tg-connector add_bot supportbot 123456:ABC...
 
 ours-tg-connector list_bots             # name, @username, masked token, route count
 
-# 2. create a route on that bot (auto-starts the daemon if needed) and print an invite
+# 2. create a route on that bot (auto-starts the connector process if needed;
+#    the shared ours daemon must already be running) and print an invite
 ours-tg-connector add_new_connection \
   --name support \
   --bot supportbot \
@@ -296,10 +299,10 @@ ours-tg-connector add_new_connection \
   --bio "ACME forum, #billing topic"
 
 ours-tg-connector list_connections     # routes grouped by bot
-ours-tg-connector remove_connection sales
+ours-tg-connector remove_connection sales  # removes the route and its name-listed daemon identity
 ours-tg-connector remove_bot supportbot   # refused while any route still uses it
 
-# daemon lifecycle
+# connector-process lifecycle (never starts or stops the shared ours daemon)
 ours-tg-connector start | stop | restart | status
 ours-tg-connector serve     # foreground (debugging)
 
@@ -307,9 +310,6 @@ ours-tg-connector serve     # foreground (debugging)
 ours-tg-connector install-service     # systemd (Linux) / launchd (macOS)
 ours-tg-connector uninstall-service
 
-# manage a bridge from the ours messenger control plane
-ours-tg-connector cp_invite supportbot              # invite to add the messenger as a contact
-ours-tg-connector bind_proxy supportbot <contact>   # start binding it (prints a 6-digit code)
 ```
 
 `install-service` registers a **user-level** service running `serve`, bakes the
@@ -331,6 +331,13 @@ topic within that chat. `--bio` is the context the agent reads about this chat
 (embedded in the invite, visible when it accepts). `--chat-id 0` makes a catch-all
 route for any chat the bot sees that no other route claims. Reuse the same `--bot`
 across routes to multiplex one bot over many chats/topics.
+
+`remove_connection` releases that route's daemon lease, then removes the daemon
+identity by its recorded route name and deletes the local route record. Because
+the ownership list is intentionally name-only, an operator who manually removes
+and recreates a same-name identity has deliberately replaced it; removing the
+route can remove that replacement too. Use the `ours` operator CLI to repair
+orphaned or deliberately replaced identities.
 
 ## Configuration
 
@@ -359,6 +366,13 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | STT size guard | `OURS_TG_STT_MAX_BYTES`   | `5242880` (5 MB; audio over this skips STT and is forwarded as a file — cost/latency guard) |
 | STT timeout    | `OURS_TG_STT_TIMEOUT_MS`  | `60000` (per-transcription abort deadline, ms) |
 | forward voice audio | `OURS_TG_FORWARD_VOICE_AUDIO` | `false` (also `send_file` the `.ogg` alongside a successful transcript) |
+
+`OURS_TG_DAEMON_URL` and `OURS_TG_DAEMON_STATE_DIR` are a coherent pair: set
+both or neither. SDK 2 refuses an explicitly selected endpoint without its state
+directory before reading a daemon token. Legacy `OURS_INSTANCE` is rejected, and
+`OURS_AUTOSTART`/`autoStart` are ignored. This connector never embeds or starts an
+ours daemon; operate the shared daemon separately with `ours daemon start` or
+`ours daemon install-service`.
 
 The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
 tokens, so do not expose the control port off-host.
