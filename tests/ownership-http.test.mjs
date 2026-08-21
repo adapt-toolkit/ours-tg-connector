@@ -78,8 +78,9 @@ const fakeDaemon = createServer(async (req, res) => {
     }
     return json(res, 200, { name: args.name, kind: 'permanent' });
   }
-  if (op === 'getMessages') return json(res, 200, { count: 0, messages: [] });
-  if (op === 'getFiles') return json(res, 200, { files: [], text: '', mode: 'all_unread', requested: null });
+  if (op === 'listIncomingMessages') return json(res, 200, []);
+  if (op === 'listIncomingFiles') return json(res, 200, []);
+  if (op === 'listHistory') return json(res, 200, { items: [], next_cursor: null });
   if (op === 'listContacts') return json(res, 200, { contacts: [], pending: [], roots: {}, degraded: [], renames: {} });
   return json(res, 500, { error: `unexpected operation ${op}` });
 });
@@ -163,9 +164,9 @@ try {
   assert.match(output, /failed to restore "MissingRoute".*has no identity in the daemon.*NOT being recreated/s,
     'NO_SUCH is surfaced as an explicit operator error and never silently recreated');
   assert.match(output, /failed to restore "BoundRoute".*held by another live session/s);
-  assert.ok(calls.some((call) => call.route === 'RestoredRoute' && call.op === 'getMessages'),
+  assert.ok(calls.some((call) => call.route === 'RestoredRoute' && call.op === 'listIncomingMessages'),
     'one NO_SUCH sibling does not prevent a healthy route from restoring and draining');
-  assert.ok(calls.some((call) => call.route === 'SnapshotMissing' && call.op === 'getMessages'),
+  assert.ok(calls.some((call) => call.route === 'SnapshotMissing' && call.op === 'listIncomingMessages'),
     'a route missing only from the snapshot remains functional after chooseIdentity succeeds');
 
   const restoredResponse = await fetch(`${controlUrl}/connections/RestoredRoute`, { method: 'DELETE' });

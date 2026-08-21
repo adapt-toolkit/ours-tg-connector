@@ -89,6 +89,18 @@ import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './env
 import { transcribe } from './stt';
 import { watchWithRetry } from './watch';
 import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply, DEFAULT_DENIED } from './routing';
+import { MessageMap } from './msgmap';
+import {
+  emojiFor,
+  formatHelp,
+  formatStatus,
+  parseReceiptCommand,
+  telegramCommandList,
+  type ReceiptState,
+} from './receipts';
+import { drainMessages as drainHistoryMessages, drainFiles as drainHistoryFiles } from './history-delivery';
+import { reconcileReceiptHistory } from './history-receipts';
+import { singleFlight } from './single-flight';
 
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
@@ -155,8 +167,29 @@ interface Connection {
   cfg: ConnectionFile;
   bot: Bot;
   lastChat: { chatId: string; threadId: string } | null; // most recent inbound origin (reverse-delivery target for non-topic-pinned routes)
+  map: MessageMap;
+  drainMessages: () => Promise<void>;
+  drainFiles: () => Promise<void>;
+  syncReceipts: () => Promise<void>;
   /** Stops this route's notification watch on removal / shutdown. */
   watch: AbortController | null;
+}
+
+function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bot: Bot): Connection {
+  let conn: Connection;
+  conn = {
+    client,
+    dir,
+    cfg,
+    bot,
+    lastChat: null,
+    map: new MessageMap(dir, (m) => log(`[${cfg.name}] ${m}`)),
+    drainMessages: singleFlight(() => forwardToTelegram(conn)),
+    drainFiles: singleFlight(() => forwardFilesToTelegram(conn)),
+    syncReceipts: singleFlight(() => syncReceiptHistory(conn)),
+    watch: null,
+  };
+  return conn;
 }
 
 // ----- the daemon this connector is attached to ------------------------------
@@ -455,9 +488,22 @@ function watchRoute(conn: Connection): void {
         const event = String(ev.event ?? '');
         try {
           if (event === 'message_received') {
-            await forwardToTelegram(conn);
+            await conn.drainMessages();
           } else if (event === 'file_received') {
-            await forwardFilesToTelegram(conn);
+            await conn.drainFiles();
+          } else if (event === 'receipt_received') {
+            const senderCid = typeof ev.sender_id === 'string' ? ev.sender_id : '';
+            const kind = ev.kind === 'delivered' || ev.kind === 'read' ? ev.kind : null;
+            const wireIds = Array.isArray(ev.wire_ids)
+              ? ev.wire_ids.filter((v): v is string => typeof v === 'string' && v.length > 0)
+              : [];
+            if (senderCid && kind && wireIds.length) {
+              await applyReceiptReactions(conn, senderCid, kind, wireIds);
+            } else {
+              await conn.syncReceipts();
+            }
+          } else if (event === 'sync_required') {
+            await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
           } else if (event === 'contact_accepted' || event === 'sibling_contact_added' || event === 'local_contact_added') {
             // The FIRST accepted contact is the proxy agent (telegram traffic routes
             // there). Later contacts must NOT clobber it, so only set peerCid while
@@ -472,9 +518,7 @@ function watchRoute(conn: Connection): void {
               log(`[${cfg.name}] contact added: "${name}" (${cid})`);
             }
           } else if (event === 'contact_restored') {
-            // Observability only now: the DAEMON drains the deferred queue on its
-            // own sweep. As a host this arm called flush_deferred itself.
-            log(`[${cfg.name}] contact "${String(ev.from ?? '')}" restored (re-keyed) — daemon will drain the queue`);
+            log(`[${cfg.name}] contact "${String(ev.from ?? '')}" restored (re-keyed)`);
           }
         } catch (err) {
           // One bad event must not tear the stream down.
@@ -486,8 +530,7 @@ function watchRoute(conn: Connection): void {
       // restoreConnection does on boot, for the same reason.
       onResume: async () => {
         log(`[${cfg.name}] notification watch resumed — draining what arrived while it was down`);
-        await forwardToTelegram(conn);
-        await forwardFilesToTelegram(conn);
+        await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
       },
       onError: (err, delayMs) => {
         log(`[${cfg.name}] notification watch failed (retrying in ${delayMs}ms):`, String(err));
@@ -542,6 +585,9 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     return;
   }
   for (const target of targets) {
+    const replyToWireId = m.reply_to
+      ? conn.map.findTelegramMessage(String(m.chat_id), m.reply_to.message_id)
+      : undefined;
     // Files and text are distinct messages (core 3.1). When the bytes resolved,
     // send them on the file channel first and capture the wire_id; the envelope
     // then references it so the agent correlates the two. Over-cap/failed
@@ -558,10 +604,19 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
           data_base64: Buffer.from(resolved.bytes).toString('base64'),
           filename: meta.filename,
           mime: meta.mime,
+          ...(replyToWireId ? { reply_to_wire_id: replyToWireId } : {}),
         });
         // `introduced` is the one outcome with no wireId — it means the send took
         // the introduction-request path and there is nothing yet to reference.
-        fileWireId = 'wireId' in r ? r.wireId : undefined;
+        fileWireId = 'wire_id' in r ? r.wire_id : undefined;
+        if (fileWireId && m.message_id > 0) {
+          conn.map.record(fileWireId, {
+            chatId: String(m.chat_id), messageId: m.message_id, contactCid: target, direction: 'inbound',
+          });
+        }
+        if ('history_stored' in r && !r.history_stored) {
+          log(`[${cfg.name}] sent file ${fileWireId ?? '<unknown>'} but daemon history storage failed`);
+        }
       } catch (err) {
         log(`[${cfg.name}] send_file to ${target} failed:`, String(err));
       }
@@ -575,7 +630,20 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     // send_file. Do not manufacture an empty text message or a JSON wrapper.
     if (body === undefined) continue;
     try {
-      const sent = await client.sendMessage({ contact: target, text: body });
+      const sent = await client.sendMessage({
+        contact: target,
+        text: body,
+        ...(replyToWireId ? { reply_to_wire_id: replyToWireId } : {}),
+      });
+      const wireId = 'wire_id' in sent ? sent.wire_id : ('wireId' in sent ? sent.wireId : '');
+      if (wireId && m.message_id > 0) {
+        conn.map.record(wireId, {
+          chatId: String(m.chat_id), messageId: m.message_id, contactCid: target, direction: 'inbound',
+        });
+      }
+      if ('history_stored' in sent && !sent.history_stored) {
+        log(`[${cfg.name}] sent message ${wireId || '<unknown>'} but daemon history storage failed`);
+      }
       if (sent.kind === 'deferred') {
         log(`[${cfg.name}] message to ${target} queued — contact restore in progress (${sent.queued} queued)`);
       }
@@ -591,99 +659,157 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
 // message_received notify.
 async function forwardToTelegram(conn: Connection): Promise<void> {
   const { client, cfg, bot } = conn;
-  let fresh;
-  try {
-    fresh = (await client.getMessages()).messages;
-  } catch (err) {
-    log(`[${cfg.name}] get_messages failed:`, String(err));
-    return;
-  }
-  if (fresh.length === 0) return;
   const target = deliveryTarget(cfg.chatId, cfg.threadId, conn.lastChat);
   if (!target || !target.chatId || isCatchAll(target.chatId)) {
-    // A catch-all route that has not yet seen an inbound message has nowhere to
-    // deliver — hand the messages back so a later attempt re-delivers them once
-    // an origin chat is known, rather than dropping them.
-    log(`[${cfg.name}] ${fresh.length} agent message(s) with no known destination chat — deferring`);
     try {
-      await client.deferMessages({ msg_ids: fresh.map((m) => Number(m.msg_id)) });
-    } catch {
-      /* best effort */
-    }
+      const pending = await client.listIncomingMessages();
+      if (pending.length) log(`[${cfg.name}] ${pending.length} agent message(s) remain unread until a destination chat is known`);
+    } catch (err) { log(`[${cfg.name}] list_incoming_messages failed:`, String(err)); }
     return;
   }
-  for (const m of fresh) {
-    try {
-      await bot.tg.sendMessage(target.chatId, m.text, target.threadId || undefined);
-    } catch (err) {
-      log(`[${cfg.name}] telegram delivery failed for #${m.msg_id}:`, String(err));
-      // Hand the message back so a later attempt re-delivers it rather than
-      // silently losing it on a transient Telegram outage.
-      try {
-        await client.deferMessages({ msg_ids: [Number(m.msg_id)] });
-      } catch {
-        /* best effort */
+  try {
+    await drainHistoryMessages(client, async (m) => {
+      const row = m.reply_to ? conn.map.get(m.reply_to.wire_id) : undefined;
+      const replyToMessageId = row && row.chatId === String(target.chatId) ? row.messageId : undefined;
+      if (m.reply_to && replyToMessageId === undefined) {
+        log(`[${cfg.name}] reply pointer ${m.reply_to.wire_id.slice(0, 12)}… has no mapped Telegram message — delivering unthreaded`);
       }
+      const ids = await bot.tg.sendMessage(target.chatId, m.body, target.threadId || undefined, {
+        replyToMessageId,
+        markdown: true,
+      });
+      if (m.wire_id && ids[0] > 0) {
+        conn.map.record(m.wire_id, {
+          chatId: String(target.chatId), messageId: ids[0], contactCid: m.from.id, direction: 'outbound',
+        });
+      }
+    });
+  } catch (err) {
+    log(`[${cfg.name}] ordered Telegram message drain stopped (oldest row remains unread unless delivery already succeeded):`, String(err));
+  }
+}
+
+// contact → Telegram: inspect unread file history, fetch immutable bytes, upload
+// each file, and only then acknowledge its exact wire id. Triggered by the
+// file_received notify; a transient Telegram failure leaves the file unread.
+async function forwardFilesToTelegram(conn: Connection): Promise<void> {
+  const { client, cfg, bot } = conn;
+  const target = deliveryTarget(cfg.chatId, cfg.threadId, conn.lastChat);
+  if (!target || !target.chatId || isCatchAll(target.chatId)) {
+    try {
+      const pending = await client.listIncomingFiles();
+      if (pending.length) log(`[${cfg.name}] ${pending.length} agent file(s) remain unread until a destination chat is known`);
+    } catch (err) { log(`[${cfg.name}] list_incoming_files failed:`, String(err)); }
+    return;
+  }
+  try {
+    await drainHistoryFiles(client, async (f, bytes) => {
+      if (bytes.length > CONFIG.outboundFileMaxBytes) {
+        log(`[${cfg.name}] file #${f.file_id} "${f.filename}" (${bytes.length} B) exceeds the ${CONFIG.outboundFileMaxBytes}-byte upload cap — skipping`);
+        return;
+      }
+      const row = f.reply_to ? conn.map.get(f.reply_to.wire_id) : undefined;
+      const replyToMessageId = row && row.chatId === String(target.chatId) ? row.messageId : undefined;
+      const messageId = await bot.tg.sendDocument(
+        target.chatId,
+        Buffer.from(bytes),
+        f.filename,
+        f.mime || undefined,
+        target.threadId || undefined,
+        { replyToMessageId },
+      );
+      if (f.wire_id && messageId > 0) {
+        conn.map.record(f.wire_id, {
+          chatId: String(target.chatId), messageId, contactCid: f.from.id, direction: 'outbound',
+        });
+      }
+    });
+  } catch (err) {
+    log(`[${cfg.name}] ordered Telegram file drain stopped (oldest row remains unread unless delivery already succeeded):`, String(err));
+  }
+}
+
+async function applyReceiptReactions(
+  conn: Connection,
+  senderCid: string,
+  kind: ReceiptState,
+  wireIds: string[],
+): Promise<void> {
+  const settings = conn.map.settingsFor(senderCid || conn.cfg.peerCid);
+  if (!settings.receiptsEnabled) return;
+  const emoji = emojiFor(kind, settings);
+  if (!emoji) return;
+  for (const wireId of wireIds) {
+    const row = conn.map.applyReceipt(wireId, kind);
+    if (!row) continue;
+    try {
+      await conn.bot.tg.setMessageReaction(row.chatId, row.messageId, emoji);
+    } catch (err) {
+      log(`[${conn.cfg.name}] reaction ${emoji} for ${kind} on ${row.chatId}/${row.messageId} refused by Telegram (delivery unaffected):`, String(err));
     }
   }
 }
 
-// contact → Telegram: pull freshly-received files out of the route's packet and
-// upload each to its chat (and topic, if pinned). Triggered by the file_received
-// notify. Mirrors forwardToTelegram: defers undelivered files so a transient
-// Telegram outage never loses them.
-async function forwardFilesToTelegram(conn: Connection): Promise<void> {
-  const { client, cfg, bot } = conn;
-  let fresh;
+async function syncReceiptHistory(conn: Connection): Promise<void> {
+  const retained = new Set(conn.map.entries('inbound').map(([wireId]) => wireId));
   try {
-    fresh = (await client.getFiles()).files;
+    await reconcileReceiptHistory(
+      conn.client,
+      retained,
+      (senderCid, kind, wireIds) => applyReceiptReactions(conn, senderCid, kind, wireIds),
+    );
   } catch (err) {
-    log(`[${cfg.name}] get_files failed:`, String(err));
-    return;
+    log(`[${conn.cfg.name}] receipt history reconciliation failed:`, String(err));
   }
-  if (fresh.length === 0) return;
-  const target = deliveryTarget(cfg.chatId, cfg.threadId, conn.lastChat);
-  if (!target || !target.chatId || isCatchAll(target.chatId)) {
-    log(`[${cfg.name}] ${fresh.length} agent file(s) with no known destination chat — deferring`);
+}
+
+async function handleConnectorCommand(bot: Bot, conn: Connection | null, m: TelegramMessage): Promise<boolean> {
+  const cmd = parseReceiptCommand(m.text, bot.username);
+  if (!cmd) return false;
+  if (!conn) {
+    if (cmd.kind !== 'help') return false;
     try {
-      await client.deferFiles({ file_ids: fresh.map((f) => Number(f.file_id)) });
-    } catch {
-      /* best effort */
-    }
-    return;
-  }
-  for (const f of fresh) {
-    // THE BYTES ARE NOT IN THE RESULT. getFiles writes each file into the
-    // daemon-owned identity folder and reports metadata; GET /files/<wire_id>
-    // serves it back, scoped to THIS session's bound identity. That indirection
-    // is what keeps a multi-megabyte upload out of a JSON body.
-    let bytes: Uint8Array;
-    try {
-      bytes = await client.fetchFile(f.wire_id);
+      await bot.tg.sendMessage(m.chat_id, formatHelp(null, '', false), m.thread_id);
     } catch (err) {
-      log(`[${cfg.name}] fetching file #${f.file_id} from the daemon failed:`, String(err));
-      try { await client.deferFiles({ file_ids: [Number(f.file_id)] }); } catch { /* best effort */ }
-      continue;
+      log(`[bot ${botLabel(bot)}] failed to answer /help in unrouted chat ${m.chat_id}:`, String(err));
     }
-    // Guard Telegram's upload ceiling (a contact can send more than we can upload).
-    if (bytes.length > CONFIG.outboundFileMaxBytes) {
-      log(`[${cfg.name}] file #${f.file_id} "${f.filename}" (${bytes.length} B) exceeds the ${CONFIG.outboundFileMaxBytes}-byte upload cap — skipping`);
-      continue; // dropped from the queue (already marked processed); see OQ3
-    }
-    try {
-      await bot.tg.sendDocument(target.chatId, Buffer.from(bytes), f.filename, f.mime || undefined, target.threadId || undefined);
-    } catch (err) {
-      log(`[${cfg.name}] telegram file delivery failed for #${f.file_id}:`, String(err));
-      // THE DATA-LOSS PATH deferFiles exists for: the file is already marked
-      // processed daemon-side, so without this hand-back a transient Telegram
-      // outage loses it silently.
-      try {
-        await client.deferFiles({ file_ids: [Number(f.file_id)] });
-      } catch {
-        /* best effort */
-      }
-    }
+    return true;
   }
+  const cid = conn.cfg.peerCid;
+  let reply: string;
+  switch (cmd.kind) {
+    case 'help':
+      reply = formatHelp(conn.map.settingsFor(cid), conn.cfg.name, !!cid);
+      break;
+    case 'receipts': {
+      const settings = conn.map.updateSettings(cid, { receiptsEnabled: cmd.on });
+      log(`[${conn.cfg.name}] receipts turned ${cmd.on ? 'on' : 'off'} for this connection`);
+      reply = formatStatus(settings, conn.cfg.name, !!cid);
+      break;
+    }
+    case 'emoji': {
+      const patch = cmd.slot === 'delivered' ? { emojiDelivered: cmd.emoji } : { emojiRead: cmd.emoji };
+      const settings = conn.map.updateSettings(cid, patch);
+      log(`[${conn.cfg.name}] ${cmd.slot} reaction set to ${cmd.emoji}`);
+      reply = formatStatus(settings, conn.cfg.name, !!cid);
+      break;
+    }
+    case 'reset':
+      reply = formatStatus(conn.map.resetSettings(cid), conn.cfg.name, !!cid);
+      break;
+    case 'status':
+      reply = formatStatus(conn.map.settingsFor(cid), conn.cfg.name, !!cid);
+      break;
+    case 'error':
+      reply = cmd.message;
+      break;
+  }
+  try {
+    await bot.tg.sendMessage(m.chat_id, reply, m.thread_id);
+  } catch (err) {
+    log(`[${conn.cfg.name}] failed to answer ${m.text.split(/\s+/)[0]}:`, String(err));
+  }
+  return true;
 }
 
 // One bot's single poll handler: demux each update to its route and forward to the
@@ -716,6 +842,8 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
   }
 
   const conn = resolveRoute(bot.exact, bot.catchAll, m.chat_id, m.thread_id);
+  if (conn) conn.lastChat = { chatId: String(m.chat_id), threadId: m.thread_id ? String(m.thread_id) : '' };
+  if (await handleConnectorCommand(bot, conn, m)) return;
   if (!conn) {
     const only = bot.exact.size === 1 && !bot.catchAll ? [...bot.exact.values()][0] : null;
     if (only && only.cfg.deniedMessage) {
@@ -729,7 +857,6 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
     }
     return;
   }
-  conn.lastChat = { chatId: String(m.chat_id), threadId: m.thread_id ? String(m.thread_id) : '' };
   await forwardToNode(conn, m);
 }
 
@@ -740,6 +867,17 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
 function activateBot(bot: Bot): void {
   if (bot.pollHandle) return;
   bot.pollHandle = bot.tg.poll((m) => onBotMessage(bot, m));
+  void publishBotCommands(bot);
+}
+
+async function publishBotCommands(bot: Bot): Promise<void> {
+  try {
+    const commands = telegramCommandList();
+    await bot.tg.setMyCommands(commands);
+    log(`[bot ${botLabel(bot)}] slash menu registered: ${commands.map((c) => `/${c.command}`).join(' ')}`);
+  } catch (err) {
+    log(`[bot ${botLabel(bot)}] setMyCommands failed (commands still work when typed):`, String(err));
+  }
 }
 
 // ----- create / restore / remove ----------------------------------------------
@@ -782,7 +920,7 @@ async function createConnection(args: {
       createdAt: new Date().toISOString(),
     };
     const client = await clientFor(cfg);
-    conn = { client, dir, cfg, bot, lastChat: null, watch: null };
+    conn = makeConnection(client, dir, cfg, bot);
     connections.set(args.name, conn);
     const conflict = registerRoute(conn);
     if (conflict) throw new Error(conflict);
@@ -839,7 +977,7 @@ async function restoreConnection(name: string): Promise<void> {
     log(`[${name}] minted a lease token (route predates the daemon-attach conversion)`);
   }
   const client = await clientFor(cfg);
-  const conn: Connection = { client, dir, cfg, bot, lastChat: null, watch: null };
+  const conn = makeConnection(client, dir, cfg, bot);
 
   // Bind by the recorded route name regardless of the one-shot global inventory.
   // chooseIdentity is authoritative for route liveness; the inventory is only
@@ -863,8 +1001,7 @@ async function restoreConnection(name: string): Promise<void> {
   watchRoute(conn);
   // Anything that arrived while this process was down is already in the daemon;
   // one drain now rather than waiting for the next notification.
-  await forwardToTelegram(conn);
-  await forwardFilesToTelegram(conn);
+  await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
   log(`[${name}] route restored (bot ${botLabel(bot)})`);
 }
 

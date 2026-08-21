@@ -53,8 +53,9 @@ customers; escalate refunds to a human").
      **message envelope** (sender + chat metadata, reply/forward context, and any
      attached file via the core 3.1 file channel — see
      [Message envelope](#message-envelope) and [File transfer](#file-transfer-core-31));
-   - every message the agent sends back is delivered to that same chat/topic, and
-     a file the agent sends is delivered with `sendDocument`.
+   - every message the agent sends back is delivered to that same chat/topic with
+     Markdown formatting and exact reply threading when `reply_to.wire_id` is
+     available; a file the agent sends is delivered with `sendDocument`.
 5. Re-run `add_new_connection` with the **same `--bot`** and a different
    `--chat-id`/`--thread-id` to add more routes on the one bot. Point two routes at
    the same agent and it sees two distinct contacts (distinct bios) — one per chat.
@@ -69,8 +70,9 @@ its native voice-transcription path even when no companion text is sent.
 
 Messages are end-to-end encrypted between the connector's route identity and the agent (ADAPT
 encrypted channels). The connector never persists message bodies to disk — only the
-bot registry (`bot name`, `token`, `@username`) and route metadata (`bot name`,
-`chat id`, `thread id`, `bio`, `peer cid`, and stable daemon lease). Those
+bot registry (`bot name`, `token`, `@username`), route metadata (`bot name`,
+`chat id`, `thread id`, `bio`, `peer cid`, and stable daemon lease), and a bounded
+30-day wire-id ↔ Telegram-message-id map with per-route receipt settings. Those
 persisted route names are also the connector's simple list of identities it
 created. The list is organizational bookkeeping, not an authorization or
 provenance boundary; identity keys and packet state stay in the shared daemon.
@@ -165,19 +167,46 @@ distinct from `send_message`, so files and text are always separate messages.
   read files from the file channel and correlate by `attachment.wire_id`** — an
   agent that still expects inline base64 will not see the bytes.
 - **Outbound (agent → Telegram).** A file the agent sends arrives via
-  `receive_file`, is stored in the daemon identity's file inbox (same unread → processed →
-  gc lifecycle as messages, bytes included), and is delivered to the chat (and
-  forum topic, if pinned) with Telegram **`sendDocument`** — preserving the
-  original filename. Agent → Telegram file sending was previously unsupported.
+  `receive_file`, is stored in the daemon's durable per-identity history, and is
+  delivered to the chat (and forum topic, if pinned) with Telegram
+  **`sendDocument`** — preserving the original filename. The connector first
+  lists unread metadata, reads the immutable blob, uploads it to Telegram, and
+  only then acknowledges that exact `wire_id` with selected `getFiles`.
 - **Caps.** Inbound media is bounded by `attachmentMaxBytes`
   (`OURS_TG_ATTACHMENT_MAX_BYTES`, **10 MB**, under Telegram's 20 MB bot
   download limit). A file a contact sends outbound is bounded by
   `outboundFileMaxBytes` (`OURS_TG_OUTBOUND_FILE_MAX_BYTES`, **50 MB**,
   Telegram's `sendDocument` upper bound); an over-cap outbound file is skipped and
   logged.
-- **Monitoring.** File traffic is monitored exactly like messages: a bound control
-  plane receives a forced **metadata-only** copy (`[file] <name> (<mime>, <N> B)`)
-  — never the bytes.
+
+### Replies, formatting, and receipts
+
+- Telegram entities (bold, italic, code, links, quotes, and related formatting)
+  are converted to Markdown for the agent. Agent Markdown is rendered as
+  Telegram MarkdownV2, with a plain-text fallback if Telegram rejects the parse.
+- The bounded wire-id map lets agent `reply_to.wire_id` pointers become native
+  Telegram replies. Telegram replies are likewise sent with a structured ours
+  reply pointer when their exact mapped message is still retained. Missing or
+  expired mappings degrade to an unthreaded message; the connector never guesses.
+- Delivery and read receipts become one Telegram reaction per message (`👀` then
+  `👌` by default). `/receipts` and `/emoji` configure them per route, and
+  `/help` reports the active settings. Receipt state is monotonic and is caught
+  up from durable outbound history after a restart or `sync_required` event.
+
+### External delivery boundary
+
+Agent messages are delivered oldest-first from the daemon's durable history.
+The connector uses `listIncomingMessages` plus `getHistoryItem` to inspect one
+unread body without changing state, sends it to Telegram, then acknowledges it
+with `getMessages({limit:1})` and verifies the returned `wire_id` is the one it
+just delivered. Per-route single-flight drains prevent concurrent notifications
+from racing acknowledgements. Telegram failures leave the oldest item unread.
+
+There is one unavoidable external side-effect window: if Telegram accepts a
+message or file and the process crashes before the daemon acknowledgement, the
+item stays unread and may be delivered again after restart. The connector favors
+recoverability over silently losing content and does not depend on removed
+defer/requeue or conversation-policy APIs.
 
 ### Voice transcription (speech-to-text)
 

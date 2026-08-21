@@ -36,11 +36,11 @@
     "test": "for f in tests/*.test.mjs; do echo \"# $f\"; node_modules/.bin/tsx \"$f\" || exit 1; done"
   },
   "dependencies": {
-    "@ours.network/sdk": "2.0.1",
+    "@ours.network/sdk": "3.0.1",
     "undici": "^7.28.0"
   },
   "devDependencies": {
-    "@ours.network/cli": "1.0.1",
+    "@ours.network/cli": "2.0.1",
     "@types/node": "^20.14.0",
     "esbuild": "^0.24.2",
     "tsx": "^4.19.0",
