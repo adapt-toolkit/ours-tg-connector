@@ -19,8 +19,8 @@
 //
 // REWRITTEN FOR THE DAEMON-ATTACHED CONNECTOR. It used to stand up an AdaptHost
 // and two packets in-process. There is no AdaptHost here any more — so it starts
-// a REAL DAEMON from the published @ours.network/sdk and drives two clients
-// against it, which is also closer to production than the old version was.
+// a REAL DAEMON through the released operator CLI and drives two public SDK
+// clients against it, which is also closer to production than the old version.
 //
 // WHAT IT COVERS IS UNCHANGED AND IS STILL THIS REPO'S OWN CODE: src/stt.ts and
 // src/envelope.ts. Only the transport underneath moved. Deleting it with the
@@ -28,28 +28,17 @@
 // NOT touch.
 //
 // Run: node_modules/.bin/tsx tests/voice.test.mjs  (it imports .ts sources directly)
-import { createServer } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildEnvelope, attachmentMeta, VOICE_MESSAGE_MIME } from '../src/envelope.ts';
 import { transcribe } from '../src/stt.ts';
+import { freePort, startExternalDaemon } from './external-daemon.mjs';
 
-// Env before the first SDK import: the SDK reads its config at MODULE LOAD, so
-// importing first and configuring after silently boots against ~/.ours and the
-// PUBLIC BROKER. See tests/attach-daemon.test.mjs.
 const DAEMON_STATE = mkdtempSync(join(tmpdir(), 'tg-voice-daemon-'));
-process.env.OURS_STATE_DIR = DAEMON_STATE;
-process.env.OURS_BROKER_URL = 'wss://invalid.local/none';
-process.env.OURS_API_VISIBILITY = 'open';
-const freePort = () => new Promise((res) => { const sv = createServer(); sv.listen(0, () => { const pt = sv.address().port; sv.close(() => res(pt)); }); });
 const PORT = await freePort();
-process.env.OURS_PORT = String(PORT);
-const { OursClient } = await import('@ours.network/sdk');
-// startDaemon boots the wrapper ITSELF — calling bootWrapper() as well is a
-// double init that dies naming neither call.
-const { startDaemon } = await import('@ours.network/sdk/daemon');
+const { attachOursClient } = await import('@ours.network/sdk');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 function assert(cond, msg) {
@@ -110,12 +99,16 @@ async function forwardVoice(client, targetCid, m, resolved, CONFIG) {
 
 async function main() {
   console.log('=== ours-tg-connector voice STT e2e (daemon-attached) ===\n');
-  const handle = await startDaemon({ version: 'test' });
-  const URL_ = `http://127.0.0.1:${PORT}`;
+  const handle = await startExternalDaemon({ stateDir: DAEMON_STATE, port: PORT });
+  const URL_ = handle.url;
   // Two sessions in ONE daemon: the route ("Connector") and the proxy agent.
   // Different lease tokens, because the token IS the session.
-  const connector = new OursClient({ url: URL_, leaseToken: 'voice-connector-tok' });
-  const agent = new OursClient({ url: URL_, leaseToken: 'voice-agent-tok' });
+  const connector = await attachOursClient({
+    endpoint: URL_, stateDir: DAEMON_STATE, leaseToken: 'voice-connector-tok',
+  });
+  const agent = await attachOursClient({
+    endpoint: URL_, stateDir: DAEMON_STATE, leaseToken: 'voice-agent-tok',
+  });
   await connector.createIdentity({ name: 'Connector', bio: '', exposeLocal: false, localAutoAccept: true });
   await agent.createIdentity({ name: 'Agent', bio: '', exposeLocal: false, localAutoAccept: true });
 
@@ -327,7 +320,7 @@ async function main() {
       'normalized malformed metadata agrees across file and envelope channels');
   } finally {
     globalThis.fetch = realFetch;
-    await handle.close?.();
+    await handle.close();
     rmSync(DAEMON_STATE, { recursive: true, force: true });
   }
 

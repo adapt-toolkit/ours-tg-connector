@@ -16,22 +16,19 @@
 // check would not have caught the class of failure that follows a bad banner,
 // an unbundled dependency, or a require that resolves only from src/.
 //
-// It matters more than usual after the SDK conversion, because dist/connector.js
-// now BUNDLES @ours.network/sdk — including a transitive @adapt-toolkit/sdk-native
-// whose loader references `../build/Release/adapt_js.node`, a path that does not
-// exist relative to dist/. That is fine ONLY because the connector reaches the
-// SDK's HTTP client and never its engine. "Fine because nothing calls it" is an
-// assumption with a shelf life, so this test is what checks it is still true.
+// SDK 2's root export is client-only, so the bundle must attach without importing
+// any package-private daemon runtime. The daemon is a separate operator-CLI
+// process in this test, matching production ownership.
 //
 // The assertion: the bundle boots, resolves and PROVES a daemon, opens its
 // control API, and stays up.
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { freePort, startExternalDaemon } from './external-daemon.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BUNDLE = join(ROOT, 'dist/connector.js');
@@ -41,23 +38,9 @@ statSync(BUNDLE);
 
 let pass = 0;
 const ok = (c, m) => { assert.ok(c, m); pass++; console.log('  ✓', m); };
-const freePort = () => new Promise((res) => {
-  const s = createServer();
-  s.listen(0, () => { const p = s.address().port; s.close(() => res(p)); });
-});
-
-// Every env var before the first SDK import — the SDK reads its config at module
-// load, so configuring after importing silently boots against ~/.ours and the
-// public broker. See the same note in attach-daemon.test.mjs.
 const DAEMON_STATE = mkdtempSync(join(tmpdir(), 'tg-dist-daemon-'));
-process.env.OURS_STATE_DIR = DAEMON_STATE;
-process.env.OURS_BROKER_URL = 'wss://invalid.local/none';
-process.env.OURS_API_VISIBILITY = 'open';
 const PORT = await freePort();
-process.env.OURS_PORT = String(PORT);
-
-const { startDaemon } = await import('@ours.network/sdk/daemon');
-const handle = await startDaemon({ version: 'test' });
+const handle = await startExternalDaemon({ stateDir: DAEMON_STATE, port: PORT });
 
 const TG_STATE = mkdtempSync(join(tmpdir(), 'tg-dist-state-'));
 const CTL_PORT = await freePort();
@@ -108,9 +91,9 @@ try {
   ok(out.includes(`control API on http://127.0.0.1:${CTL_PORT}`),
     'the control API came up on loopback');
 
-  // The engine is bundled but must never be reached: the connector is a client.
+  // The engine belongs only to the separately spawned operator daemon.
   ok(!out.includes('wrapper: packet ready') && !out.includes('wrapper ready (identities='),
-    'the bundled engine was NOT booted — the connector stayed a client of the daemon');
+    'the connector did NOT boot an engine — it stayed a client of the daemon');
 
   // Still alive: a bundle that loads and then dies on its first real call would
   // have satisfied every check above.
