@@ -1,6 +1,6 @@
 {
   "name": "@ours.network/tg-connector",
-  "version": "0.3.2",
+  "version": "0.5.0",
   "description": "Bridge Telegram bots to ours.network agents — attaches to an already-running ours daemon and bridges one Telegram chat/topic to one agent per route. Run `ours-tg-connector add_new_connection`.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
