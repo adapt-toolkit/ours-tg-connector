@@ -9,9 +9,17 @@ import { homedir } from 'node:os';
 import { resolve, join, dirname } from 'node:path';
 
 export interface ConnectorConfig {
-  brokerUrl: string;   // the ADAPT broker every hosted packet connects through
+  // WHICH OURS DAEMON TO ATTACH TO. Both are OPTIONAL and both are passed
+  // straight to the SDK's resolveDaemonConfig, which owns precedence, source
+  // tracking and the coherence refusal. Setting daemonUrl WITHOUT daemonStateDir
+  // is refused by that resolver before any credential is read. The SDK owns
+  // this check so daemon selection has one authoritative implementation.
+  // SDK 2 also rejects legacy OURS_INSTANCE and ignores OURS_AUTOSTART/autoStart:
+  // the connector always attaches and never starts or embeds a daemon.
+  daemonUrl: string;      // '' => the SDK's default selection
+  daemonStateDir: string; // '' => the SDK's default selection
   controlPort: number; // localhost JSON control API (add/list/remove connections)
-  stateDir: string;    // one subdir per connection: stateDir/<name>/
+  stateDir: string;    // this connector's OWN config dir (bots.json + one subdir per route)
   pollTimeoutSec: number; // Telegram long-poll timeout per getUpdates call
   // Telegram network path hardening (see src/telegram.ts). Default is the robust
   // path: force IPv4 so a configured-but-unreachable IPv6 can't stall/fail fetch.
@@ -19,9 +27,15 @@ export interface ConnectorConfig {
   tgConnectTimeoutMs: number;  // bound a stalled connect (fail fast, not ~30s)
   tgFetchRetries: number;      // transient-error retries for transactional calls
   tgFetchRetryBaseMs: number;  // base backoff between those retries (ms)
-  attachmentMaxBytes: number; // max media size forwarded inline (base64) before degrading to a metadata-only stub
+  attachmentMaxBytes: number; // max inbound media size sent through the file channel before metadata-only degradation
   outboundFileMaxBytes: number; // max size of a received file we will upload to Telegram (bot upload limit is 50 MB)
-  // Speech-to-text for inbound voice notes (opt-in; off ⇒ byte-identical to today).
+  // Speech-to-text for inbound voice notes (opt-in).
+  //
+  // WHAT `false` PROMISES, PRECISELY: that THIS PROCESS does not send audio to a
+  // speech-to-text provider. It does NOT promise the audio is never transcribed.
+  // The connector is a client of a daemon that runs its OWN STT when the
+  // receiving side pulls a voice note, under configuration this operator does
+  // not control. As a host, `false` covered the whole path; attached, it cannot.
   sttEnabled: boolean;
   sttApiKey: string;        // secret; env-preferred, masked on config.json rewrite
   sttBaseUrl: string;       // OpenAI-compatible endpoint root
@@ -34,7 +48,8 @@ export interface ConnectorConfig {
 }
 
 export const DEFAULT_CONFIG: ConnectorConfig = {
-  brokerUrl: 'wss://broker1.ours.network',
+  daemonUrl: '',
+  daemonStateDir: '',
   controlPort: 3051,
   stateDir: resolve(homedir(), '.ours-telegram'),
   pollTimeoutSec: 30,
@@ -73,7 +88,8 @@ function readFileConfig(): Partial<ConnectorConfig> {
     return {};
   }
   const out: Partial<ConnectorConfig> = {};
-  if (typeof parsed.brokerUrl === 'string') out.brokerUrl = parsed.brokerUrl;
+  if (typeof parsed.daemonUrl === 'string') out.daemonUrl = parsed.daemonUrl;
+  if (typeof parsed.daemonStateDir === 'string') out.daemonStateDir = resolve(parsed.daemonStateDir);
   if (typeof parsed.controlPort === 'number' && Number.isFinite(parsed.controlPort)) out.controlPort = parsed.controlPort;
   if (typeof parsed.stateDir === 'string') out.stateDir = resolve(parsed.stateDir);
   if (typeof parsed.pollTimeoutSec === 'number' && Number.isFinite(parsed.pollTimeoutSec)) {
@@ -123,7 +139,11 @@ function envBool(name: string): boolean | undefined {
 export function loadConfig(): ConnectorConfig {
   const file = readFileConfig();
   return {
-    brokerUrl: process.env.OURS_TG_BROKER_URL ?? file.brokerUrl ?? DEFAULT_CONFIG.brokerUrl,
+    // NOTE: no OURS_TG_BROKER_URL any more. The connector does not talk to a
+    // broker — the daemon does. A stale one in a config file is now ignored
+    // rather than half-honoured.
+    daemonUrl: process.env.OURS_TG_DAEMON_URL ?? file.daemonUrl ?? DEFAULT_CONFIG.daemonUrl,
+    daemonStateDir: process.env.OURS_TG_DAEMON_STATE_DIR ?? file.daemonStateDir ?? DEFAULT_CONFIG.daemonStateDir,
     controlPort: envInt('OURS_TG_CONTROL_PORT') ?? file.controlPort ?? DEFAULT_CONFIG.controlPort,
     stateDir: resolve(process.env.OURS_TG_STATE_DIR ?? file.stateDir ?? DEFAULT_CONFIG.stateDir),
     pollTimeoutSec: envInt('OURS_TG_POLL_TIMEOUT') ?? file.pollTimeoutSec ?? DEFAULT_CONFIG.pollTimeoutSec,

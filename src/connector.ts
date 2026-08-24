@@ -2,17 +2,30 @@
 //
 // ours.network Telegram connector — daemon.
 //
-// One process == one native ADAPT wrapper hosting N messenger packets. Two layers:
+// THE CONNECTOR IS A CLIENT NOW, NOT A HOST. It used to run its own native ADAPT
+// wrapper and its own MUFL packet per route. It runs neither: it attaches over
+// HTTP to an ALREADY-RUNNING ours daemon and drives it through the typed API in
+// @ours.network/sdk. That is what "share the daemon between the connector and
+// ours-mcp" means — one engine on the box, not two.
+//
+// What went with the host: src/adapt.ts, the whole mufl_code/ tree including its
+// core submodule, packet lifecycle, state persistence, the e2e-restore commit,
+// and the deferred/migration/contact-restore sweeps. Every one of those is
+// something THE DAEMON ALREADY DOES FOR ITSELF; the connector only ever ran them
+// because it was its own host. There is deliberately no typed operation for any
+// of them — exporting them would re-export the daemon's internals.
+//
+// Two layers, unchanged:
 //
 //   BOT   — one Telegram bot token == one getUpdates poll loop (Telegram allows
 //           only ONE consumer per token). A bot fans its updates out to many
 //           routes by chat-key.
-//   ROUTE — one ours.network identity (packet) pinned to one chat-key. A chat-key is a
+//   ROUTE — one ours.network identity (in the DAEMON) pinned to one chat-key. A chat-key is a
 //           whole chat (`chatId`) or a single forum topic (`chatId:threadId`). The
 //           route bridges that chat-key to one proxy agent:
 //
-//   Telegram chat/topic ──getUpdates──▶ bot demux ──▶ route packet ──send_message──▶ agent
-//   Telegram chat/topic ◀─sendMessage── bot ◀── route packet ◀──(encrypted)─── agent
+//   Telegram chat/topic ──getUpdates──▶ bot demux ──▶ route identity ──send_message──▶ agent
+//   Telegram chat/topic ◀─sendMessage── bot ◀── route identity ◀──(encrypted)─── agent
 //
 // Because each route's identity is pinned to exactly one chat-key, reverse
 // delivery is structural: an agent's reply arrives on the identity that *is* the
@@ -27,29 +40,31 @@
 // in exactly one place. Setup is then one command per route (`add_new_connection
 // --bot <name>`): the connector mints a fresh identity, sets its name + bio,
 // generates an invite, and returns it. The human pastes that invite into the proxy
-// agent's `add_contact`; the packet — already live on the broker — completes the
+// agent's `add_contact`; the route identity — already live through the daemon — completes the
 // handshake and the bridge is open. Routes naming the same bot share its single
 // poll loop.
 //
-// Persistence:
+// Persistence — AND NOTE WHAT IS NO LONGER HERE:
 //   STATE_DIR/bots.json          { name: { name, token, username, createdAt } }
-//   STATE_DIR/<route-name>/      one dir per route:
-//     identity.key      the exported root SIGN secret (adapt #77) — recreating
-//                        the packet and reseeding from this keeps the container
-//                        id stable across restarts, regardless of the (ephemeral,
-//                        unpersisted) seed phrase used to recreate the packet
-//     state_data.bin    serialized packet state (contacts + encrypted channels)
-//     connection.json   { botName, chatId, threadId, bio, label, peerCid, ... }
-//     messages.json     wire_id -> (chat id, message id, receipt state) plus this
-//                        route's per-contact receipt settings — what makes reply
-//                        threading and delivery/read reactions survive a restart.
-//                        Ids and state only; never message content. See msgmap.ts.
+//   STATE_DIR/<route-name>/connection.json
+//                                { botName, chatId, threadId, bio, label,
+//                                  peerCid, leaseToken, ... }
+//
+// identity.key and state_data.bin ARE GONE. The daemon owns identity material and
+// packet state; this process holds nothing an attacker would want except the
+// Telegram bot tokens, its lease tokens, and the simple list of route names it
+// created. That list is application bookkeeping, not an authorization or
+// provenance boundary. `leaseToken` is what
+// makes a route's daemon session survive a connector restart: it IS the session,
+// so a route that regenerated one on every boot would look like a new client to
+// the daemon's lease table every time.
 //
 // On boot the bot registry is loaded first (one TelegramClient per bot, no poll
-// yet), then every persisted route is recreated so its packet re-registers on the
-// broker, then each bot that has at least one route gets its single poll started.
+// yet), then the daemon is SELECTED AND PROVED (see attachToDaemon), then every
+// persisted route binds its identity in the daemon and starts watching its
+// notification stream, then each bot's single poll starts.
 //
-// A localhost-only JSON control API (default :3040) is how the CLI adds / lists /
+// A localhost-only JSON control API (default :3051) is how the CLI adds / lists /
 // removes routes against the live daemon, so a new packet is online to complete
 // its invite handshake the moment the user pastes it.
 
@@ -59,40 +74,33 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import * as fs from 'node:fs';
 
-// Own package version, for the pre-migration blob retention key. Resolved from the
-// package root in both layouts (src/../ and dist/../).
-const PKG_VERSION: string = (() => {
-  try {
-    return JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  } catch {
-    return 'unknown';
-  }
-})();
-
 import { loadConfig } from './config';
-import type { AdaptValue } from './adapt';
 import {
-  AdaptHost,
-  Packet,
-  wireHandlers,
-  packInvite,
-  renderInbox,
-  renderFiles,
-  renderContacts,
-  renderControlRequests,
-  renderReceipt,
-  withScope,
-  withScopeAsync,
-} from './adapt';
-import { DEFAULT_DENIED, monitoringStatus, dispatchControlRequest } from './control';
+  OursError,
+  attachOursClient,
+  resolveDaemonConfig,
+  describeDaemonConfig,
+} from '@ours.network/sdk';
+import type { OursClient, ResolvedDaemonConfig, ResolveDaemonConfigOptions } from '@ours.network/sdk';
 import { TelegramClient } from './telegram';
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
 import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './envelope';
 import { transcribe } from './stt';
-import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply } from './routing';
+import { watchWithRetry } from './watch';
+import { chatKey, isCatchAll, resolveRoute, deliveryTarget, isIdCommand, formatChatIdReply, DEFAULT_DENIED } from './routing';
 import { MessageMap } from './msgmap';
-import { emojiFor, formatHelp, formatStatus, parseReceiptCommand, telegramCommandList, type ReceiptState } from './receipts';
+import {
+  emojiFor,
+  formatHelp,
+  formatStatus,
+  parseReceiptCommand,
+  telegramCommandList,
+  type ReceiptState,
+} from './receipts';
+import { drainMessages as drainHistoryMessages, drainFiles as drainHistoryFiles } from './history-delivery';
+import { reconcileReceiptHistory } from './history-receipts';
+import { singleFlight } from './single-flight';
 
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
@@ -107,21 +115,6 @@ const TG_NET = {
 
 const log = (...parts: unknown[]) => process.stderr.write(`ours-tg: ${parts.join(' ')}\n`);
 
-// Render a `bin` field of a notify payload as lowercase hex ('' when absent) — for
-// the e2e migration proof lines (epoch / session_id arrive as binary).
-function binHexField(av: AdaptValue, field: string): string {
-  const x = av.Reduce(field);
-  return x.IsNil() ? '' : Buffer.from(x.GetBinary()).toString('hex');
-}
-
-// Route names double as on-disk directory names and peer-visible display names,
-// so keep them simple and path-safe.
-const NAME_RE = /^[A-Za-z0-9 _.-]{1,64}$/;
-function validateName(name: string): string | null {
-  if (!NAME_RE.test(name)) return 'name must be 1-64 chars of letters, digits, space, _ . or -';
-  if (name === '.' || name === '..' || name.includes('/') || name.includes('\\')) return 'invalid name';
-  return null;
-}
 
 // ----- connection (route) model ----------------------------------------------
 interface ConnectionFile {
@@ -135,6 +128,12 @@ interface ConnectionFile {
   payloadMode: PayloadMode; // envelope preserves Telegram metadata; plain forwards DM text directly
   deniedMessage: string; // reply sent to a non-routed chat when the bot serves exactly one route
   peerCid: string; // the proxy agent's container id once it accepts the invite ('' until then)
+  // This route's daemon lease token. PERSISTED ON PURPOSE: the token IS the
+  // session, so regenerating it on every boot would make the daemon's lease table
+  // see a brand-new client each time and the route would have to re-bind rather
+  // than resume. Legacy routes without this field get
+  // one minted on first restore, which re-binds once and then stays stable.
+  leaseToken?: string;
   createdAt: string;
 }
 
@@ -161,26 +160,115 @@ interface BotFile {
 }
 
 interface Connection {
-  pkt: Packet;
+  /** This route's own session with the daemon. One client per route: the lease
+   *  token IS the session, so two routes sharing one would share a binding. */
+  client: OursClient;
   dir: string;
   cfg: ConnectionFile;
   bot: Bot;
   lastChat: { chatId: string; threadId: string } | null; // most recent inbound origin (reverse-delivery target for non-topic-pinned routes)
-  // wire_id ⇄ Telegram message ids + this connection's receipt settings, persisted
-  // in the route dir so reply threading and reaction state survive a restart.
   map: MessageMap;
+  drainMessages: () => Promise<void>;
+  drainFiles: () => Promise<void>;
+  syncReceipts: () => Promise<void>;
+  /** Stops this route's notification watch on removal / shutdown. */
+  watch: AbortController | null;
 }
 
-const host = new AdaptHost(CONFIG.brokerUrl, log);
+function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bot: Bot): Connection {
+  let conn: Connection;
+  conn = {
+    client,
+    dir,
+    cfg,
+    bot,
+    lastChat: null,
+    map: new MessageMap(dir, (m) => log(`[${cfg.name}] ${m}`)),
+    drainMessages: singleFlight(() => forwardToTelegram(conn)),
+    drainFiles: singleFlight(() => forwardFilesToTelegram(conn)),
+    syncReceipts: singleFlight(() => syncReceiptHistory(conn)),
+    watch: null,
+  };
+  return conn;
+}
+
+// ----- the daemon this connector is attached to ------------------------------
+// Resolved and PROVED once at boot, then shared by every route's client.
+//
+// The connector implements NO credential resolution of its own, on purpose. The
+// SDK's resolveDaemonConfig tracks the SOURCE of every auth-affecting field and
+// refuses an incoherent combination BEFORE reading a token or opening a socket —
+// selecting an endpoint while the state directory stays defaulted would otherwise
+// read the live ~/.ours token and send it wherever the endpoint points. That is a
+// a local token and send it to an operator-selected endpoint. Keeping this
+// resolution in the SDK prevents divergent credential-handling implementations.
+let daemon: ResolvedDaemonConfig | null = null;
+// A one-shot view of the daemon's GLOBAL identity names. It is used only to
+// report the connector-owned subset at boot; chooseIdentity remains the
+// authoritative per-route check and is never gated by this snapshot.
+let daemonIdentityNames = new Set<string>();
+
+// The connector's complete ownership bookkeeping: names of persisted routes,
+// plus a newly-created live route between createIdentity and writeMeta. This is
+// deliberately a simple name set, not provenance or an authorization boundary.
+const ownedIdentityNames = new Set<string>();
+
+function daemonSelectionOptions(): ResolveDaemonConfigOptions {
+  return {
+    ...(CONFIG.daemonUrl ? { endpoint: CONFIG.daemonUrl } : {}),
+    ...(CONFIG.daemonStateDir ? { stateDir: CONFIG.daemonStateDir } : {}),
+  };
+}
+
+async function attachToDaemon(): Promise<ResolvedDaemonConfig> {
+  const options = daemonSelectionOptions();
+  const cfg = resolveDaemonConfig(options);
+  // SDK 2's supported application boundary resolves the coherent selection,
+  // proves /state-dir, and only then constructs a credential-bearing client.
+  // This boot probe deliberately remains unbound; each route attaches below
+  // with its own stable lease because one lease has one current identity.
+  const client = await attachOursClient(options);
+  daemonIdentityNames = new Set((await client.identities()).map((row) => row.name));
+  log(`attached to daemon ${JSON.stringify(describeDaemonConfig(cfg))}`);
+  return cfg;
+}
+
+/**
+ * This route's session with the daemon. The lease token is persisted per route
+ * (see ConnectionFile.leaseToken) so a restart RESUMES the session rather than
+ * arriving as a new client.
+ */
+async function clientFor(cfg: ConnectionFile): Promise<OursClient> {
+  if (!daemon) throw new Error('not attached to a daemon yet');
+  return attachOursClient({
+    ...daemonSelectionOptions(),
+    leaseToken: cfg.leaseToken!,
+  });
+}
 const connections = new Map<string, Connection>(); // route name -> route
 const bots = new Map<string, Bot>(); // bot name -> bot
 
+
+// Route names are BOTH an on-disk directory component here AND an identity name
+// in the daemon. The daemon enforces its own rule and will reject a bad one on
+// createIdentity — this check exists for the half it cannot see: a name that
+// would escape STATE_DIR. Deliberately NOT a copy of the daemon's NAME_RE; two
+// copies of one rule drift, and the daemon's answer is the authoritative one.
+function routeNameError(name: string): string | null {
+  if (!name) return 'name is required';
+  if (name.length > 64) return 'name must be at most 64 characters';
+  if (name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) {
+    return `"${name}" is not usable as a directory name`;
+  }
+  return null;
+}
+
+
 // ----- per-route paths --------------------------------------------------------
+// identity.key and state_data.bin are NOT here any more, and neither are their
+// path helpers: the daemon owns identity material and packet state. A route
+// directory holds connection.json and nothing else.
 const connDir = (name: string) => join(STATE_DIR, name);
-// The route's wire_id ⇄ Telegram message map (messages.json in the route dir).
-const newMessageMap = (dir: string, name: string) => new MessageMap(dir, (m) => log(`[${name}] ${m}`));
-const keyPath = (dir: string) => join(dir, 'identity.key');
-const dataPath = (dir: string) => join(dir, 'state_data.bin');
 const metaPath = (dir: string) => join(dir, 'connection.json');
 const botsPath = () => join(STATE_DIR, 'bots.json');
 
@@ -209,186 +297,15 @@ function writeMeta(dir: string, cfg: ConnectionFile): void {
   fs.renameSync(tmp, metaPath(dir));
 }
 
-// ----- persistence (data-level) -----------------------------------------------
-function hasSavedState(dir: string): boolean {
-  try {
-    return fs.existsSync(dataPath(dir)) && fs.statSync(dataPath(dir)).size > 0;
-  } catch {
-    return false;
-  }
-}
 
-// Export the root SIGN secret (adapt #77) so it can be persisted to identity.key
-// and later reparsed + injected to reseed a recreated packet onto the same
-// container id. secretkey_sign is a domain-typed leaf: GetBinary() throws
-// "Invalid domain", so we Serialize() it (self-contained, reparses cross-host)
-// and hex-encode the bytes.
-function exportSigningSecret(pkt: Packet): string {
-  return withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_signing_secret', lt).Serialize()).toString('hex'));
-}
 
-function saveState(pkt: Packet, dir: string): void {
-  try {
-    saveStateFailClosed(pkt, dir);
-  } catch (err) {
-    log(`[${pkt.name}] failed to save state:`, String(err));
-  }
-}
 
-// Fail-closed persist (APP-GUARANTEE-1, DR-ROLLOUT-PLAN §6.3): DR ratchet state must be
-// durably on disk before any network effect of the same transaction — a swallowed write
-// failure here turns the next crash into a stale-ratchet restore. On failure this THROWS;
-// wired as the save_state RET hook, the throw propagates into the wrapper's action loop,
-// which (on the 0.10.12 SDK's SEND durability barrier) withholds the transaction's
-// buffered SENDs. fsync on file AND dir: rename alone is not durable.
-function saveStateFailClosed(pkt: Packet, dir: string): void {
-  const bytes = withScope((lt) => Buffer.from(pkt.readonlyTx('::actor::export_state', lt).Serialize()));
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${dataPath(dir)}.tmp`;
-  const fd = fs.openSync(tmp, 'w', 0o600);
-  try {
-    fs.writeFileSync(fd, bytes);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  fs.renameSync(tmp, dataPath(dir));
-  const dirFd = fs.openSync(dir, 'r');
-  try {
-    fs.fsyncSync(dirFd);
-  } finally {
-    fs.closeSync(dirFd);
-  }
-}
 
-// ----- contact restore (host driving) ------------------------------------
-// The packet self-heals degraded contacts (known cid, no encryption keys —
-// the outcome of a breaking-change migration that dropped peer_ads) through
-// the signed request_contact_restore handshake. The host's jobs: fire the
-// sweep on boot + the periodic restore-retry timer, and drain deferred queues
-// once a contact heals ($contact_restored notify, or the sweep for a flush
-// lost to a crash).
-function renderDegraded(av: AdaptValue): Array<{ cid: string; name: string; attempts: number; queued: number }> {
-  const out: Array<{ cid: string; name: string; attempts: number; queued: number }> = [];
-  const arr = av.Reduce('degraded');
-  if (arr.IsNil()) return out;
-  for (let i = 0; ; i++) {
-    const e = arr.Reduce(i);
-    if (e.IsNil()) break;
-    out.push({
-      cid: e.Reduce('container_id').Visualize(),
-      name: e.Reduce('name').Visualize(),
-      attempts: Number(e.Reduce('attempts').Visualize()),
-      queued: Number(e.Reduce('queued').Visualize()),
-    });
-  }
-  return out;
-}
 
-function renderDeferredQueues(av: AdaptValue): Array<{ cid: string; queued: number; degraded: boolean }> {
-  const out: Array<{ cid: string; queued: number; degraded: boolean }> = [];
-  const arr = av.Reduce('queues');
-  if (arr.IsNil()) return out;
-  for (let i = 0; ; i++) {
-    const e = arr.Reduce(i);
-    if (e.IsNil()) break;
-    out.push({
-      cid: e.Reduce('container_id').Visualize(),
-      queued: Number(e.Reduce('queued').Visualize()),
-      degraded: e.Reduce('degraded').GetBoolean(),
-    });
-  }
-  return out;
-}
 
-// Drain messages queued while a contact was degraded. Idempotent (empty or
-// still-degraded queue → flushed 0), so re-firing is always safe.
-async function flushDeferredFor(pkt: Packet, contactCid: string): Promise<void> {
-  try {
-    const flushed = await withScopeAsync(async (lt) => {
-      const r = await pkt.mutatingTx('::a2a_messaging::flush_deferred', { contact: contactCid }, lt);
-      return Number(r.Reduce('flushed').Visualize());
-    });
-    if (flushed > 0) log(`[${pkt.name}] flushed ${flushed} deferred message(s) to ${contactCid.slice(0, 12)}…`);
-  } catch (err) {
-    log(`[${pkt.name}] deferred flush to ${contactCid.slice(0, 12)}… failed:`, String(err));
-  }
-}
 
-// Boot + periodic sweep: (re)request restores for degraded contacts and flush any
-// healed-but-still-queued contact (a crash between restore and flush).
-async function contactRestoreSweep(pkt: Packet): Promise<void> {
-  try {
-    const requested = await withScopeAsync(async (lt) => {
-      const r = await pkt.mutatingTx('::a2a_messaging::restore_degraded_contacts', {}, lt);
-      return Number(r.Reduce('requested').Visualize());
-    });
-    if (requested > 0) log(`[${pkt.name}] contact restore requested for ${requested} degraded contact(s)`);
-    const queues = withScope((lt) => renderDeferredQueues(pkt.readonlyTx('::a2a_messaging::list_deferred_queues', lt)));
-    for (const q of queues) {
-      if (!q.degraded) await flushDeferredFor(pkt, q.cid);
-    }
-  } catch (err) {
-    log(`[${pkt.name}] contact-restore sweep failed:`, String(err));
-  }
-}
 
-// Boot + periodic e2e migration reconciler (core 0.9.0 §5.6). Re-drives any
-// in-flight migration handshake AND proactively OFFERS to every already-e2e
-// contact that both sides can now migrate (mig_should_trigger). This is the path
-// that makes case-3a — existing contacts auto-migrate to the double ratchet —
-// fire IMMEDIATELY, even for an idle contact with no inbound traffic (the receive
-// triggers need traffic; advertise_migrate is the runtime staged-enable). Inert +
-// idempotent + fail-closed IN CORE: sweep_e2e_migrations does nothing until this
-// node advertises core.e2e.migrate (the actor manifest $advertise) and never
-// re-offers an in-flight or already-migrated pair, so it is safe on every boot and
-// GC tick. Peer-facing sends ride the legacy encrypted channel (the migration
-// carve-out), so the packet must already be registered on the broker when called.
-async function migrationSweep(pkt: Packet): Promise<void> {
-  try {
-    const { initiated, redriven, superseded, stalled } = await withScopeAsync(async (lt) => {
-      const r = await pkt.mutatingTx('::a2a_messaging::sweep_e2e_migrations', {}, lt);
-      return {
-        initiated: Number(r.Reduce('initiated').Visualize()),
-        redriven: Number(r.Reduce('redriven').Visualize()),
-        superseded: Number(r.Reduce('superseded').Visualize()),
-        stalled: Number(r.Reduce('stalled').Visualize()),
-      };
-    });
-    if (initiated + redriven + superseded + stalled > 0) {
-      log(`[${pkt.name}] e2e migration sweep: ${initiated} offered, ${redriven} re-driven, ${superseded} superseded, ${stalled} stalled`);
-    }
-  } catch (err) {
-    log(`[${pkt.name}] e2e migration sweep failed:`, String(err));
-  }
-}
 
-// Boot/upgrade RE-ADVERTISE (DAEMON CONTRACT, core 0.10 B1) — mirrors the mcp host.
-// Pushes this route's fresh v2 AD (+ caps piggyback) to every PRE-EXISTING LEGACY
-// contact over the legacy channel. A v2 peer ingests it (handle_readvertise_ad →
-// learns our caps/pv, refreshes its stored AD) and offers migration back; a still-v1
-// peer ignores it. This is the ONLY bootstrap for a stable-era contact whose stored
-// peer AD predates DR — without it neither migrationSweep nor advertise_migrate can
-// find it eligible (they only offer to already-known-0.9 peers), so an existing
-// contact would never auto-migrate after both sides upgrade. Connector identities are
-// FLAT (self-sovereign packets, no delegation cert), so the mcp's role-cert re-mint
-// does NOT apply here — the readvertise carries a NIL cert (flat-identity verify path)
-// and is accepted. The core trn is STATELESS + idempotent (legacy-only filter; no
-// _save_state), so it is safe on every boot and GC tick; the packet must already be
-// registered on the broker (called after restore, like migrationSweep). The push is
-// delivered only while the PEER is online, so re-fire on a short schedule to catch a
-// peer that reconnects shortly after us.
-async function readvertiseOnUpgrade(pkt: Packet): Promise<void> {
-  try {
-    const readvertised = await withScopeAsync(async (lt) => {
-      const r = await pkt.mutatingTx('::a2a_messaging::readvertise_on_upgrade', {}, lt);
-      return Number(r.Reduce('readvertised').Visualize());
-    });
-    if (readvertised > 0) log(`[${pkt.name}] re-advertised v2 AD to ${readvertised} pre-existing legacy contact(s) (migration bootstrap)`);
-  } catch (err) {
-    log(`[${pkt.name}] readvertise-on-upgrade sweep failed:`, String(err));
-  }
-}
 
 // ----- bot registry -----------------------------------------------------------
 function botLabel(bot: Bot): string {
@@ -486,12 +403,9 @@ function unregisterRoute(conn: Connection): void {
   if (conn.bot.catchAll === conn) conn.bot.catchAll = null;
 }
 
-// Re-index a route after its chat-key changed (control-plane set_config). Returns
-// a conflict string if the new slot is taken.
-function reregisterRoute(conn: Connection): string | null {
-  unregisterRoute(conn);
-  return registerRoute(conn);
-}
+// There is no re-index helper any more: a route's chat-key was only ever edited
+// in flight by the control plane's set_config, which went with the control plane.
+// A chat-key now changes by removing the route and adding it back.
 
 // Is the chat-key (or the single catch-all slot) already claimed on this bot?
 // Lets createConnection fail before minting an identity.
@@ -538,9 +452,96 @@ function sttEngineLabel(baseUrl: string): string {
 // envelope (sender/chat/reply/forward metadata + the text, plus the file inline
 // as base64 for a media message). We send to the route's peer if known, else to
 // every contact (covers the one proxy agent). If the agent has not accepted the
+
+/**
+ * Watch this route's notification stream and react. THIS REPLACES wireHandlers.
+ *
+ * As a host the connector installed packet callbacks and got `notify_agent`
+ * events synchronously. As a client it long-polls
+ * `GET /identities/<name>/notifications`, which the daemon serves from the same
+ * durable notifications.log those callbacks used to write. The events are the
+ * SAME NAMES with the SAME content-free payloads, so the arms below are the old
+ * ones minus the packet plumbing.
+ *
+ * WHAT IS DELIBERATELY GONE: every migration/e2e proof line. Those were
+ * observability for an engine THIS PROCESS NO LONGER RUNS — the daemon logs them,
+ * and re-logging them here would claim knowledge of a session we do not hold.
+ *
+ * THE WATCH IS KEPT ALIVE ACROSS TRANSIENT FAILURES (see src/watch.ts). A
+ * callback could not stop; a long poll can, and the SDK generator throws out of
+ * `for await` on any fetch failure or daemon-side error. Giving up there would
+ * leave the route reading Telegram and never answering it.
+ */
+function watchRoute(conn: Connection): void {
+  if (conn.watch) return;
+  const ctrl = new AbortController();
+  conn.watch = ctrl;
+  const { cfg, client } = conn;
+  void watchWithRetry(
+    // `since: 'tip'` skips the backlog: anything already in the log was handled
+    // before this restart, and get_messages is the source of truth regardless —
+    // a replayed event would at worst cause one redundant, empty poll.
+    () => client.watchNotifications(cfg.name, { since: 'tip', signal: ctrl.signal }),
+    {
+      signal: ctrl.signal,
+      onEvent: async (ev) => {
+        const event = String(ev.event ?? '');
+        try {
+          if (event === 'message_received') {
+            await conn.drainMessages();
+          } else if (event === 'file_received') {
+            await conn.drainFiles();
+          } else if (event === 'receipt_received') {
+            const senderCid = typeof ev.sender_id === 'string' ? ev.sender_id : '';
+            const kind = ev.kind === 'delivered' || ev.kind === 'read' ? ev.kind : null;
+            const wireIds = Array.isArray(ev.wire_ids)
+              ? ev.wire_ids.filter((v): v is string => typeof v === 'string' && v.length > 0)
+              : [];
+            if (senderCid && kind && wireIds.length) {
+              await applyReceiptReactions(conn, senderCid, kind, wireIds);
+            } else {
+              await conn.syncReceipts();
+            }
+          } else if (event === 'sync_required') {
+            await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
+          } else if (event === 'contact_accepted' || event === 'sibling_contact_added' || event === 'local_contact_added') {
+            // The FIRST accepted contact is the proxy agent (telegram traffic routes
+            // there). Later contacts must NOT clobber it, so only set peerCid while
+            // it is still empty.
+            const name = String(ev.from ?? ev.name ?? '');
+            const cid = String(ev.container_id ?? ev.cid ?? '');
+            if (cid && !cfg.peerCid) {
+              cfg.peerCid = cid;
+              writeMeta(conn.dir, cfg);
+              log(`[${cfg.name}] proxy agent connected: "${name}" (${cid})`);
+            } else {
+              log(`[${cfg.name}] contact added: "${name}" (${cid})`);
+            }
+          } else if (event === 'contact_restored') {
+            log(`[${cfg.name}] contact "${String(ev.from ?? '')}" restored (re-keyed)`);
+          }
+        } catch (err) {
+          // One bad event must not tear the stream down.
+          log(`[${cfg.name}] handling ${event} failed:`, String(err));
+        }
+      },
+      // The re-armed watch primes at `tip` like the first one, so it does not
+      // replay what landed while it was down. This is the same drain
+      // restoreConnection does on boot, for the same reason.
+      onResume: async () => {
+        log(`[${cfg.name}] notification watch resumed — draining what arrived while it was down`);
+        await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
+      },
+      onError: (err, delayMs) => {
+        log(`[${cfg.name}] notification watch failed (retrying in ${delayMs}ms):`, String(err));
+      },
+    },
+  );
+}
+
 // invite yet, there is no contact and the message is dropped with a log line.
 async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void> {
-  const { pkt, cfg } = conn;
+  const { client, cfg } = conn;
   const resolved = m.attachment ? await resolveAttachment(conn, m.attachment) : undefined;
 
   // Speech-to-text for voice (and any other configured kinds). Only when
@@ -573,15 +574,20 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
   if (cfg.peerCid) {
     targets.push(cfg.peerCid);
   } else {
-    withScope((lt) => {
-      for (const c of renderContacts(pkt.readonlyTx('::a2a_messaging::list_contacts', lt))) targets.push(c.container_id);
-    });
+    try {
+      for (const c of (await client.listContacts()).contacts) targets.push(c.container_id);
+    } catch (err) {
+      log(`[${cfg.name}] list_contacts failed:`, String(err));
+    }
   }
   if (targets.length === 0) {
     log(`[${cfg.name}] telegram message from ${m.from} dropped — proxy agent has not accepted the invite yet`);
     return;
   }
   for (const target of targets) {
+    const replyToWireId = m.reply_to
+      ? conn.map.findTelegramMessage(String(m.chat_id), m.reply_to.message_id)
+      : undefined;
     // Files and text are distinct messages (core 3.1). When the bytes resolved,
     // send them on the file channel first and capture the wire_id; the envelope
     // then references it so the agent correlates the two. Over-cap/failed
@@ -589,19 +595,34 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     let fileWireId: string | undefined;
     if (m.attachment && resolved?.ok && sendAudio) {
       const meta = attachmentMeta(m.attachment, m.message_id);
-      const fileBytes = resolved.bytes;
       try {
-        fileWireId = await withScopeAsync(async (lt) => {
-          const r = await pkt.mutatingTx('::a2a_messaging::send_file',
-            { contact: target, filename: meta.filename, mime: meta.mime, data: pkt.newBinary(fileBytes, lt) }, lt);
-          return r.Reduce('wire_id').Visualize();
+        // data_base64 rather than a path: the bytes came off Telegram and are in
+        // memory. Writing them to a temp file just to name it would put message
+        // content on this box's disk for no reason.
+        const r = await client.sendFile({
+          contact: target,
+          data_base64: Buffer.from(resolved.bytes).toString('base64'),
+          filename: meta.filename,
+          mime: meta.mime,
+          ...(replyToWireId ? { reply_to_wire_id: replyToWireId } : {}),
         });
+        // `introduced` is the one outcome with no wireId — it means the send took
+        // the introduction-request path and there is nothing yet to reference.
+        fileWireId = 'wire_id' in r ? r.wire_id : undefined;
+        if (fileWireId && m.message_id > 0) {
+          conn.map.record(fileWireId, {
+            chatId: String(m.chat_id), messageId: m.message_id, contactCid: target, direction: 'inbound',
+          });
+        }
+        if ('history_stored' in r && !r.history_stored) {
+          log(`[${cfg.name}] sent file ${fileWireId ?? '<unknown>'} but daemon history storage failed`);
+        }
       } catch (err) {
         log(`[${cfg.name}] send_file to ${target} failed:`, String(err));
       }
     }
     // Omit `resolved` from the envelope when we are not announcing the audio, so
-    // no attachment block is emitted for a text-only transcript (SPEC §4.5).
+    // no attachment block is emitted for a text-only transcript.
     const body = cfg.payloadMode === 'plain'
       ? buildPlainPayload(m, resolved, fileWireId, transcription)
       : buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId, transcription);
@@ -609,191 +630,139 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
     // send_file. Do not manufacture an empty text message or a JSON wrapper.
     if (body === undefined) continue;
     try {
-      const { deferred, queued, wireId } = await withScopeAsync(async (lt) => {
-        const sent = await pkt.mutatingTx('::a2a_messaging::send_message', { contact: target, text: body }, lt);
-        const defAv = sent.Reduce('deferred');
-        const wireAv = sent.Reduce('wire_id');
-        return {
-          deferred: !defAv.IsNil(),
-          queued: defAv.IsNil() ? 0 : Number(sent.Reduce('queued').Visualize()),
-          wireId: wireAv.IsNil() ? '' : String(wireAv.Visualize()),
-        };
+      const sent = await client.sendMessage({
+        contact: target,
+        text: body,
+        ...(replyToWireId ? { reply_to_wire_id: replyToWireId } : {}),
       });
-      // Remember which Telegram message this wire_id IS. Two consumers: the
-      // agent's reply (reply_to.wire_id -> reply_parameters.message_id) and its
-      // receipts (delivered/read -> a reaction on this exact message). Recorded
-      // for a deferred send too — the wire_id is already minted and the queue
-      // flushes under the same id.
+      const wireId = 'wire_id' in sent ? sent.wire_id : ('wireId' in sent ? sent.wireId : '');
       if (wireId && m.message_id > 0) {
         conn.map.record(wireId, {
-          chatId: String(m.chat_id),
-          messageId: m.message_id,
-          contactCid: target,
-          direction: 'inbound',
+          chatId: String(m.chat_id), messageId: m.message_id, contactCid: target, direction: 'inbound',
         });
       }
-      if (deferred) {
-        log(`[${cfg.name}] message to ${target} queued — contact restore in progress (${queued} queued)`);
+      if ('history_stored' in sent && !sent.history_stored) {
+        log(`[${cfg.name}] sent message ${wireId || '<unknown>'} but daemon history storage failed`);
+      }
+      if (sent.kind === 'deferred') {
+        log(`[${cfg.name}] message to ${target} queued — contact restore in progress (${sent.queued} queued)`);
       }
     } catch (err) {
       log(`[${cfg.name}] send_message to ${target} failed:`, String(err));
     }
   }
+
 }
 
 // agent → Telegram: pull freshly-received messages out of the route's packet and
 // deliver each body to its chat (and topic, if pinned). Triggered by the
 // message_received notify.
 async function forwardToTelegram(conn: Connection): Promise<void> {
-  const { pkt, cfg, bot } = conn;
-  let fresh;
-  try {
-    fresh = await withScopeAsync(async (lt) => renderInbox((await pkt.mutatingTx('::actor::get_messages', {}, lt)).Reduce('messages')));
-  } catch (err) {
-    log(`[${cfg.name}] get_messages failed:`, String(err));
-    return;
-  }
-  if (fresh.length === 0) return;
+  const { client, cfg, bot } = conn;
   const target = deliveryTarget(cfg.chatId, cfg.threadId, conn.lastChat);
   if (!target || !target.chatId || isCatchAll(target.chatId)) {
-    // A catch-all route that has not yet seen an inbound message has nowhere to
-    // deliver — hand the messages back so a later attempt re-delivers them once
-    // an origin chat is known, rather than dropping them.
-    log(`[${cfg.name}] ${fresh.length} agent message(s) with no known destination chat — deferring`);
     try {
-      await withScopeAsync((lt) => pkt.mutatingTx('::actor::defer_messages', { msg_ids: fresh.map((m) => m.msg_id) }, lt));
-    } catch {
-      /* best effort */
-    }
+      const pending = await client.listIncomingMessages();
+      if (pending.length) log(`[${cfg.name}] ${pending.length} agent message(s) remain unread until a destination chat is known`);
+    } catch (err) { log(`[${cfg.name}] list_incoming_messages failed:`, String(err)); }
     return;
   }
-  for (const m of fresh) {
-    // Reply threading. The agent points at the message it is answering with
-    // reply_to.wire_id; we look that wire_id up in this route's map and, when it
-    // resolves to a message in the chat we are delivering to, send a real Telegram
-    // reply. No row (never mapped, or past the retention horizon) => a plain
-    // message. We NEVER fall back to a "similar" or most-recent message.
-    //
-    // This only works when the agent FILLS reply_to.wire_id. An agent that does
-    // not gets plain messages — a property of the sender, not a connector defect.
-    const row = m.reply_to ? conn.map.get(m.reply_to.wire_id) : undefined;
-    const replyToMessageId = row && row.chatId === String(target.chatId) ? row.messageId : undefined;
-    if (m.reply_to && replyToMessageId === undefined) {
-      log(`[${cfg.name}] reply pointer ${m.reply_to.wire_id.slice(0, 12)}… has no mapped Telegram message — delivering unthreaded`);
-    }
-    try {
-      const ids = await bot.tg.sendMessage(target.chatId, m.text, target.threadId || undefined, {
+  try {
+    await drainHistoryMessages(client, async (m) => {
+      const row = m.reply_to ? conn.map.get(m.reply_to.wire_id) : undefined;
+      const replyToMessageId = row && row.chatId === String(target.chatId) ? row.messageId : undefined;
+      if (m.reply_to && replyToMessageId === undefined) {
+        log(`[${cfg.name}] reply pointer ${m.reply_to.wire_id.slice(0, 12)}… has no mapped Telegram message — delivering unthreaded`);
+      }
+      const ids = await bot.tg.sendMessage(target.chatId, m.body, target.threadId || undefined, {
         replyToMessageId,
         markdown: true,
       });
-      // Map the delivered message back to its wire_id as well, so a receipt on an
-      // agent→Telegram message (and any future agent-driven reaction) has a target.
       if (m.wire_id && ids[0] > 0) {
         conn.map.record(m.wire_id, {
-          chatId: String(target.chatId),
-          messageId: ids[0],
-          contactCid: m.sender_id,
-          direction: 'outbound',
+          chatId: String(target.chatId), messageId: ids[0], contactCid: m.from.id, direction: 'outbound',
         });
       }
-    } catch (err) {
-      log(`[${cfg.name}] telegram delivery failed for #${m.msg_id}:`, String(err));
-      // Hand the message back so a later attempt re-delivers it rather than
-      // silently losing it on a transient Telegram outage.
-      try {
-        await withScopeAsync((lt) => pkt.mutatingTx('::actor::defer_messages', { msg_ids: [m.msg_id] }, lt));
-      } catch {
-        /* best effort */
-      }
-    }
+    });
+  } catch (err) {
+    log(`[${cfg.name}] ordered Telegram message drain stopped (oldest row remains unread unless delivery already succeeded):`, String(err));
   }
 }
 
-// contact → Telegram: pull freshly-received files out of the route's packet and
-// upload each to its chat (and topic, if pinned). Triggered by the file_received
-// notify. Mirrors forwardToTelegram: defers undelivered files so a transient
-// Telegram outage never loses them.
+// contact → Telegram: inspect unread file history, fetch immutable bytes, upload
+// each file, and only then acknowledge its exact wire id. Triggered by the
+// file_received notify; a transient Telegram failure leaves the file unread.
 async function forwardFilesToTelegram(conn: Connection): Promise<void> {
-  const { pkt, cfg, bot } = conn;
-  let fresh;
-  try {
-    fresh = await withScopeAsync(async (lt) => renderFiles((await pkt.mutatingTx('::actor::get_files', {}, lt)).Reduce('files')));
-  } catch (err) {
-    log(`[${cfg.name}] get_files failed:`, String(err));
-    return;
-  }
-  if (fresh.length === 0) return;
+  const { client, cfg, bot } = conn;
   const target = deliveryTarget(cfg.chatId, cfg.threadId, conn.lastChat);
   if (!target || !target.chatId || isCatchAll(target.chatId)) {
-    log(`[${cfg.name}] ${fresh.length} agent file(s) with no known destination chat — deferring`);
     try {
-      await withScopeAsync((lt) => pkt.mutatingTx('::actor::defer_files', { file_ids: fresh.map((f) => f.file_id) }, lt));
-    } catch {
-      /* best effort */
-    }
+      const pending = await client.listIncomingFiles();
+      if (pending.length) log(`[${cfg.name}] ${pending.length} agent file(s) remain unread until a destination chat is known`);
+    } catch (err) { log(`[${cfg.name}] list_incoming_files failed:`, String(err)); }
     return;
   }
-  for (const f of fresh) {
-    // Guard Telegram's upload ceiling (a contact can send more than we can upload).
-    if (f.bytes.length > CONFIG.outboundFileMaxBytes) {
-      log(`[${cfg.name}] file #${f.file_id} "${f.filename}" (${f.bytes.length} B) exceeds the ${CONFIG.outboundFileMaxBytes}-byte upload cap — skipping`);
-      continue; // dropped from the queue (already marked processed); see OQ3
-    }
-    try {
-      await bot.tg.sendDocument(target.chatId, f.bytes, f.filename, f.mime || undefined, target.threadId || undefined);
-    } catch (err) {
-      log(`[${cfg.name}] telegram file delivery failed for #${f.file_id}:`, String(err));
-      try {
-        await withScopeAsync((lt) => pkt.mutatingTx('::actor::defer_files', { file_ids: [f.file_id] }, lt));
-      } catch {
-        /* best effort */
+  try {
+    await drainHistoryFiles(client, async (f, bytes) => {
+      if (bytes.length > CONFIG.outboundFileMaxBytes) {
+        log(`[${cfg.name}] file #${f.file_id} "${f.filename}" (${bytes.length} B) exceeds the ${CONFIG.outboundFileMaxBytes}-byte upload cap — skipping`);
+        return;
       }
-    }
+      const row = f.reply_to ? conn.map.get(f.reply_to.wire_id) : undefined;
+      const replyToMessageId = row && row.chatId === String(target.chatId) ? row.messageId : undefined;
+      const messageId = await bot.tg.sendDocument(
+        target.chatId,
+        Buffer.from(bytes),
+        f.filename,
+        f.mime || undefined,
+        target.threadId || undefined,
+        { replyToMessageId },
+      );
+      if (f.wire_id && messageId > 0) {
+        conn.map.record(f.wire_id, {
+          chatId: String(target.chatId), messageId, contactCid: f.from.id, direction: 'outbound',
+        });
+      }
+    });
+  } catch (err) {
+    log(`[${cfg.name}] ordered Telegram file drain stopped (oldest row remains unread unless delivery already succeeded):`, String(err));
   }
 }
 
-// receipt → Telegram reaction. Core delivered a peer's delivery/read confirmation
-// for messages we sent; each wire_id resolves to the Telegram message it came
-// from and gets the configured emoji.
-//
-// Three rules, all load-bearing:
-//   • MONOTONIC per (peer, wire_id) — applyReceipt only moves unknown < sent <
-//     delivered < read forward, so a duplicate or reordered receipt is a no-op and
-//     a "read" reaction is never walked back to "delivered".
-//   • ONE reaction per message — setMessageReaction REPLACES, so read overwrites
-//     delivered rather than sitting beside it (a bot cannot hold two).
-//   • a Telegram refusal (reactions disabled in the chat, message deleted, emoji
-//     rejected) is logged in full and goes no further. Receipts are best-effort UX
-//     by core's own contract; they must never touch message delivery.
-async function applyReceiptReactions(conn: Connection, senderCid: string, kind: ReceiptState, wireIds: string[]): Promise<void> {
-  const { cfg, bot } = conn;
-  const settings = conn.map.settingsFor(senderCid || cfg.peerCid);
+async function applyReceiptReactions(
+  conn: Connection,
+  senderCid: string,
+  kind: ReceiptState,
+  wireIds: string[],
+): Promise<void> {
+  const settings = conn.map.settingsFor(senderCid || conn.cfg.peerCid);
   if (!settings.receiptsEnabled) return;
   const emoji = emojiFor(kind, settings);
   if (!emoji) return;
   for (const wireId of wireIds) {
     const row = conn.map.applyReceipt(wireId, kind);
-    if (!row) continue; // unknown id, or a duplicate / out-of-order receipt
+    if (!row) continue;
     try {
-      await bot.tg.setMessageReaction(row.chatId, row.messageId, emoji);
+      await conn.bot.tg.setMessageReaction(row.chatId, row.messageId, emoji);
     } catch (err) {
-      log(`[${cfg.name}] reaction ${emoji} for ${kind} on ${row.chatId}/${row.messageId} refused by Telegram (delivery unaffected):`, String(err));
+      log(`[${conn.cfg.name}] reaction ${emoji} for ${kind} on ${row.chatId}/${row.messageId} refused by Telegram (delivery unaffected):`, String(err));
     }
   }
 }
 
-// The connector's own commands, parsed HERE in connector code — never handed to
-// the agent as a prompt, so the settings cannot be argued with by a message body.
-// A command applies to the ours contact of the chat it came from, so `/receipts
-// off` on one connection leaves the others untouched. Returns true when the
-// message was one of ours (and must not be forwarded to the agent).
-//
-// ONLY the commands parseReceiptCommand claims are intercepted. Anything else —
-// including any other slash word — returns false here and is relayed verbatim.
-//
-// `conn` is null for a chat with no route. Only `/help` can answer then (there is
-// no connection to read settings from, and nothing to configure); the settings
-// commands decline, leaving the existing no-route handling in charge.
+async function syncReceiptHistory(conn: Connection): Promise<void> {
+  const retained = new Set(conn.map.entries('inbound').map(([wireId]) => wireId));
+  try {
+    await reconcileReceiptHistory(
+      conn.client,
+      retained,
+      (senderCid, kind, wireIds) => applyReceiptReactions(conn, senderCid, kind, wireIds),
+    );
+  } catch (err) {
+    log(`[${conn.cfg.name}] receipt history reconciliation failed:`, String(err));
+  }
+}
+
 async function handleConnectorCommand(bot: Bot, conn: Connection | null, m: TelegramMessage): Promise<boolean> {
   const cmd = parseReceiptCommand(m.text, bot.username);
   if (!cmd) return false;
@@ -806,45 +775,39 @@ async function handleConnectorCommand(bot: Bot, conn: Connection | null, m: Tele
     }
     return true;
   }
-  const { cfg } = conn;
-  const cid = cfg.peerCid;
+  const cid = conn.cfg.peerCid;
   let reply: string;
   switch (cmd.kind) {
     case 'help':
-      reply = formatHelp(conn.map.settingsFor(cid), cfg.name, !!cid);
+      reply = formatHelp(conn.map.settingsFor(cid), conn.cfg.name, !!cid);
       break;
     case 'receipts': {
-      const s = conn.map.updateSettings(cid, { receiptsEnabled: cmd.on });
-      log(`[${cfg.name}] receipts turned ${cmd.on ? 'on' : 'off'} for this connection`);
-      reply = formatStatus(s, cfg.name, !!cid);
+      const settings = conn.map.updateSettings(cid, { receiptsEnabled: cmd.on });
+      log(`[${conn.cfg.name}] receipts turned ${cmd.on ? 'on' : 'off'} for this connection`);
+      reply = formatStatus(settings, conn.cfg.name, !!cid);
       break;
     }
     case 'emoji': {
       const patch = cmd.slot === 'delivered' ? { emojiDelivered: cmd.emoji } : { emojiRead: cmd.emoji };
-      const s = conn.map.updateSettings(cid, patch);
-      log(`[${cfg.name}] ${cmd.slot} reaction set to ${cmd.emoji}`);
-      reply = formatStatus(s, cfg.name, !!cid);
+      const settings = conn.map.updateSettings(cid, patch);
+      log(`[${conn.cfg.name}] ${cmd.slot} reaction set to ${cmd.emoji}`);
+      reply = formatStatus(settings, conn.cfg.name, !!cid);
       break;
     }
-    case 'reset': {
-      const s = conn.map.resetSettings(cid);
-      log(`[${cfg.name}] reaction emoji reset to defaults`);
-      reply = formatStatus(s, cfg.name, !!cid);
+    case 'reset':
+      reply = formatStatus(conn.map.resetSettings(cid), conn.cfg.name, !!cid);
       break;
-    }
     case 'status':
-      reply = formatStatus(conn.map.settingsFor(cid), cfg.name, !!cid);
+      reply = formatStatus(conn.map.settingsFor(cid), conn.cfg.name, !!cid);
       break;
     case 'error':
       reply = cmd.message;
       break;
   }
   try {
-    // Plain text (no markdown): the emoji list and the usage lines are full of
-    // MarkdownV2-reserved characters and must not be able to fail their own send.
-    await conn.bot.tg.sendMessage(m.chat_id, reply, m.thread_id);
+    await bot.tg.sendMessage(m.chat_id, reply, m.thread_id);
   } catch (err) {
-    log(`[${cfg.name}] failed to answer ${m.text.split(/\s+/)[0]}:`, String(err));
+    log(`[${conn.cfg.name}] failed to answer ${m.text.split(/\s+/)[0]}:`, String(err));
   }
   return true;
 }
@@ -880,10 +843,6 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
 
   const conn = resolveRoute(bot.exact, bot.catchAll, m.chat_id, m.thread_id);
   if (conn) conn.lastChat = { chatId: String(m.chat_id), threadId: m.thread_id ? String(m.thread_id) : '' };
-  // The connector's own commands are answered here and never forwarded. Run
-  // before the no-route handling so `/help` answers in an unrouted chat too,
-  // exactly like `/id` above — the slash menu offers it in every chat the bot is
-  // in, so it must not be silently ignored in some of them.
   if (await handleConnectorCommand(bot, conn, m)) return;
   if (!conn) {
     const only = bot.exact.size === 1 && !bot.catchAll ? [...bot.exact.values()][0] : null;
@@ -901,101 +860,6 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
   await forwardToNode(conn, m);
 }
 
-// ----- activation -------------------------------------------------------------
-// Wire a route packet's notify routing to the Telegram side. (The poll loop lives
-// on the bot, not the route — see activateBot.)
-function activateRoute(conn: Connection): void {
-  const { pkt, dir, cfg } = conn;
-  wireHandlers(
-    pkt,
-    {
-      onSaveState: () => saveStateFailClosed(pkt, dir),
-      onNotify: (event, payload) => {
-        if (event === 'message_received') {
-          process.nextTick(() => void forwardToTelegram(conn));
-        } else if (event === 'file_received') {
-          process.nextTick(() => void forwardFilesToTelegram(conn));
-        } else if (event === 'control_request') {
-          process.nextTick(() => void processControlRequests(conn));
-        } else if (event === 'receipt_received') {
-          // core 0.7.0 receipts: a peer confirmed delivery/read of what we sent.
-          // Decoded synchronously (the payload is freed when this handler returns)
-          // and applied off the notify tick.
-          const ev = renderReceipt(payload);
-          if (ev) process.nextTick(() => void applyReceiptReactions(conn, ev.senderId, ev.kind, ev.wireIds));
-        } else if (event === 'contact_accepted' || event === 'sibling_contact_added') {
-          const cid = payload.Reduce('container_id').Visualize();
-          const name = payload.Reduce('name').Visualize();
-          // The FIRST accepted contact is the proxy agent (telegram traffic routes
-          // there). Later contacts — e.g. the messenger control plane — must NOT
-          // clobber it, so only set peerCid while it is still empty.
-          if (cid && !cfg.peerCid) {
-            cfg.peerCid = cid;
-            writeMeta(dir, cfg);
-            log(`[${cfg.name}] proxy agent connected: "${name}" (${cid})`);
-          } else {
-            log(`[${cfg.name}] contact added: "${name}" (${cid})`);
-          }
-        } else if (event === 'contact_restored') {
-          // A degraded contact (post-upgrade re-key) finished the signed
-          // restore handshake. Drain anything queued toward it; content-free log line.
-          const name = payload.Reduce('name').Visualize();
-          const cid = payload.Reduce('container_id').Visualize();
-          log(`[${cfg.name}] contact "${name}" restored (re-keyed)`);
-          process.nextTick(() => void flushDeferredFor(pkt, String(cid)));
-        } else if (event === 'migration_active') {
-          // The e2e migration pin is set for this contact — the session is now the
-          // double ratchet (epoch + session_id of the migrated session). Proof line
-          // (DAEMON-INTEGRATION §4); epoch/session_id are bin -> hex.
-          const cid = payload.Reduce('cid').Visualize();
-          const role = payload.Reduce('role').Visualize();
-          const epoch = binHexField(payload, 'epoch');
-          const sid = binHexField(payload, 'session_id');
-          log(`[${cfg.name}] [migration] active cid=${cid} role=${role}${epoch ? ` epoch=${epoch}` : ''}${sid ? ` session_id=${sid}` : ''}`);
-        } else if (event === 'e2e_app_send') {
-          // §4 app-SEND proof: core delivered an app message over the migrated
-          // (double-ratchet) session. session_id (bin->hex) == active_session_id.
-          const cid = payload.Reduce('cid').Visualize();
-          const sid = binHexField(payload, 'session_id');
-          const olm = payload.Reduce('olm_type').Visualize();
-          const wireId = payload.Reduce('wire_id').Visualize();
-          log(`[${cfg.name}] [e2e-app] send cid=${cid} session_id=${sid} olm_type=${olm} wire_id=${wireId}`);
-        } else if (event === 'e2e_app_recv') {
-          // §4 app-RECV proof: core decrypted an inbound app message over the
-          // migrated (double-ratchet) session on this peer.
-          const cid = payload.Reduce('cid').Visualize();
-          const sid = binHexField(payload, 'session_id');
-          const ok = payload.Reduce('ok').GetBoolean();
-          const wireId = payload.Reduce('wire_id').Visualize();
-          log(`[${cfg.name}] [e2e-app] recv cid=${cid} session_id=${sid} ok=${ok} wire_id=${wireId}`);
-        } else if (event === 'migration_deferred_flush') {
-          // One notify per app message drained onto the now-active migrated session
-          // (FIFO). Core performs the re-drive (each surfaces as an e2e_app_send);
-          // this is observability only — NEVER box, NEVER drop silently.
-          const cid = payload.Reduce('cid').Visualize();
-          const wireId = payload.Reduce('wire_id').Visualize();
-          log(`[${cfg.name}] [migration] flush-notify cid=${cid} wire_id=${wireId} (deferred->e2e; core delivers)`);
-        } else if (event === 'migration_stalled') {
-          // Migration didn't reach active in its window. UX/log only — core re-drives
-          // via the sweep; legacy still flows (nothing silently downgrades).
-          const cid = payload.Reduce('cid').Visualize();
-          const phase = payload.Reduce('phase').Visualize();
-          const attempts = payload.Reduce('attempts').Visualize();
-          log(`[${cfg.name}] [migration] stalled-notify cid=${cid} phase=${phase} attempts=${attempts} (core re-drives via sweep)`);
-        } else if (event === 'downgrade_refused') {
-          // SECURITY: core DROPPED an inbound legacy plaintext app message from an
-          // epoch-pinned (migrated) contact — post-migration all app data is e2e, so a
-          // legacy plaintext is a downgrade attack. Core already dropped it; surface it.
-          const cid = payload.Reduce('cid').Visualize();
-          const wireAv = payload.Reduce('wire_id');
-          const wireId = wireAv.IsNil() ? '' : String(wireAv.Visualize());
-          log(`[${cfg.name}] [e2e-route] downgrade-dropped cid=${cid}${wireId ? ` wire_id=${wireId}` : ''} (legacy plaintext from a migrated peer — dropped by core)`);
-        }
-      },
-    },
-    log,
-  );
-}
 
 // Start (or restart) a bot's single Telegram long-poll loop, if not already
 // running. One getUpdates consumer per token — every route on the bot is served
@@ -1003,69 +867,21 @@ function activateRoute(conn: Connection): void {
 function activateBot(bot: Bot): void {
   if (bot.pollHandle) return;
   bot.pollHandle = bot.tg.poll((m) => onBotMessage(bot, m));
-  void publishBotCommands(bot); // discoverability only — never gates the poll
+  void publishBotCommands(bot);
 }
 
-// Publish the connector's commands to Telegram's slash menu, once per bot as its
-// poll starts (activateBot is idempotent, so this fires once too). Best-effort by
-// construction: the list is cosmetic, so a refusal is logged and the bot keeps
-// polling and keeps answering the commands typed by hand.
 async function publishBotCommands(bot: Bot): Promise<void> {
   try {
-    await bot.tg.setMyCommands(telegramCommandList());
-    log(`[bot ${botLabel(bot)}] slash menu registered: ${telegramCommandList().map((c) => `/${c.command}`).join(' ')}`);
+    const commands = telegramCommandList();
+    await bot.tg.setMyCommands(commands);
+    log(`[bot ${botLabel(bot)}] slash menu registered: ${commands.map((c) => `/${c.command}`).join(' ')}`);
   } catch (err) {
     log(`[bot ${botLabel(bot)}] setMyCommands failed (commands still work when typed):`, String(err));
   }
 }
 
-// ----- control plane (ours messenger) --------------------------------------
-// Each route is itself a self-sovereign node bound + configured from the messenger
-// control plane over the a2a_control channel. Verb dispatch lives in control.ts
-// (shared with the e2e test); here we just drain the queue and supply the
-// persist/log hooks, then re-index the route if its chat-key was changed.
-
-const controlBusy = new Set<string>();
-async function processControlRequests(conn: Connection): Promise<void> {
-  if (controlBusy.has(conn.cfg.name)) return;
-  controlBusy.add(conn.cfg.name);
-  try {
-    for (;;) {
-      const reqs = await withScopeAsync(async (lt) => renderControlRequests((await conn.pkt.mutatingTx('::actor::get_control_requests', {}, lt)).Reduce('requests')));
-      if (reqs.length === 0) return;
-      for (const req of reqs) {
-        const beforeKey = `${conn.cfg.chatId} ${conn.cfg.threadId}`;
-        await dispatchControlRequest(conn.pkt, conn.cfg, req, {
-          persist: () => writeMeta(conn.dir, conn.cfg),
-          log: (m) => log(`[${conn.cfg.name}] ${m}`),
-        });
-        const afterKey = `${conn.cfg.chatId} ${conn.cfg.threadId}`;
-        if (beforeKey !== afterKey) {
-          const conflict = reregisterRoute(conn);
-          if (conflict) log(`[${conn.cfg.name}] re-route after config change failed: ${conflict}`);
-          else log(`[${conn.cfg.name}] re-routed to ${chatKey(conn.cfg.chatId, conn.cfg.threadId || undefined)} after config change`);
-        }
-      }
-    }
-  } catch (err) {
-    log(`[${conn.cfg.name}] control dispatch failed:`, String(err));
-  } finally {
-    controlBusy.delete(conn.cfg.name);
-  }
-}
-
-// Start binding the messenger control plane: generate a 6-digit code bound to an
-// existing contact (the messenger must already be a contact — see /cp-invite).
-// The user reads the code OUT OF BAND and enters it in the Control Panel.
-async function startBind(conn: Connection, contactRef: string): Promise<string> {
-  const code = String(randomBytes(3).readUIntBE(0, 3) % 1_000_000).padStart(6, '0');
-  await withScopeAsync((lt) => conn.pkt.mutatingTx('::a2a_messaging::set_proxy_pending', { code, proxy: contactRef }, lt));
-  log(`[${conn.cfg.name}] proxy bind started for "${contactRef}" — code ${code}`);
-  return code;
-}
-
 // ----- create / restore / remove ----------------------------------------------
-// Create a brand-new route live on an already-registered bot: mint a fresh packet,
+// Create a brand-new route live on an already-registered bot: mint a fresh daemon identity,
 // set display name + bio, persist, register in the demux, ensure the bot poll is
 // running, generate an invite, return the blob to hand out.
 async function createConnection(args: {
@@ -1079,6 +895,8 @@ async function createConnection(args: {
 }): Promise<{ cid: string; invite: string; botUsername: string }> {
   const bot = bots.get(args.botName);
   if (!bot) throw new Error(`no bot named "${args.botName}" — register it with add_bot`);
+  let conn: Connection | null = null;
+  let identityCreated = false;
   try {
     // Fail before minting an identity if the slot is taken.
     const slotErr = routeSlotConflict(bot, args.chatId, args.threadId);
@@ -1086,9 +904,6 @@ async function createConnection(args: {
 
     const dir = connDir(args.name);
     fs.mkdirSync(dir, { recursive: true });
-    const seed = randomBytes(24).toString('hex'); // ephemeral entropy, not persisted
-    const pkt = await host.createPacket(args.name, seed);
-    fs.writeFileSync(keyPath(dir), exportSigningSecret(pkt), { mode: 0o600 });
     const cfg: ConnectionFile = {
       v: 1,
       name: args.name,
@@ -1100,32 +915,49 @@ async function createConnection(args: {
       payloadMode: args.payloadMode,
       deniedMessage: DEFAULT_DENIED,
       peerCid: '',
+      // Minted once, here, and persisted. See ConnectionFile.leaseToken.
+      leaseToken: randomBytes(24).toString('hex'),
       createdAt: new Date().toISOString(),
     };
-    const conn: Connection = { pkt, dir, cfg, bot, lastChat: null, map: newMessageMap(dir, args.name) };
+    const client = await clientFor(cfg);
+    conn = makeConnection(client, dir, cfg, bot);
     connections.set(args.name, conn);
-    // Wire handlers BEFORE the first mutating tx so save_state/notify route.
-    activateRoute(conn);
     const conflict = registerRoute(conn);
     if (conflict) throw new Error(conflict);
 
-    await withScopeAsync((lt) => pkt.mutatingTx('::a2a_messaging::set_my_name', { name: args.name }, lt));
-    if (args.bio) await withScopeAsync((lt) => pkt.mutatingTx('::a2a_messaging::set_my_bio', { bio: args.bio }, lt));
+    // The daemon mints the identity, names it and binds it to THIS route's
+    // session. exposeLocal is false: a route identity is reached by invite, not
+    // by the host contact book.
+    const made = await client.createIdentity({
+      name: args.name, bio: args.bio, exposeLocal: false, localAutoAccept: true,
+    });
+    identityCreated = true;
+    ownedIdentityNames.add(args.name);
+    daemonIdentityNames.add(args.name);
     writeMeta(dir, cfg);
-    saveState(pkt, dir);
+    watchRoute(conn);
     activateBot(bot); // idempotent — the bot already polls from add_bot
 
-    // bio is embedded in the invite, so generate it AFTER set_my_bio.
-    const invite = await withScopeAsync(async (lt) =>
-      packInvite(Buffer.from((await pkt.mutatingTx('::a2a_messaging::generate_invite', {}, lt)).Reduce('invite').GetBinary())),
-    );
+    // bio is embedded in the invite, so generate it AFTER createIdentity set it.
+    const invite = await client.generateInvite({});
     const key = isCatchAll(cfg.chatId) ? 'any chat' : chatKey(cfg.chatId, cfg.threadId || undefined);
     log(`[${args.name}] route created (bot ${botLabel(bot)}, ${key})`);
-    return { cid: pkt.cid, invite, botUsername: bot.username };
+    return { cid: made.info.cid, invite: invite.blob, botUsername: bot.username };
   } catch (err) {
-    // Roll back the half-created route so a retry with the same name works. The
-    // bot keeps polling regardless — it polls from registration so /id stays live.
-    if (connections.has(args.name)) removeConnection(args.name);
+    // Roll back a completed create so a normal retry with the same name works.
+    // A hard process crash between createIdentity and writeMeta can leave a
+    // name-only orphan in the global daemon; that accepted residual is repaired
+    // explicitly with the operator CLI rather than a recovery/provenance layer.
+    if (conn && identityCreated) {
+      const cleanup = await removeConnection(args.name);
+      if (cleanup.error) log(`[${args.name}] cleanup after create failure: ${cleanup.error}`);
+    } else if (conn) {
+      unregisterRoute(conn);
+      conn.watch?.abort();
+      connections.delete(args.name);
+      try { await conn.client.releaseLease(); } catch { /* best effort */ }
+      try { fs.rmSync(connDir(args.name), { recursive: true, force: true }); } catch { /* best effort */ }
+    }
     throw err;
   }
 }
@@ -1136,118 +968,126 @@ async function restoreConnection(name: string): Promise<void> {
   const dir = connDir(name);
   const cfg = readMeta(dir);
   const bot = bots.get(cfg.botName);
-  if (!bot) {
-    log(`[${name}] references unknown bot "${cfg.botName}" — skipping (add_bot then restart)`);
-    return;
+  if (!bot) throw new Error(`route "${name}" references unknown bot "${cfg.botName}"`);
+  // A legacy route may have no lease token. Mint and persist one so it re-binds
+  // once here and remains stable on later starts.
+  if (!cfg.leaseToken) {
+    cfg.leaseToken = randomBytes(24).toString('hex');
+    writeMeta(dir, cfg);
+    log(`[${name}] minted a lease token for a legacy route`);
   }
-  // Reseed from the persisted SIGN secret (adapt #77) — the seed phrase is
-  // irrelevant once reseed_identity_from_secret overwrites the container id.
-  const secret = fs.readFileSync(keyPath(dir), 'utf8').trim();
-  const pkt = await host.createPacket(name, '', secret);
-  const conn: Connection = { pkt, dir, cfg, bot, lastChat: null, map: newMessageMap(dir, name) };
+  const client = await clientFor(cfg);
+  const conn = makeConnection(client, dir, cfg, bot);
+
+  // Bind by the recorded route name regardless of the one-shot global inventory.
+  // chooseIdentity is authoritative for route liveness; the inventory is only
+  // reporting and must never cause this call to be skipped.
+  try {
+    await client.chooseIdentity({ name, force: false });
+  } catch (err) {
+    if (err instanceof OursError && err.code === 'NO_SUCH_IDENTITY') {
+      throw new Error(
+        `route "${name}" has no identity in the daemon at ${daemon?.baseUrl.value}. ` +
+        'Either this is the wrong daemon, or the identity was removed — the route is NOT being ' +
+        'recreated, because that would mint a new container id and silently break every contact.',
+      );
+    }
+    // In particular BOUND_ELSEWHERE is a hard error. Never force or adopt.
+    throw err;
+  }
   connections.set(name, conn);
-  activateRoute(conn);
   const conflict = registerRoute(conn);
-  if (conflict) log(`[${name}] route conflict on restore: ${conflict} — left unrouted`);
-  if (hasSavedState(dir)) {
-    // Pre-migration retention (DR-ROLLOUT-PLAN §7.3): on the FIRST boot of this version
-    // over an existing blob, keep a copy keyed by the new version — the last state the
-    // previous version wrote. A lossy-but-successful core migration otherwise overwrites
-    // in place and leaves no rollback artifact (.failed-* only covers import *failure*).
-    // Same-version reboots skip (the file exists), so the copy stays the true pre-upgrade
-    // blob. Same secrecy class as the live blob (0600).
-    const preCopy = `${dataPath(dir)}.pre-${PKG_VERSION}`;
-    if (!fs.existsSync(preCopy)) {
-      try {
-        fs.copyFileSync(dataPath(dir), preCopy);
-        fs.chmodSync(preCopy, 0o600);
-        log(`[${name}] pre-migration blob retained as ${preCopy.split('/').pop()}`);
-      } catch (err) {
-        log(`[${name}] pre-migration retention failed (continuing):`, String(err));
-      }
-    }
-    let imported = false;
-    try {
-      const buf = fs.readFileSync(dataPath(dir));
-      await withScopeAsync(async (lt) => {
-        const adaptData = pkt.pw.packet.ParseValue(new Uint8Array(buf)).Attach(lt);
-        await pkt.mutatingTx('::actor::import_state', adaptData, lt);
-      });
-      imported = true;
-    } catch (err) {
-      log(`[${name}] FAILED TO IMPORT SAVED STATE — continuing with the reseeded identity; ` +
-        `surviving contacts (if the blob was partially migrated) self-heal via contact restore:`, String(err));
-      try {
-        fs.renameSync(dataPath(dir), `${dataPath(dir)}.failed-${Date.now()}`);
-        log(`[${name}] unreadable state blob preserved as state_data.bin.failed-*`);
-      } catch {
-        /* best effort */
-      }
-    }
-    if (imported) {
-      // DR staged-restore commit (mirrors ours-mcp's host): import_state PARKED the
-      // $e2e_sessions blob unvalidated; validate + assign it in a dedicated transaction.
-      // A corrupt pickle hard-fails ONLY this txn (atomic rollback — nothing assigned),
-      // observed here identity-scoped, and we discard the staged blob via reject so the
-      // fresh account + contact self-heal fallback take over. Both legs fire _save_state,
-      // persisting the now-clean export (via the onSaveState hook) so the corrupt pickles
-      // never come back on the next boot.
-      try {
-        const st = await withScopeAsync(async (lt) => {
-          const r = await pkt.mutatingTx('::a2a_messaging::commit_e2e_restore', {}, lt);
-          const status = r.Reduce('status').Visualize();
-          const sessions = r.Reduce('sessions').IsNil() ? '0' : r.Reduce('sessions').Visualize();
-          return { status: String(status), sessions: String(sessions) };
-        });
-        log(`[${name}] e2e restore commit: status=${st.status} sessions=${st.sessions}`);
-      } catch (err) {
-        log(`[${name}] E2E RESTORE REJECTED — staged session blob failed pickle validation; ` +
-          `discarding it, fresh account + self-heal fallback take over: ${String(err).slice(0, 260)}`);
-        try {
-          await withScopeAsync(async (lt) => {
-            await pkt.mutatingTx('::a2a_messaging::reject_e2e_restore', {}, lt);
-          });
-        } catch (err2) {
-          log(`[${name}] reject_e2e_restore failed (staging is transient; continuing):`, String(err2));
-        }
-      }
-    }
-  }
-  const key = isCatchAll(cfg.chatId) ? 'any chat' : chatKey(cfg.chatId, cfg.threadId || undefined);
-  log(`[${name}] restored (bot ${botLabel(bot)}, ${key}${cfg.peerCid ? `, peer ${cfg.peerCid}` : ', awaiting proxy'})`);
-  // Eager restore: re-key degraded contacts + flush queues orphaned by a crash.
-  await contactRestoreSweep(pkt);
-  // Boot/upgrade re-advertise FIRST so a pre-existing legacy peer learns we are now
-  // e2e-capable (refreshes its stored AD/caps → it offers migration back); re-fire on
-  // a short schedule to catch a peer that reconnects shortly after us. Idempotent.
-  await readvertiseOnUpgrade(pkt);
-  for (const ms of [10_000, 30_000, 90_000]) {
-    setTimeout(() => { void readvertiseOnUpgrade(pkt); }, ms);
-  }
-  // Proactively migrate already-e2e contacts to the double ratchet (case 3a), even
-  // if they are idle — runs after restore so state is imported + the packet is
-  // registered on the broker (the migration offer rides the encrypted channel).
-  await migrationSweep(pkt);
-  // Drain any control requests queued by the control plane while we were down.
-  process.nextTick(() => void processControlRequests(conn));
+  if (conflict) throw new Error(conflict);
+  watchRoute(conn);
+  // Anything that arrived while this process was down is already in the daemon;
+  // one drain now rather than waiting for the next notification.
+  await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
+  log(`[${name}] route restored (bot ${botLabel(bot)})`);
 }
 
-function removeConnection(name: string): string | null {
+interface RemoveConnectionResult {
+  found: boolean;
+  localRemoved: boolean;
+  identityRemoved: boolean;
+  identityLeftBehind: boolean;
+  error?: string;
+}
+
+async function removeConnection(name: string): Promise<RemoveConnectionResult> {
   const conn = connections.get(name);
-  if (!conn) return `no connection named "${name}"`;
-  unregisterRoute(conn);
-  try {
-    host.removePacket(conn.pkt.cid);
-  } catch (err) {
-    log(`[${name}] remove_packet failed:`, String(err));
+  if (!conn) {
+    // An unrestorable route is absent from the live map. Without its bound
+    // session there is no lease to release, so discard the local record and
+    // surface the global identity for explicit operator cleanup.
+    const dir = connDir(name);
+    if (!fs.existsSync(metaPath(dir))) {
+      return { found: false, localRemoved: false, identityRemoved: false, identityLeftBehind: false, error: `no connection named "${name}"` };
+    }
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      return {
+        found: true, localRemoved: false, identityRemoved: false, identityLeftBehind: true,
+        error: `deleting ${dir} failed: ${String(err)}`,
+      };
+    }
+    ownedIdentityNames.delete(name);
+    const reason = `route "${name}" was not live, so its daemon lease could not be released; identity "${name}" was left behind`;
+    log(`[${name}] ${reason}`);
+    return {
+      found: true, localRemoved: true, identityRemoved: false, identityLeftBehind: true, error: reason,
+    };
   }
+
+  let releaseError = '';
+  try {
+    await conn.client.releaseLease();
+  } catch (err) {
+    releaseError = `releasing the daemon lease for identity "${name}" failed: ${String(err)}`;
+  }
+
+  let identityRemoved = false;
+  let removalError = releaseError;
+  if (!releaseError && ownedIdentityNames.has(name)) {
+    try {
+      // Name-only deletion is deliberately organizational bookkeeping, not an
+      // authorization boundary. If an operator removed and externally recreated
+      // this same name, removal can delete that replacement; the approved model
+      // accepts that outcome and adds no CID/provenance machinery around it.
+      await conn.client.removeIdentity({ name });
+      identityRemoved = true;
+    } catch (err) {
+      removalError = `route "${name}" was removed locally, but daemon identity "${name}" was left behind: ${String(err)}`;
+    }
+  } else if (!releaseError) {
+    removalError = `route "${name}" was removed locally, but identity "${name}" was not in the connector-owned name list and was left behind`;
+  }
+
+  unregisterRoute(conn);
+  conn.watch?.abort();
+  conn.watch = null;
   connections.delete(name);
   try {
     fs.rmSync(conn.dir, { recursive: true, force: true });
   } catch (err) {
-    return `deleting ${conn.dir} failed: ${String(err)}`;
+    return {
+      found: true, localRemoved: false, identityRemoved, identityLeftBehind: !identityRemoved,
+      error: `deleting ${conn.dir} failed: ${String(err)}`,
+    };
   }
-  return null;
+  ownedIdentityNames.delete(name);
+  if (identityRemoved) {
+    daemonIdentityNames.delete(name);
+    log(`[${name}] route and daemon identity removed`);
+  }
+  else log(`[${name}] route removed locally; ${removalError}`);
+  return {
+    found: true,
+    localRemoved: true,
+    identityRemoved,
+    identityLeftBehind: !identityRemoved,
+    ...(removalError ? { error: removalError } : {}),
+  };
 }
 
 // ----- control HTTP API (localhost) -------------------------------------------
@@ -1287,19 +1127,21 @@ function describeBot(bot: Bot): Record<string, unknown> {
   };
 }
 
-function describeConnection(conn: Connection): Record<string, unknown> {
-  const contacts = withScope((lt) => renderContacts(conn.pkt.readonlyTx('::a2a_messaging::list_contacts', lt)));
-  const mon = monitoringStatus(conn.pkt);
-  const receipts = conn.map.settingsFor(conn.cfg.peerCid);
+async function describeConnection(conn: Connection): Promise<Record<string, unknown>> {
+  // Contacts are read from the daemon. The monitoring/control-plane fields this
+  // used to report — controlPlaneCid, bound — are gone with messenger
+  // manageability; nothing reports them because nothing can be bound any more.
+  let contacts: { name: string; cid: string }[] = [];
+  let cid: string | null = null;
+  try {
+    contacts = (await conn.client.listContacts()).contacts.map((c) => ({ name: c.name, cid: c.container_id }));
+    cid = (await conn.client.currentIdentity()).cid;
+  } catch (err) {
+    log(`[${conn.cfg.name}] reading route state from the daemon failed:`, String(err));
+  }
   return {
-    receipts: {
-      enabled: receipts.receiptsEnabled,
-      emojiDelivered: receipts.emojiDelivered,
-      emojiRead: receipts.emojiRead,
-      mappedMessages: conn.map.size(),
-    },
     name: conn.cfg.name,
-    cid: conn.pkt.cid,
+    cid,
     botName: conn.cfg.botName,
     botUsername: conn.bot.username || null,
     chatId: conn.cfg.chatId,
@@ -1309,9 +1151,7 @@ function describeConnection(conn: Connection): Record<string, unknown> {
     payloadMode: conn.cfg.payloadMode,
     deniedMessage: conn.cfg.deniedMessage || DEFAULT_DENIED,
     peerCid: conn.cfg.peerCid || null,
-    controlPlaneCid: mon.proxyCid || null,
-    bound: mon.proxyCid !== '',
-    contacts: contacts.map((c) => ({ name: c.name, cid: c.container_id })),
+    contacts,
     createdAt: conn.cfg.createdAt,
   };
 }
@@ -1337,7 +1177,7 @@ function startControlServer(): void {
         const label = String(body.label ?? '').trim();
         const bio = String(body.bio ?? '').trim();
         const payloadMode = String(body.payloadMode ?? 'envelope').trim();
-        const bad = validateName(name);
+        const bad = routeNameError(name);
         if (bad) return sendJson(res, 400, { ok: false, error: bad });
         if (!botName) return sendJson(res, 400, { ok: false, error: 'botName is required (register a bot with add_bot first)' });
         if (!chatId) return sendJson(res, 400, { ok: false, error: 'chatId is required (use 0 for a catch-all route)' });
@@ -1365,7 +1205,7 @@ function startControlServer(): void {
         const body = (await readBody(req)) as Record<string, unknown>;
         const name = String(body.name ?? '').trim();
         const botToken = String(body.botToken ?? '').trim();
-        const bad = validateName(name);
+        const bad = routeNameError(name);
         if (bad) return sendJson(res, 400, { ok: false, error: bad });
         if (!botToken) return sendJson(res, 400, { ok: false, error: 'botToken is required' });
         try {
@@ -1385,47 +1225,27 @@ function startControlServer(): void {
         return sendJson(res, 200, { ok: true, removed: name });
       }
 
-      // Generate a fresh invite to hand to the messenger control plane so it can
-      // add this route's node as a contact (prerequisite for binding).
-      const inviteMatch = url.pathname.match(/^\/connections\/([^/]+)\/cp-invite$/);
-      if (req.method === 'POST' && inviteMatch) {
-        const name = decodeURIComponent(inviteMatch[1]);
-        const conn = connections.get(name);
-        if (!conn) return sendJson(res, 404, { ok: false, error: `no connection named "${name}"` });
-        try {
-          const invite = await withScopeAsync(async (lt) =>
-            packInvite(Buffer.from((await conn.pkt.mutatingTx('::a2a_messaging::generate_invite', {}, lt)).Reduce('invite').GetBinary())),
-          );
-          return sendJson(res, 200, { ok: true, invite });
-        } catch (err) {
-          return sendJson(res, 500, { ok: false, error: String(err) });
-        }
-      }
-
-      // Start binding the control plane: generate a 6-digit code bound to an
-      // existing contact (the messenger). The user enters it in the Control Panel.
-      const bindMatch = url.pathname.match(/^\/connections\/([^/]+)\/bind$/);
-      if (req.method === 'POST' && bindMatch) {
-        const name = decodeURIComponent(bindMatch[1]);
-        const conn = connections.get(name);
-        if (!conn) return sendJson(res, 404, { ok: false, error: `no connection named "${name}"` });
-        const body = (await readBody(req)) as Record<string, unknown>;
-        const contact = String(body.contact ?? '').trim();
-        if (!contact) return sendJson(res, 400, { ok: false, error: 'contact (name or container id) is required' });
-        try {
-          const code = await startBind(conn, contact);
-          return sendJson(res, 200, { ok: true, code });
-        } catch (err) {
-          return sendJson(res, 500, { ok: false, error: String(err) });
-        }
-      }
+      // REMOVED WITH MESSENGER MANAGEABILITY: POST /connections/<n>/cp-invite and
+      // POST /connections/<n>/bind. They minted an invite for the ours messenger
+      // and started the 6-digit control-plane bind. The connector is no longer a
+      // managed node, so there is nothing to invite and nothing to bind; the CLI
+      // commands that drove them (cp_invite, bind_proxy) are gone too.
 
       const delMatch = url.pathname.match(/^\/connections\/(.+)$/);
       if (req.method === 'DELETE' && delMatch) {
         const name = decodeURIComponent(delMatch[1]);
-        const fail = removeConnection(name);
-        if (fail) return sendJson(res, fail.startsWith('no connection') ? 404 : 500, { ok: false, error: fail });
-        return sendJson(res, 200, { ok: true, removed: name });
+        const result = await removeConnection(name);
+        if (!result.found) return sendJson(res, 404, { ok: false, error: result.error });
+        if (result.error) {
+          return sendJson(res, 409, {
+            ok: false,
+            removed: result.localRemoved ? name : null,
+            identityRemoved: result.identityRemoved,
+            identityLeftBehind: result.identityLeftBehind,
+            error: result.error,
+          });
+        }
+        return sendJson(res, 200, { ok: true, removed: name, identityRemoved: true, identityLeftBehind: false });
       }
 
       sendJson(res, 404, { ok: false, error: 'not found' });
@@ -1449,7 +1269,11 @@ function startControlServer(): void {
         /* best effort */
       }
     }
-    for (const conn of connections.values()) saveState(conn.pkt, conn.dir);
+    // NOTHING TO SAVE. The daemon owns packet state; this process holds only
+    // config, which is written on change. What DOES need doing on the way out is
+    // stopping the notification watches so the daemon's long-polls close cleanly
+    // rather than waiting out their deadline.
+    for (const conn of connections.values()) conn.watch?.abort();
     server.close();
     process.exit(0);
   };
@@ -1457,37 +1281,15 @@ function startControlServer(): void {
   process.on('SIGTERM', shutdown);
 }
 
-// ----- contact restore retry timer ---------------------------------------
-// A periodic backstop for contactRestoreSweep (already run on boot per route,
-// and again once a contact heals via the 'contact_restored' notify): retries
-// restore requests for contacts still degraded, and flushes anything queued
-// by a heal whose notify was lost to a crash. The reentrancy guard skips a
-// tick if the previous sweep still runs.
-const RESTORE_SWEEP_INTERVAL_MS = 3_600_000;
-let restoreSweepRunning = false;
-function startRestoreSweepTimer(): void {
-  setInterval(() => {
-    if (restoreSweepRunning) return;
-    restoreSweepRunning = true;
-    void (async () => {
-      try {
-        for (const conn of connections.values()) {
-          await contactRestoreSweep(conn.pkt);
-          await readvertiseOnUpgrade(conn.pkt);
-          await migrationSweep(conn.pkt);
-        }
-      } finally {
-        restoreSweepRunning = false;
-      }
-    })();
-  }, RESTORE_SWEEP_INTERVAL_MS).unref();
-  log(`contact restore-retry timer armed (every ${RESTORE_SWEEP_INTERVAL_MS}ms)`);
-}
+// The contact-restore retry timer went with contactRestoreSweep — the daemon
+// runs its own sweep, and a second one here would be a client retrying repairs
+// on a session it does not hold. The 'contact_restored' notify is observability
+// now (see watchRoute), not a trigger.
 
 // ----- startup ----------------------------------------------------------------
 async function main(): Promise<void> {
-  log(`booting (state ${STATE_DIR}, broker ${CONFIG.brokerUrl})`);
-  await host.boot();
+  log(`booting (config ${STATE_DIR})`);
+  daemon = await attachToDaemon();
 
   // 1. Load the bot registry first (one TelegramClient per bot; no poll yet).
   const botRecs = loadBotRegistry();
@@ -1496,6 +1298,13 @@ async function main(): Promise<void> {
 
   // 2. Restore persisted routes; each resolves its bot by name.
   const names = listPersistedNames();
+  for (const name of names) ownedIdentityNames.add(name);
+  const visibleOwned = names.filter((name) => daemonIdentityNames.has(name));
+  const missingOwned = names.filter((name) => !daemonIdentityNames.has(name));
+  if (visibleOwned.length) log(`daemon inventory includes connector routes: ${visibleOwned.join(', ')}`);
+  if (missingOwned.length) {
+    log(`daemon inventory does not include connector routes: ${missingOwned.join(', ')} — attempting authoritative chooseIdentity for each`);
+  }
   if (names.length === 0) {
     log('no persisted routes — add a bot with `add_bot`, then a route with `add_new_connection`');
   } else {
@@ -1523,7 +1332,6 @@ async function main(): Promise<void> {
   }
 
   startControlServer();
-  startRestoreSweepTimer();
   log(`ready (bots=${bots.size}, routes=${connections.size})`);
 }
 

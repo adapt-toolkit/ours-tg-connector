@@ -12,7 +12,7 @@ loop.
  chat B ─┤  Telegram   │        (demux by chat-key)     │
  topic#7 ┘             └──┬──────────┬──────────┬───────┘
                           ▼          ▼          ▼
-                    identity A  identity B  identity C   ← one packet per chat-key
+                    identity A  identity B  identity C   ← daemon identity per chat-key
                           │          │          │  send_message
                           ▼          ▼          ▼
                       Agent X     Agent X     Agent Y    ← same agent can serve many
@@ -24,7 +24,7 @@ Two layers:
   (`add_bot`). One token == one `getUpdates` poll loop (Telegram allows only one
   consumer per token). The loop demultiplexes each update to a route by **chat-key**
   (`chatId`, or `chatId:threadId` for a forum topic).
-- **Route** — one self-sovereign ADAPT identity (a packet) pinned to one chat-key,
+- **Route** — one ours identity in the shared daemon pinned to one chat-key,
   bridged to one proxy agent. A route **references its bot by name**, so the token
   lives in exactly one place; many routes share a bot. The invite a route emits is
   byte-compatible with the ours `add_contact` tool.
@@ -47,14 +47,15 @@ customers; escalate refunds to a human").
    context). The connector mints a fresh identity, sets its name + bio, and prints
    an **invite blob**.
 3. You paste that blob into your proxy agent via its `add_contact`. The connector
-   packet — already live on the broker — completes the encrypted-channel handshake.
+   route identity — already live through the daemon — completes the encrypted-channel handshake.
 4. From then on:
    - every message in that chat/topic is forwarded to its agent as a JSON
      **message envelope** (sender + chat metadata, reply/forward context, and any
      attached file via the core 3.1 file channel — see
      [Message envelope](#message-envelope) and [File transfer](#file-transfer-core-31));
-   - every message the agent sends back is delivered to that same chat/topic, and
-     a file the agent sends is delivered with `sendDocument`.
+   - every message the agent sends back is delivered to that same chat/topic with
+     Markdown formatting and exact reply threading when `reply_to.wire_id` is
+     available; a file the agent sends is delivered with `sendDocument`.
 5. Re-run `add_new_connection` with the **same `--bot`** and a different
    `--chat-id`/`--thread-id` to add more routes on the one bot. Point two routes at
    the same agent and it sees two distinct contacts (distinct bios) — one per chat.
@@ -67,11 +68,14 @@ both modes; Telegram voice notes retain the protocol MIME marker
 `audio/ogg; x-ours-kind=voice-message`, allowing the receiving daemon to invoke
 its native voice-transcription path even when no companion text is sent.
 
-Messages are end-to-end encrypted between the connector packet and the agent (ADAPT
+Messages are end-to-end encrypted between the connector's route identity and the agent (ADAPT
 encrypted channels). The connector never persists message bodies to disk — only the
-bot registry (`bot name`, `token`, `@username`), the per-route seed + serialized
-packet state, and the route's Telegram side (`bot name`, `chat id`, `thread id`,
-`bio`, `peer cid`).
+bot registry (`bot name`, `token`, `@username`), route metadata (`bot name`,
+`chat id`, `thread id`, `bio`, `peer cid`, and stable daemon lease), and a bounded
+30-day wire-id ↔ Telegram-message-id map with per-route receipt settings. Those
+persisted route names are also the connector's simple list of identities it
+created. The list is organizational bookkeeping, not an authorization or
+provenance boundary; identity keys and packet state stay in the shared daemon.
 
 ### Routing rules
 
@@ -108,102 +112,6 @@ bypasses normal processing entirely.
 In a **privacy-mode** group only the `/id@<bot_username>` form is delivered (see the
 note above); in DMs and privacy-off groups bare `/id` works too. In a group with
 several bots, only the one named in `/id@<bot_username>` answers.
-
-### Reply threading
-
-An agent's answer can arrive in Telegram **as a reply to the message that prompted
-it**, so a busy group chat stays readable. The mechanism is one mapping:
-
-1. an inbound Telegram message is sent to the agent as ours `wire_id` **W**, and the
-   route records `W → (chat id, message id)` in `messages.json` in its state dir;
-2. the agent answers with `reply_to_wire_id = W` (the `send_message` tool already
-   supports it);
-3. the connector resolves **W** back to that Telegram message and sends with
-   `reply_parameters.message_id`.
-
-**It only works when the agent fills `reply_to_wire_id`.** An agent that does not
-gets ordinary un-threaded messages — that is a property of the sender, not a
-connector fault, so it is worth putting in the persona of any role that writes to
-Telegram. If a pointer resolves to nothing (never mapped, or older than the 30-day
-retention below) the message is delivered **plain**; a "similar" or most-recent
-message is never substituted.
-
-The map is persistent (it survives a daemon restart), holds **no message content** —
-only chat/message ids, the contact id and the receipt state — and is pruned at
-**30 days** / 2000 rows per route, oldest first.
-
-### Delivery & read receipts as reactions
-
-When the agent's node confirms a message, the connector puts a **reaction** on the
-originating Telegram message: 👀 when it was **delivered**, then 👌 once the agent
-has **read** it (its `get` path). Because a bot may hold **at most one reaction per
-message**, read *replaces* delivered rather than sitting beside it.
-
-The confirmations themselves are core 0.7.0 receipts, not something the connector
-invents: emission is gated on both sides' `core.receipts.*` capabilities (the
-connector declares `emit` and `receive`), and application is **monotonic** per
-(peer, message) over `unknown < sent < delivered < read` — a duplicate or
-out-of-order receipt changes nothing. Receipts are **best-effort UX**: a missing
-reaction does **not** mean the message failed to arrive, and a Telegram refusal on a
-reaction (reactions disabled in the chat, message deleted) is logged and never
-affects message delivery.
-
-> **The agent side has to emit them.** A peer only sends receipts if *it* advertises
-> `core.receipts.emit`. Against an agent node that does not, the reactions simply
-> never appear — everything else keeps working.
-
-Per **connection** (not per bot — `/receipts off` on one route leaves the others
-alone), in the route's own chat:
-
-```
-/receipts on            # turn delivery/read reactions on for this connection
-/receipts off           # …and off
-/receipts status        # show the current setting and emoji
-/emoji delivered <e>    # set the "delivered" reaction
-/emoji read <e>         # set the "read" reaction
-/emoji reset            # back to 👀 / 👌
-```
-
-Commands are parsed **in connector code**, never passed to the agent, and are
-answered in the chat. An emoji is validated against Telegram's fixed
-bot-reaction list **before** it is saved, with the valid set in the error —
-note that ✅ is *not* on that list, which is why the `read` default is 👌.
-
-### `/help` and the slash menu
-
-**`/help`** is answered by the connector itself: it lists the commands the
-connector owns (`/help`, `/id`, `/receipts`, `/emoji`) and the current receipt
-settings for that connection. It works in a chat with no route yet too — you get
-the command list and a pointer to `/id`.
-
-The same list is registered with Telegram via `setMyCommands` at **default
-scope** when a bot starts polling, so a client offers the commands in its slash
-menu as you type. Registration is cosmetic and best-effort: if it fails it is
-logged, and every command still works when typed by hand.
-
-> **Only these four commands are intercepted.** Everything else you send is
-> relayed to the agent exactly as typed, *including* text that starts with a
-> slash — `/deploy prod` reaches the agent, and so does `/help me write the
-> release note`, because only a **bare** `/help` is treated as the command.
-
-### Message formatting
-
-Formatting is preserved **in both directions**.
-
-- **Telegram → agent.** A message's `entities` / `caption_entities` (bold, italic,
-  underline, strikethrough, spoiler, code, `pre` with its language, blockquote,
-  links and mentions) are folded into **Markdown** in the message text, so the
-  agent reads the formatting instead of losing it. Offsets are UTF-16 code units
-  and are treated as such. A `custom_emoji` is premium-only and degrades to the
-  stand-in glyph Telegram already put in the text. A message with no entities is
-  passed through byte-for-byte.
-- **Agent → Telegram.** The agent's Markdown is rendered as `MarkdownV2`, escaping
-  the **text leaves only** (all 18 reserved characters — one unescaped `.` would
-  fail the whole send). Emphasis is deliberately conservative: `foo_bar_baz` and
-  `2*3*4` stay literal. The 4096-character limit is applied to the **escaped**
-  text. **If Telegram rejects the markup, the same text is resent with no
-  `parse_mode`** and the original refusal is logged — the message always wins over
-  its styling.
 
 ### Message envelope
 
@@ -259,19 +167,46 @@ distinct from `send_message`, so files and text are always separate messages.
   read files from the file channel and correlate by `attachment.wire_id`** — an
   agent that still expects inline base64 will not see the bytes.
 - **Outbound (agent → Telegram).** A file the agent sends arrives via
-  `receive_file`, is stored in the packet's file inbox (same unread → processed →
-  gc lifecycle as messages, bytes included), and is delivered to the chat (and
-  forum topic, if pinned) with Telegram **`sendDocument`** — preserving the
-  original filename. Agent → Telegram file sending was previously unsupported.
+  `receive_file`, is stored in the daemon's durable per-identity history, and is
+  delivered to the chat (and forum topic, if pinned) with Telegram
+  **`sendDocument`** — preserving the original filename. The connector first
+  lists unread metadata, reads the immutable blob, uploads it to Telegram, and
+  only then acknowledges that exact `wire_id` with selected `getFiles`.
 - **Caps.** Inbound media is bounded by `attachmentMaxBytes`
   (`OURS_TG_ATTACHMENT_MAX_BYTES`, **10 MB**, under Telegram's 20 MB bot
   download limit). A file a contact sends outbound is bounded by
   `outboundFileMaxBytes` (`OURS_TG_OUTBOUND_FILE_MAX_BYTES`, **50 MB**,
   Telegram's `sendDocument` upper bound); an over-cap outbound file is skipped and
   logged.
-- **Monitoring.** File traffic is monitored exactly like messages: a bound control
-  plane receives a forced **metadata-only** copy (`[file] <name> (<mime>, <N> B)`)
-  — never the bytes.
+
+### Replies, formatting, and receipts
+
+- Telegram entities (bold, italic, code, links, quotes, and related formatting)
+  are converted to Markdown for the agent. Agent Markdown is rendered as
+  Telegram MarkdownV2, with a plain-text fallback if Telegram rejects the parse.
+- The bounded wire-id map lets agent `reply_to.wire_id` pointers become native
+  Telegram replies. Telegram replies are likewise sent with a structured ours
+  reply pointer when their exact mapped message is still retained. Missing or
+  expired mappings degrade to an unthreaded message; the connector never guesses.
+- Delivery and read receipts become one Telegram reaction per message (`👀` then
+  `👌` by default). `/receipts` and `/emoji` configure them per route, and
+  `/help` reports the active settings. Receipt state is monotonic and is caught
+  up from durable outbound history after a restart or `sync_required` event.
+
+### External delivery boundary
+
+Agent messages are delivered oldest-first from the daemon's durable history.
+The connector uses `listIncomingMessages` plus `getHistoryItem` to inspect one
+unread body without changing state, sends it to Telegram, then acknowledges it
+with `getMessages({limit:1})` and verifies the returned `wire_id` is the one it
+just delivered. Per-route single-flight drains prevent concurrent notifications
+from racing acknowledgements. Telegram failures leave the oldest item unread.
+
+There is one unavoidable external side-effect window: if Telegram accepts a
+message or file and the process crashes before the daemon acknowledgement, the
+item stays unread and may be delivered again after restart. The connector favors
+recoverability over silently losing content and does not depend on removed
+defer/requeue or conversation-policy APIs.
 
 ### Voice transcription (speech-to-text)
 
@@ -296,8 +231,15 @@ added for provenance:
 }
 ```
 
-- **Opt-in.** Off by default (`sttEnabled:false`) — behaviour is then byte-identical
-  to today. Turn it on and supply a key (see [Configuration](#configuration)).
+- **Opt-in, and it covers THIS PROCESS ONLY.** Off by default
+  (`sttEnabled:false`), which means *the connector* sends no audio to a
+  speech-to-text provider. It does **not** mean the audio is never transcribed:
+  the connector is a client of an ours daemon, and **the daemon runs its own
+  speech-to-text** when the receiving side pulls a voice note — under
+  configuration this connector's operator does not control and may not know
+  exists. When the connector was its own host, `sttEnabled:false` did cover the
+  whole path; attached, it no longer can. Turn it on and supply a key to
+  transcribe here as well (see [Configuration](#configuration)).
 - **No transcoding.** Telegram voice is **OGG/Opus**, which OpenAI-compatible
   transcription endpoints accept directly — the connector adds **no ffmpeg** and no
   new dependency (just built-in `fetch`).
@@ -351,9 +293,11 @@ npm install
 npm run build
 ```
 
-Requires Node ≥ 20. The native ADAPT SDK (`@adapt-toolkit/sdk` +
-`@adapt-toolkit/sdk-native`, pinned to the version matching the shipped
-`.muflo`) is resolved from `node_modules` at runtime.
+Requires Node ≥ 20, and **an ours daemon already running on this box** — the
+connector attaches to it over `/api/v1` and drives it through
+[`@ours.network/sdk`](https://www.npmjs.com/package/@ours.network/sdk). It runs
+no engine of its own: there is no native ADAPT SDK and no MUFL packet here, so
+nothing beyond `npm install` is resolved at runtime.
 
 ## Usage
 
@@ -366,7 +310,8 @@ ours-tg-connector add_bot supportbot 123456:ABC...
 
 ours-tg-connector list_bots             # name, @username, masked token, route count
 
-# 2. create a route on that bot (auto-starts the daemon if needed) and print an invite
+# 2. create a route on that bot (auto-starts the connector process if needed;
+#    the shared ours daemon must already be running) and print an invite
 ours-tg-connector add_new_connection \
   --name support \
   --bot supportbot \
@@ -383,10 +328,10 @@ ours-tg-connector add_new_connection \
   --bio "ACME forum, #billing topic"
 
 ours-tg-connector list_connections     # routes grouped by bot
-ours-tg-connector remove_connection sales
+ours-tg-connector remove_connection sales  # removes the route and its name-listed daemon identity
 ours-tg-connector remove_bot supportbot   # refused while any route still uses it
 
-# daemon lifecycle
+# connector-process lifecycle (never starts or stops the shared ours daemon)
 ours-tg-connector start | stop | restart | status
 ours-tg-connector serve     # foreground (debugging)
 
@@ -394,9 +339,6 @@ ours-tg-connector serve     # foreground (debugging)
 ours-tg-connector install-service     # systemd (Linux) / launchd (macOS)
 ours-tg-connector uninstall-service
 
-# manage a bridge from the ours messenger control plane
-ours-tg-connector cp_invite supportbot              # invite to add the messenger as a contact
-ours-tg-connector bind_proxy supportbot <contact>   # start binding it (prints a 6-digit code)
 ```
 
 `install-service` registers a **user-level** service running `serve`, bakes the
@@ -419,6 +361,13 @@ topic within that chat. `--bio` is the context the agent reads about this chat
 route for any chat the bot sees that no other route claims. Reuse the same `--bot`
 across routes to multiplex one bot over many chats/topics.
 
+`remove_connection` releases that route's daemon lease, then removes the daemon
+identity by its recorded route name and deletes the local route record. Because
+the ownership list is intentionally name-only, an operator who manually removes
+and recreates a same-name identity has deliberately replaced it; removing the
+route can remove that replacement too. Use the `ours` operator CLI to repair
+orphaned or deliberately replaced identities.
+
 ## Configuration
 
 Precedence per field: **env var > `config.json` > default**. The config file is
@@ -426,7 +375,8 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 
 | field          | env var                   | default                                         |
 |----------------|---------------------------|-------------------------------------------------|
-| broker URL     | `OURS_TG_BROKER_URL`   | `wss://broker1.ours.network` |
+| daemon URL     | `OURS_TG_DAEMON_URL`   | `''` (the SDK's own default selection) |
+| daemon state dir | `OURS_TG_DAEMON_STATE_DIR` | `''` (the SDK's own default selection) |
 | control port   | `OURS_TG_CONTROL_PORT` | `3051` (localhost only)                         |
 | state dir      | `OURS_TG_STATE_DIR`    | `~/.ours-telegram`                            |
 | poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
@@ -436,7 +386,7 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | retry backoff  | `OURS_TG_FETCH_RETRY_BASE_MS` | `300` (base delay between those retries; grows exponentially with jitter) |
 | attachment cap | `OURS_TG_ATTACHMENT_MAX_BYTES` | `10485760` (10 MB; larger inbound media forwarded as a metadata-only stub) |
 | outbound file cap | `OURS_TG_OUTBOUND_FILE_MAX_BYTES` | `52428800` (50 MB; a larger file from a contact is skipped + logged — Telegram's `sendDocument` limit) |
-| STT enabled    | `OURS_TG_STT_ENABLED`     | `false` (master switch for voice transcription; off ⇒ byte-identical to today) |
+| STT enabled    | `OURS_TG_STT_ENABLED`     | `false` (whether **this connector** transcribes voice; the attached daemon runs its own STT regardless — see [Voice](#voice-messages--speech-to-text)) |
 | STT API key    | `OURS_TG_STT_API_KEY`     | `''` (secret; env preferred — masked if placed in `config.json`, never logged) |
 | STT base URL   | `OURS_TG_STT_BASE_URL`    | `https://api.openai.com/v1` (OpenAI-compatible endpoint root; e.g. `https://api.groq.com/openai/v1` or a self-hosted whisper server) |
 | STT model      | `OURS_TG_STT_MODEL`       | `whisper-1` (e.g. `whisper-large-v3-turbo` on Groq) |
@@ -446,39 +396,29 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | STT timeout    | `OURS_TG_STT_TIMEOUT_MS`  | `60000` (per-transcription abort deadline, ms) |
 | forward voice audio | `OURS_TG_FORWARD_VOICE_AUDIO` | `false` (also `send_file` the `.ogg` alongside a successful transcript) |
 
+`OURS_TG_DAEMON_URL` and `OURS_TG_DAEMON_STATE_DIR` are a coherent pair: set
+both or neither. SDK 2 refuses an explicitly selected endpoint without its state
+directory before reading a daemon token. Legacy `OURS_INSTANCE` is rejected, and
+`OURS_AUTOSTART`/`autoStart` are ignored. This connector never embeds or starts an
+ours daemon; operate the shared daemon separately with `ours daemon start` or
+`ours daemon install-service`.
+
 The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
 tokens, so do not expose the control port off-host.
 
-## Control plane (ours messenger)
+## Control plane (removed)
 
-Each bridge is a self-sovereign ours node that can be **managed from the
-ours messenger control plane** over the encrypted a2a_control
-channel — no extra ports. The connector advertises an app manifest
-(`network.ours.telegram-connector`) with a `core.configuration` capability, so the
-messenger renders its generic config form for it. Two fields are configurable
-live (no restart):
+The connector used to be a **managed node**: it advertised an app manifest
+(`network.ours.telegram-connector`) and the ours messenger could bind to it over
+the a2a_control channel and edit the allowed chat id and denial message live.
+That was removed when the connector moved to the shared-daemon client model,
+along with the
+`cp_invite` and `bind_proxy` commands, the `get_manifest` / `get_config` /
+`set_config` verbs, and the bind ceremony.
 
-- **Allowed chat ID** — only this chat is proxied to the agent.
-- **Denial message** — what any other chat is told.
-
-(The bot token is *not* CP-configurable: the messenger strips secret-field values
-on save, so the token stays set at connection creation.)
-
-Bind it once:
-
-```sh
-# 1. add the messenger as a contact of the bridge node
-ours-tg-connector cp_invite supportbot
-#    → paste the invite into the messenger (add contact / add node)
-
-# 2. start the bind ceremony for that contact; read out the 6-digit code
-ours-tg-connector bind_proxy supportbot <messenger-contact-name-or-cid>
-#    → enter the code in the messenger Control Panel (out-of-band, 5 min, 3 tries)
-```
-
-Once bound, the messenger can pull the manifest, render the config form, and push
-changes (`get_manifest` / `get_config` / `set_config`). Config verbs are gated:
-only the bound control plane may read or write the configuration.
+A route is configured when it is created (`add_new_connection`) and changed by
+removing it and adding it back. There is no live reconfiguration path, and
+nothing to bind.
 
 ## Learn more
 

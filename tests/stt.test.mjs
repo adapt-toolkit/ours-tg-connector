@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Unit test for src/stt.ts — the speech-to-text client — plus a DoD-7 secret
+// Unit test for src/stt.ts — the speech-to-text client — plus a secret
 // hygiene guard for src/config.ts writeConfig(). Pure: stubbed globalThis.fetch,
 // no network, no broker. Covers STT success, HTTP error, unparseable body,
 // abort/timeout, the keyless short-circuit, and that writeConfig masks sttApiKey.
@@ -92,9 +92,8 @@ try {
   globalThis.fetch = realFetch;
 }
 
-// ---- DoD 7: writeConfig() masks the STT secret (regression guard) ----
-// The old broker-backed test-config.mjs was removed on main; this pure guard
-// keeps the secret-hygiene invariant covered without a broker.
+// ---- writeConfig() masks the STT secret (regression guard) ------------------
+// This pure guard keeps the secret-hygiene invariant covered without a broker.
 console.log('=== config secret hygiene ===');
 {
   const SECRET = 'sk-livekey-abcdef0123456789';

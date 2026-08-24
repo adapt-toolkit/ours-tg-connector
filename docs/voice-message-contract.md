@@ -59,5 +59,11 @@ node --import tsx tests/voice.test.mjs
 ```
 
 The first two are pure local tests. The voice integration test uses placeholder
-OGG/Opus-signature bytes, an in-process ADAPT host, and a stubbed STT provider;
-it requires no Telegram token, STT token, or real media.
+OGG/Opus-signature bytes, a real ours daemon driven through `@ours.network/sdk`
+(the connector no longer runs an in-process ADAPT host), and a stubbed STT
+provider; it requires no Telegram token, STT token, or real media.
+
+The STT spy is scoped **by origin**, not by URL: the daemon transcribes through
+the same `openai-compatible` provider URL, so a URL-matching spy cannot tell the
+daemon's call apart from the connector's, and an assertion that "the STT provider
+was never called" would fail against a connector that correctly never called it.

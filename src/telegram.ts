@@ -309,9 +309,13 @@ export function parseReply(m: {
 }
 
 // The message text with its Telegram entities folded back into Markdown, so the
-// agent reads bold/code/links/quotes instead of losing them. A message with no
-// entities comes back byte-for-byte unchanged.
-export function messageMarkdown(m: { text?: string; caption?: string; entities?: TelegramEntity[]; caption_entities?: TelegramEntity[] }): string {
+// agent reads bold/code/links/quotes instead of losing it.
+export function messageMarkdown(m: {
+  text?: string;
+  caption?: string;
+  entities?: TelegramEntity[];
+  caption_entities?: TelegramEntity[];
+}): string {
   const body = m.text ?? m.caption ?? '';
   if (body === '') return '';
   return entitiesToMarkdown(body, m.text !== undefined ? m.entities : m.caption_entities);
@@ -391,12 +395,8 @@ export class TelegramClient {
 
   // Deliver text to a chat, optionally into a specific forum topic. Passing a
   // threadId routes the reply back into the same topic it came from; omitting it
-  // posts to the chat's General/main thread. Returns the message_id of every
-  // message actually posted, so the caller can map them back to a wire_id.
-  //
-  // `replyToMessageId` makes this a Telegram reply (reply_parameters), which is
-  // how an agent's ours-level reply becomes a visible thread. `markdown` renders
-  // the text as MarkdownV2 — with the mandatory fallback below.
+  // posts to the chat's General/main thread. Returns every posted message id so
+  // callers can map an ours wire id back to Telegram.
   async sendMessage(
     chatId: number | string,
     text: string,
@@ -404,22 +404,16 @@ export class TelegramClient {
     opts: { replyToMessageId?: number; markdown?: boolean } = {},
   ): Promise<number[]> {
     const thread = threadId === undefined || threadId === '' ? undefined : Number(threadId);
-    // Telegram caps a single message at 4096 characters, counted on what is
-    // actually sent — so a formatted message is split by its RENDERED length.
     const pieces = opts.markdown ? splitForMarkdownV2(text) : chunkText(text, 4000);
     const ids: number[] = [];
     for (let i = 0; i < pieces.length; i += 1) {
       const piece = pieces[i];
-      // The reply pointer belongs on the first piece only — the rest continue it.
       const replyTo = i === 0 ? opts.replyToMessageId : undefined;
       if (opts.markdown) {
         try {
           ids.push(await this.postMessage(chatId, toMarkdownV2(piece), thread, replyTo, 'MarkdownV2'));
           continue;
         } catch (err) {
-          // MANDATORY FALLBACK: Telegram rejected our markup. The message matters
-          // more than its styling — resend the SAME text with no parse_mode and
-          // log the original refusal. Any other failure is the caller's problem.
           if (!isParseEntitiesError(err)) throw err;
           this.log(`markdown rejected, resending as plain text: ${String(err)}`);
         }
@@ -429,7 +423,6 @@ export class TelegramClient {
     return ids;
   }
 
-  // One sendMessage call. Returns the new message's id (0 if Telegram omitted it).
   private async postMessage(
     chatId: number | string,
     text: string,
@@ -445,8 +438,6 @@ export class TelegramClient {
         text,
         ...(thread !== undefined ? { message_thread_id: thread } : {}),
         ...(parseMode ? { parse_mode: parseMode } : {}),
-        // allow_sending_without_reply: the referenced message may have been
-        // deleted; the reply is then posted unthreaded instead of failing.
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } }
           : {}),
@@ -460,15 +451,6 @@ export class TelegramClient {
     return parsed?.result?.message_id ?? 0;
   }
 
-  // Publish the connector's own commands so a Telegram client offers them in its
-  // slash menu while the user types. DEFAULT SCOPE on purpose (no `scope` field):
-  // the list is a property of the bot, identical in every chat it serves, and a
-  // token belongs to exactly one connector instance — so one call per bot start
-  // covers every chat, including ones routed later, with no per-chat bookkeeping.
-  //
-  // Purely cosmetic: parseReceiptCommand, not this list, decides what is actually
-  // intercepted. Throws for the caller to log — a bot whose menu did not publish
-  // must still poll and still answer the commands typed by hand.
   async setMyCommands(commands: { command: string; description: string }[]): Promise<void> {
     const resp = await this.tgFetch(this.url('setMyCommands'), {
       method: 'POST',
@@ -479,21 +461,12 @@ export class TelegramClient {
       const body = await resp.text();
       throw new Error(`setMyCommands failed (HTTP ${resp.status}): ${body}`);
     }
-    // Telegram normally reports a bad command list as HTTP 400, but a 200 with
-    // ok:false is still a refusal — do not report it as success.
     const parsed = (await resp.json().catch(() => null)) as { ok?: boolean; description?: string } | null;
     if (parsed && parsed.ok === false) {
       throw new Error(`setMyCommands failed: ${parsed.description ?? 'unknown error'}`);
     }
   }
 
-  // Set (or, with a null emoji, clear) THE reaction on a message. A bot holds at
-  // most one reaction per message, so this replaces whatever was there — which is
-  // exactly why a read receipt overwrites the delivered one.
-  //
-  // Throws on refusal (reactions disabled in the chat, message deleted, emoji not
-  // on Telegram's list) for the caller to log. A receipt is best-effort UX: it must
-  // never affect message delivery.
   async setMessageReaction(chatId: number | string, messageId: number, emoji: string | null): Promise<void> {
     const resp = await this.tgFetch(this.url('setMessageReaction'), {
       method: 'POST',
@@ -511,8 +484,8 @@ export class TelegramClient {
   }
 
   // Deliver a file to a chat as a document — preserves the original filename and
-  // works for any media type (photos arrive uncompressed; see design D3/OQ4 for
-  // per-type rendering). Optionally into a forum topic. Multipart/form-data, so
+  // works for any media type; photos arrive uncompressed. Optionally sends into
+  // a forum topic. Multipart/form-data, so
   // we let fetch set the Content-Type boundary (do not set it ourselves).
   async sendDocument(
     chatId: number | string,
@@ -520,11 +493,18 @@ export class TelegramClient {
     filename: string,
     mime: string | undefined,
     threadId?: number | string,
-  ): Promise<void> {
+    opts: { replyToMessageId?: number } = {},
+  ): Promise<number> {
     const thread = threadId === undefined || threadId === '' ? undefined : Number(threadId);
     const form = new FormData();
     form.set('chat_id', String(chatId));
     if (thread !== undefined) form.set('message_thread_id', String(thread));
+    if (opts.replyToMessageId !== undefined) {
+      form.set('reply_parameters', JSON.stringify({
+        message_id: opts.replyToMessageId,
+        allow_sending_without_reply: true,
+      }));
+    }
     // Copy into a fresh Uint8Array: a Buffer is typed ArrayBufferLike (possibly
     // SharedArrayBuffer-backed) which is not a valid BlobPart; the copy is a plain
     // ArrayBuffer-backed view and preserves the bytes exactly.
@@ -535,6 +515,8 @@ export class TelegramClient {
       const body = await resp.text();
       throw new Error(`sendDocument failed (HTTP ${resp.status}): ${body}`);
     }
+    const parsed = (await resp.json().catch(() => null)) as { result?: { message_id?: number } } | null;
+    return parsed?.result?.message_id ?? 0;
   }
 
   // Resolve a file_id to its temporary download path (and size, when Telegram
@@ -617,9 +599,6 @@ export class TelegramClient {
               from: senderLabel(m),
               from_id: m.from?.id,
               from_username: m.from?.username,
-              // Entities folded into Markdown here, at the parse boundary, so
-              // every consumer downstream (envelope, plain payload, STT) sees the
-              // formatting as text rather than losing it.
               text: messageMarkdown(m),
               date: m.date,
               reply_to: parseReply(m),
@@ -658,13 +637,8 @@ function chunkText(text: string, size: number): string[] {
   return out;
 }
 
-// Split the agent's Markdown SOURCE into pieces whose RENDERED MarkdownV2 fits
-// Telegram's limit. Splitting the source (not the rendered string) is what makes
-// the plain-text fallback exact: each piece can be resent verbatim with no
-// parse_mode. Escaping can nearly double a piece's length, so the boundary is
-// found by bisecting on the rendered size, then backed off to a line or word
-// boundary. A prefix that cuts through `**bold**` is still valid MarkdownV2 —
-// the orphaned marker renders as an escaped literal.
+// Split the Markdown source so each rendered MarkdownV2 piece fits Telegram.
+// Keeping source pieces is what makes the plain-text fallback exact.
 export function splitForMarkdownV2(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
   if (toMarkdownV2(text).length <= limit) return [text];
   const out: string[] = [];
@@ -675,7 +649,8 @@ export function splitForMarkdownV2(text: string, limit = TELEGRAM_TEXT_LIMIT): s
     let fit = 1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (toMarkdownV2(rest.slice(0, mid)).length <= limit) { fit = mid; lo = mid + 1; } else { hi = mid - 1; }
+      if (toMarkdownV2(rest.slice(0, mid)).length <= limit) { fit = mid; lo = mid + 1; }
+      else hi = mid - 1;
     }
     const nl = rest.lastIndexOf('\n', fit);
     const sp = rest.lastIndexOf(' ', fit);

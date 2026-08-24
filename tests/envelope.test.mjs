@@ -1,11 +1,7 @@
 #!/usr/bin/env node
 // Pure unit test for the transcription behaviour of src/envelope.ts buildEnvelope()
-// — the text-fold, attachment-omit, error-shape, off-path, and caption-guard cases
-// that back the voice-STT DoD (SPEC §8.1–8.6). No broker, no Telegram, no network.
-//
-// (The broader envelope shaping lived in the root test-envelope.mjs, removed on
-// main as a scratch script; this keeps the STT-specific envelope coverage under
-// tests/ without resurrecting that file.)
+// — text folding, attachment omission, error shape, disabled behavior, and
+// caption handling. No broker, Telegram connection, or external network is used.
 //
 // Run: node_modules/.bin/tsx tests/envelope.test.mjs
 

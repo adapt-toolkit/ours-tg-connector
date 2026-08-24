@@ -13,13 +13,15 @@
 //   ours-tg-connector start | stop | restart | status | serve
 //   ours-tg-connector install-service | uninstall-service
 //
-// `add_new_connection` auto-starts the daemon if it is not already running, then
+// `add_new_connection` auto-starts this connector process if it is not already
+// running, then
 // creates the connection live (so the new packet is online to complete its invite
 // handshake) and prints the invite to paste into the proxy node.
 //
 // Config precedence per field: env var > config.json (OURS_TG_CONFIG, else
 // ~/.ours-telegram/config.json) > default:
-//   OURS_TG_BROKER_URL    broker to connect to (default: public broker)
+//   OURS_TG_DAEMON_URL       the ours daemon to attach to (default: the SDK's selection)
+//   OURS_TG_DAEMON_STATE_DIR its state directory — REQUIRED alongside a URL, see config.ts
 //   OURS_TG_CONTROL_PORT  localhost control API port (default 3051)
 //   OURS_TG_STATE_DIR     state + pid/log dir (default ~/.ours-telegram)
 //   OURS_TG_POLL_TIMEOUT  Telegram long-poll seconds (default 30)
@@ -32,6 +34,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as fs from 'node:fs';
 
 import { loadConfig } from './config';
+import { launchdPlist, serviceEnvironment } from './service-definition';
 import { looksLikeBotToken } from './routing';
 
 const CONFIG = loadConfig();
@@ -116,7 +119,7 @@ async function cmdStart(): Promise<void> {
   });
   child.unref();
   if (!child.pid) {
-    err('failed to spawn the daemon.');
+    err('failed to spawn the connector.');
     process.exit(1);
   }
   fs.writeFileSync(PID_PATH, String(child.pid));
@@ -124,11 +127,11 @@ async function cmdStart(): Promise<void> {
   const ready = await waitForPort(PORT);
   if (ready) {
     out(`up on ${BASE}`);
-    out(`  broker: ${CONFIG.brokerUrl}`);
+    out(`  daemon: ${CONFIG.daemonUrl || '(default selection)'}`);
     out(`  state:  ${STATE_DIR}`);
     out(`  logs:   ${LOG_PATH}`);
   } else {
-    err(`daemon started (pid ${child.pid}) but control port ${PORT} did not open within 30s — check ${LOG_PATH}.`);
+    err(`connector started (pid ${child.pid}) but control port ${PORT} did not open within 30s — check ${LOG_PATH}.`);
     process.exit(1);
   }
 }
@@ -173,7 +176,7 @@ async function cmdStatus(): Promise<void> {
   out('ours-tg-connector: running');
   if (pid) out(`  pid:    ${pid}`);
   out(`  url:    ${BASE} ${up ? '(reachable)' : '(port not answering!)'}`);
-  out(`  broker: ${CONFIG.brokerUrl}`);
+  out(`  daemon: ${CONFIG.daemonUrl || '(default selection)'}`);
   out(`  state:  ${STATE_DIR}`);
   out(`  logs:   ${LOG_PATH}`);
   if (up) {
@@ -187,13 +190,14 @@ async function cmdStatus(): Promise<void> {
   }
 }
 
-// Ensure the daemon is up before a control call; auto-start it if needed.
-async function ensureDaemon(): Promise<void> {
+// Ensure the connector process is up before a control call; auto-start it if
+// needed. This never starts the separately-operated shared ours daemon.
+async function ensureConnector(): Promise<void> {
   if (await portOpen(PORT)) return;
-  out('daemon not running — starting it…');
+  out('connector not running — starting it…');
   await cmdStart();
   if (!(await portOpen(PORT))) {
-    err('daemon did not come up; aborting.');
+    err('connector did not come up; aborting.');
     process.exit(1);
   }
 }
@@ -233,7 +237,7 @@ async function cmdAddBot(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  await ensureDaemon();
+  await ensureConnector();
   let res: Response;
   try {
     res = await fetch(`${BASE}/bots`, {
@@ -242,7 +246,7 @@ async function cmdAddBot(argv: string[]): Promise<void> {
       body: JSON.stringify({ name, botToken: token }),
     });
   } catch (e) {
-    err(`failed to reach the daemon control API: ${String(e)}`);
+    err(`failed to reach the connector control API: ${String(e)}`);
     process.exit(1);
   }
   const body = (await res.json()) as { ok: boolean; name?: string; username?: string; error?: string };
@@ -257,7 +261,7 @@ async function cmdAddBot(argv: string[]): Promise<void> {
 
 async function cmdListBots(): Promise<void> {
   if (!(await portOpen(PORT))) {
-    out('daemon not running — no live bots. (Persisted ones load on `start`.)');
+    out('connector not running — no live bots. (Persisted ones load on `start`.)');
     return;
   }
   const res = await fetch(`${BASE}/bots`);
@@ -283,7 +287,7 @@ async function cmdRemoveBot(name: string): Promise<void> {
     process.exit(1);
   }
   if (!(await portOpen(PORT))) {
-    err('daemon not running — start it first to remove a bot.');
+    err('connector not running — start it first to remove a bot.');
     process.exit(1);
   }
   const res = await fetch(`${BASE}/bots/${encodeURIComponent(name)}`, { method: 'DELETE' });
@@ -328,7 +332,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  await ensureDaemon();
+  await ensureConnector();
   let res: Response;
   try {
     res = await fetch(`${BASE}/connections`, {
@@ -337,7 +341,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
       body: JSON.stringify({ name, botName, chatId, threadId, label, bio, payloadMode }),
     });
   } catch (e) {
-    err(`failed to reach the daemon control API: ${String(e)}`);
+    err(`failed to reach the connector control API: ${String(e)}`);
     process.exit(1);
   }
   const body = (await res.json()) as { ok: boolean; cid?: string; invite?: string; botUsername?: string; error?: string };
@@ -368,7 +372,7 @@ async function cmdAddConnection(argv: string[]): Promise<void> {
 
 async function cmdListConnections(): Promise<void> {
   if (!(await portOpen(PORT))) {
-    out('daemon not running — no live connections. (Persisted ones load on `start`.)');
+    out('connector not running — no live connections. (Persisted ones load on `start`.)');
     return;
   }
   const res = await fetch(`${BASE}/connections`);
@@ -415,59 +419,7 @@ async function cmdListConnections(): Promise<void> {
   }
 }
 
-// Generate an invite to add the messenger control plane as a contact of a
-// connection's node (prerequisite for binding it as the control plane).
-async function cmdCpInvite(name: string): Promise<void> {
-  if (!name) {
-    err('cp_invite requires a connection name.');
-    process.exit(1);
-  }
-  if (!(await portOpen(PORT))) {
-    err('daemon not running — start it first.');
-    process.exit(1);
-  }
-  const res = await fetch(`${BASE}/connections/${encodeURIComponent(name)}/cp-invite`, { method: 'POST' });
-  const body = (await res.json()) as { ok: boolean; invite?: string; error?: string };
-  if (!body.ok || !body.invite) {
-    err(`cp_invite failed: ${body.error ?? `HTTP ${res.status}`}`);
-    process.exit(1);
-  }
-  out('');
-  out(`Add the messenger control plane as a contact of "${name}".`);
-  out('Paste this invite into the messenger (add contact / add node):');
-  out('');
-  out(body.invite);
-  out('');
-  out(`Once it is a contact, bind it:  ours-tg-connector bind_proxy ${name} <contact-name-or-cid>`);
-}
 
-// Start binding a contact (the messenger) as the control plane: prints a 6-digit
-// code to enter in the messenger Control Panel (out-of-band).
-async function cmdBindProxy(name: string, contact: string): Promise<void> {
-  if (!name || !contact) {
-    err('bind_proxy requires <connection-name> <contact-name-or-cid>.');
-    process.exit(1);
-  }
-  if (!(await portOpen(PORT))) {
-    err('daemon not running — start it first.');
-    process.exit(1);
-  }
-  const res = await fetch(`${BASE}/connections/${encodeURIComponent(name)}/bind`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contact }),
-  });
-  const body = (await res.json()) as { ok: boolean; code?: string; error?: string };
-  if (!body.ok || !body.code) {
-    err(`bind_proxy failed: ${body.error ?? `HTTP ${res.status}`}`);
-    process.exit(1);
-  }
-  out('');
-  out(`Verification code: ${body.code}`);
-  out('');
-  out('Enter it in the messenger Control Panel within 5 minutes (3 attempts).');
-  out('Do NOT send it over ours — it must travel out-of-band (this terminal counts).');
-}
 
 async function cmdRemoveConnection(name: string): Promise<void> {
   if (!name) {
@@ -475,16 +427,26 @@ async function cmdRemoveConnection(name: string): Promise<void> {
     process.exit(1);
   }
   if (!(await portOpen(PORT))) {
-    err('daemon not running — start it first to remove a live connection.');
+    err('connector not running — start it first to remove a live connection.');
     process.exit(1);
   }
   const res = await fetch(`${BASE}/connections/${encodeURIComponent(name)}`, { method: 'DELETE' });
-  const body = (await res.json()) as { ok: boolean; error?: string };
+  const body = (await res.json()) as {
+    ok: boolean;
+    removed?: string | null;
+    identityRemoved?: boolean;
+    identityLeftBehind?: boolean;
+    error?: string;
+  };
   if (!body.ok) {
-    err(`remove_connection failed: ${body.error ?? `HTTP ${res.status}`}`);
+    if (body.removed) {
+      err(`Removed connection "${body.removed}" locally, but its daemon identity was left behind: ${body.error ?? `HTTP ${res.status}`}`);
+    } else {
+      err(`remove_connection failed: ${body.error ?? `HTTP ${res.status}`}`);
+    }
     process.exit(1);
   }
-  out(`Removed connection "${name}" and its state.`);
+  out(`Removed connection "${name}", its state, and its name-listed daemon identity.`);
 }
 
 // ----- boot-persistent service (systemd / launchd) ----------------------------
@@ -508,14 +470,9 @@ function run(cmd: string, args: string[]): boolean {
 }
 
 // Env baked into the service definition so the daemon resolves the same config.
-function serviceEnv(): Record<string, string> {
-  return {
-    OURS_TG_BROKER_URL: CONFIG.brokerUrl,
-    OURS_TG_CONTROL_PORT: String(CONFIG.controlPort),
-    OURS_TG_STATE_DIR: STATE_DIR,
-    OURS_TG_POLL_TIMEOUT: String(CONFIG.pollTimeoutSec),
-  };
-}
+// An UNCHOSEN daemon selection produces no line at all — see service-definition.ts
+// for why an empty baked value is worse than an absent one.
+const serviceEnv = (): Record<string, string> => serviceEnvironment(CONFIG, STATE_DIR);
 
 function installSystemd(): void {
   const unitPath = systemdUnitPath();
@@ -577,31 +534,13 @@ function installLaunchd(): void {
   const plistPath = launchdPlistPath();
   fs.mkdirSync(dirname(plistPath), { recursive: true });
   const env = serviceEnv();
-  const envEntries = Object.entries(env)
-    .map(([k, v]) => `    <key>${k}</key><string>${v}</string>`)
-    .join('\n');
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${process.execPath}</string>
-    <string>${SELF}</string>
-    <string>serve</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-${envEntries}
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${LOG_PATH}</string>
-  <key>StandardErrorPath</key><string>${LOG_PATH}</string>
-</dict>
-</plist>
-`;
+  const plist = launchdPlist({
+    label: LAUNCHD_LABEL,
+    execPath: process.execPath,
+    self: SELF,
+    logPath: LOG_PATH,
+    env,
+  });
   fs.writeFileSync(plistPath, plist);
   out(`wrote ${plistPath}`);
 
@@ -664,22 +603,19 @@ function usage(): void {
   out('  list_connections     list configured routes grouped by bot');
   out('  remove_connection <name>   delete a route and its state');
   out('');
-  out('  control plane (ours messenger):');
-  out('  cp_invite <name>           print an invite to add the messenger as a contact');
-  out('  bind_proxy <name> <contact>  start binding the messenger as control plane (prints a 6-digit code)');
-  out('');
-  out('  start    start the daemon in the background');
-  out('  stop     stop the running daemon');
+  out('  start    start the connector in the background');
+  out('  stop     stop the running connector');
   out('  restart  stop then start');
-  out('  status   show whether the daemon is running');
-  out('  serve    run the daemon in the foreground (used by start; handy for debugging)');
+  out('  status   show whether the connector is running');
+  out('  serve    run the connector in the foreground (used by start; handy for debugging)');
   out('');
   out('  install-service    install + start a boot-persistent service (systemd/launchd)');
   out('  uninstall-service  stop + remove that service');
   out('');
   out('Config precedence (per field): env var > config.json > default.');
   out('  config.json: OURS_TG_CONFIG, else ~/.ours-telegram/config.json');
-  out('  env: OURS_TG_BROKER_URL, OURS_TG_CONTROL_PORT (3051), OURS_TG_STATE_DIR, OURS_TG_POLL_TIMEOUT (30)');
+  out('  env: OURS_TG_DAEMON_URL + OURS_TG_DAEMON_STATE_DIR (both, or neither), OURS_TG_CONTROL_PORT (3051),');
+  out('       OURS_TG_STATE_DIR, OURS_TG_POLL_TIMEOUT (30)');
 }
 
 async function main(): Promise<void> {
@@ -733,14 +669,6 @@ async function main(): Promise<void> {
     case 'remove-connection':
     case 'remove':
       await cmdRemoveConnection(process.argv[3]);
-      break;
-    case 'cp_invite':
-    case 'cp-invite':
-      await cmdCpInvite(process.argv[3]);
-      break;
-    case 'bind_proxy':
-    case 'bind-proxy':
-      await cmdBindProxy(process.argv[3], process.argv[4]);
       break;
     case 'start':
       await cmdStart();
