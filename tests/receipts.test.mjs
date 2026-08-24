@@ -56,10 +56,10 @@ console.log('=== Telegram reaction allowlist (validated BEFORE saving) ===');
   eq(canonicalReaction('not an emoji'), null, 'arbitrary text is rejected');
   eq(canonicalReaction(''), null, 'empty input is rejected');
 
-  // The spec's proposed read default is NOT on Telegram's bot list — the reason
-  // the connector ships 👌 instead. Pinned here so the substitution is visible.
+  // ✅ is not on Telegram's bot list, so the connector ships 👌 for read receipts.
+  // Pin both defaults here so that compatibility choice stays visible.
   eq(canonicalReaction('✅'), null, "✅ is NOT an allowed bot reaction (why the read default is 👌, not ✅)");
-  eq(DEFAULT_EMOJI_DELIVERED, '👀', 'delivered default is the spec\'s 👀');
+  eq(DEFAULT_EMOJI_DELIVERED, '👀', 'delivered default is 👀');
   assert(ALLOWED_REACTIONS.includes(DEFAULT_EMOJI_READ), 'the shipped read default is on the allowlist');
 }
 

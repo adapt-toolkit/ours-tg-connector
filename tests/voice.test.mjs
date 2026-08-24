@@ -1,31 +1,10 @@
 #!/usr/bin/env node
-// Live e2e for voice-note speech-to-text through the connector path. Mirrors
-// test-sendfile.mjs: one AdaptHost (in-process test broker), two packets that
-// become contacts — a "Connector" (the bot node) and an "Agent" (the proxy) —
-// then drives the REAL inbound forward logic and asserts what the Agent actually
-// receives (its get_messages envelope + get_files) for each Definition-of-Done
-// scenario (SPEC §8.1–8.6).
-//
-// This exercises the real src/stt.ts transcribe() and src/envelope.ts
-// buildEnvelope() over a real encrypted channel; only the STT provider HTTP call
-// and Telegram download are stubbed (globalThis.fetch / fixed bytes), so it needs
-// no Telegram bot and no real STT key. The send block below (forwardVoice) is a
-// faithful mirror of the STT + send-decision in connector.ts forwardToNode — the
-// `let transcription …` block through `buildEnvelope(m, sendAudio ? resolved : …,
-// fileWireId, transcription)`. The repo tests the wire path by driving packets
-// directly because connector.ts auto-runs main() on import, so forwardToNode
-// cannot be imported (see test-sendfile.mjs). If forwardToNode's STT/sendAudio
-// logic changes, update forwardVoice() below to match.
-//
-// REWRITTEN FOR THE DAEMON-ATTACHED CONNECTOR. It used to stand up an AdaptHost
-// and two packets in-process. There is no AdaptHost here any more — so it starts
-// a REAL DAEMON through the released operator CLI and drives two public SDK
-// clients against it, which is also closer to production than the old version.
-//
-// WHAT IT COVERS IS UNCHANGED AND IS STILL THIS REPO'S OWN CODE: src/stt.ts and
-// src/envelope.ts. Only the transport underneath moved. Deleting it with the
-// engine tests would have lost the coverage of the two files the conversion did
-// NOT touch.
+// End-to-end voice-note speech-to-text coverage for the daemon-attached connector.
+// The test starts a daemon through the released operator CLI, connects two public
+// SDK clients, and asserts the message envelope and file observed by the receiver.
+// Telegram download and the STT provider call are stubbed, so no bot or provider
+// key is required. The local forwardVoice helper mirrors connector.ts's
+// STT/send-audio decision because connector.ts starts main() when imported.
 //
 // Run: node_modules/.bin/tsx tests/voice.test.mjs  (it imports .ts sources directly)
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -157,8 +136,8 @@ async function main() {
   //    connector's `sttEnabled: false` no longer means "this audio is not sent to
   //    an STT provider". It means "the CONNECTOR does not send it"; the daemon
   //    may still, on the receiving side, under its own configuration. That is a
-  //    privacy-relevant behaviour change of the host->client conversion and it is
-  //    NOT something to fix by loosening an assertion.
+  //    privacy-relevant boundary between connector and daemon configuration and
+  //    is not something to hide by loosening an assertion.
   //
   // So the spy is scoped by ORIGIN, not by URL: `connectorSttInFlight` is set
   // only around the connector's own transcribe() call.
@@ -198,7 +177,7 @@ async function main() {
   const resolvedOk = { ok: true, bytes: opus };
 
   const realFetch = globalThis.fetch;
-  // Base config = spec defaults; each scenario overrides.
+  // Base config uses the documented defaults; each scenario overrides as needed.
   const baseCfg = {
     sttEnabled: false, sttApiKey: 'sk-dummy-test', sttBaseUrl: 'https://api.groq.com/openai/v1',
     sttModel: 'whisper-large-v3-turbo', sttLanguage: '', sttKinds: ['voice'],
@@ -206,41 +185,41 @@ async function main() {
   };
 
   try {
-    // DoD 1 + 2: transcript reaches agent as text; audio omitted by default.
-    console.log('\n-- DoD 1 & 2: transcribe, text-only (forwardVoiceAudio:false) --');
+    // Successful transcript reaches the agent as text; audio is omitted by default.
+    console.log('\n-- transcribe, text-only (forwardVoiceAudio:false) --');
     globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ text: 'ship it friday', language: 'en' }) });
     let r = await forwardVoice(connector, AGENT_NAME, voiceMsg(701), resolvedOk, { ...baseCfg, sttEnabled: true });
     let a = await drainAgent();
-    assert(a.env && a.env.text === 'ship it friday', 'DoD1: agent envelope text equals the spoken phrase');
-    assert(a.env && a.env.transcription?.status === 'ok' && a.env.transcription.engine === 'groq' && a.env.transcription.model === 'whisper-large-v3-turbo', 'DoD1: transcription block ok with engine + model');
-    assert(!r.sentFile && a.files.length === 0, 'DoD2: no send_file for the message');
-    assert(a.env && a.env.attachment === undefined, 'DoD2: envelope has no attachment block');
+    assert(a.env && a.env.text === 'ship it friday', 'agent envelope text equals the spoken phrase');
+    assert(a.env && a.env.transcription?.status === 'ok' && a.env.transcription.engine === 'groq' && a.env.transcription.model === 'whisper-large-v3-turbo', 'transcription block is ok with engine + model');
+    assert(!r.sentFile && a.files.length === 0, 'default text-only mode sends no file');
+    assert(a.env && a.env.attachment === undefined, 'default text-only envelope has no attachment block');
 
-    // DoD 3: forwardVoiceAudio:true → both send_file and attachment + transcription.
-    console.log('\n-- DoD 3: forwardVoiceAudio:true --');
+    // forwardVoiceAudio:true sends both the file and attachment + transcription metadata.
+    console.log('\n-- forwardVoiceAudio:true --');
     globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ text: 'hello there' }) });
     r = await forwardVoice(connector, AGENT_NAME, voiceMsg(702), resolvedOk, { ...baseCfg, sttEnabled: true, forwardVoiceAudio: true });
     a = await drainAgent();
-    assert(a.env && a.env.text === 'hello there', 'DoD3: text still folded in forward mode');
-    assert(r.sentFile && a.files.length === 1 && (await contentOf(a.files[0])).equals(opus), 'DoD3: audio also delivered via send_file (bytes intact)');
-    assert(a.env && a.env.attachment && a.env.attachment.wire_id && a.env.attachment.transport === 'send_file', 'DoD3: envelope carries the attachment block with a wire_id');
+    assert(a.env && a.env.text === 'hello there', 'text remains folded in forward mode');
+    assert(r.sentFile && a.files.length === 1 && (await contentOf(a.files[0])).equals(opus), 'audio is also delivered via send_file with bytes intact');
+    assert(a.env && a.env.attachment && a.env.attachment.wire_id && a.env.attachment.transport === 'send_file', 'envelope carries the attachment block with a wire_id');
     assert(a.files[0].filename === 'voice_702.ogg' && a.env.attachment.filename === a.files[0].filename,
-      'DoD3: send_file and envelope share the safe .ogg filename');
+      'send_file and envelope share the safe .ogg filename');
     assert(a.files[0].mime === VOICE_MESSAGE_MIME && a.env.attachment.mime === a.files[0].mime,
-      'DoD3: send_file and envelope share the exact ours-mcp voice MIME');
-    assert(a.env && a.env.transcription?.status === 'ok', 'DoD3: transcription block also present');
+      'send_file and envelope share the exact ours-mcp voice MIME');
+    assert(a.env && a.env.transcription?.status === 'ok', 'transcription block is also present');
 
-    // DoD 4: graceful failure on invalid key / provider error → .ogg forwarded, status:error.
-    console.log('\n-- DoD 4: STT failure (HTTP 401) degrades to file forward --');
+    // Provider failure degrades gracefully to .ogg forwarding with status:error.
+    console.log('\n-- STT failure (HTTP 401) degrades to file forward --');
     globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => 'invalid api key' });
     r = await forwardVoice(connector, AGENT_NAME, voiceMsg(703), resolvedOk, { ...baseCfg, sttEnabled: true, sttApiKey: 'sk-bad' });
     a = await drainAgent();
-    assert(r.sentFile && a.files.length === 1, 'DoD4: .ogg still delivered on STT failure');
-    assert(a.env && a.env.transcription?.status === 'error' && /401/.test(a.env.transcription.error), 'DoD4: transcription.status:error captured');
-    assert(a.env && a.env.text === '', 'DoD4: text stays empty (nothing dropped)');
-    assert(a.env && a.env.attachment && a.env.attachment.wire_id, 'DoD4: attachment block announces the forwarded audio');
+    assert(r.sentFile && a.files.length === 1, '.ogg is still delivered on STT failure');
+    assert(a.env && a.env.transcription?.status === 'error' && /401/.test(a.env.transcription.error), 'transcription.status:error captures the provider failure');
+    assert(a.env && a.env.text === '', 'text stays empty when no transcript is available');
+    assert(a.env && a.env.attachment && a.env.attachment.wire_id, 'attachment block announces the forwarded audio');
     assert(a.files[0].mime === VOICE_MESSAGE_MIME && a.env.attachment.mime === VOICE_MESSAGE_MIME,
-      'DoD4: STT failure fallback remains recognizable as a voice message');
+      'STT failure fallback remains recognizable as a voice message');
 
     // Enabled STT with no local/provider key is another graceful fallback: the
     // STT client short-circuits and the original bytes remain available.
@@ -256,32 +235,32 @@ async function main() {
     assert(r.sentFile && (await contentOf(a.files[0])).equals(opus) && a.files[0].mime === VOICE_MESSAGE_MIME,
       'missing local STT credential forwards unchanged marked OGG/Opus bytes');
 
-    // DoD 6: size guard — bytes over sttMaxBytes skip STT, forward the .ogg.
-    console.log('\n-- DoD 6: size guard (over sttMaxBytes) --');
+    // Size guard: bytes over sttMaxBytes skip STT and forward the .ogg.
+    console.log('\n-- size guard (over sttMaxBytes) --');
     const spySize = sttSpy(() => ({ ok: true, status: 200, json: async () => ({ text: 'should not run' }) }));
     r = await forwardVoice(connector, AGENT_NAME, voiceMsg(704), resolvedOk, { ...baseCfg, sttEnabled: true, sttMaxBytes: 100 });
     a = await drainAgent();
     spySize.restore();
-    assert(!spySize.was(), 'DoD6: STT endpoint not called when over the size guard');
-    assert(a.env && a.env.transcription?.status === 'error' && a.env.transcription.error === 'too_large', 'DoD6: transcription.status:error error:too_large');
-    assert(r.sentFile && a.files.length === 1, 'DoD6: .ogg forwarded despite skipped STT');
+    assert(!spySize.was(), 'STT endpoint is not called when over the size guard');
+    assert(a.env && a.env.transcription?.status === 'error' && a.env.transcription.error === 'too_large', 'size guard reports transcription.status:error error:too_large');
+    assert(r.sentFile && a.files.length === 1, '.ogg is forwarded despite skipped STT');
     assert(a.files[0].mime === VOICE_MESSAGE_MIME && a.env.attachment.mime === VOICE_MESSAGE_MIME,
-      'DoD6: oversized-for-STT fallback carries the exact voice MIME');
+      'oversized-for-STT fallback carries the exact voice MIME');
 
-    // DoD 5: sttEnabled:false → file + text:'' + attachment, no transcription.
-    console.log('\n-- DoD 5: sttEnabled:false ⇒ marked file fallback --');
+    // sttEnabled:false yields a file + empty text + attachment, with no transcription.
+    console.log('\n-- sttEnabled:false ⇒ marked file fallback --');
     const spyOff = sttSpy(() => ({ ok: true, status: 200, json: async () => ({ text: 'x' }) }));
     r = await forwardVoice(connector, AGENT_NAME, voiceMsg(705), resolvedOk, { ...baseCfg, sttEnabled: false });
     a = await drainAgent();
     spyOff.restore();
-    assert(!spyOff.was(), 'DoD5: no STT call when disabled');
-    assert(a.env && a.env.text === '' && a.env.transcription === undefined, 'DoD5: text:"" and NO transcription field');
+    assert(!spyOff.was(), 'no STT call is made when disabled');
+    assert(a.env && a.env.text === '' && a.env.transcription === undefined, 'disabled STT yields text:"" and no transcription field');
     assert(r.sentFile && a.files.length === 1 && a.env.attachment && a.env.attachment.wire_id,
-      'DoD5: .ogg forwarded with a correlated attachment block');
+      '.ogg is forwarded with a correlated attachment block');
     assert((await contentOf(a.files[0])).equals(opus) && a.files[0].mime === VOICE_MESSAGE_MIME,
-      'DoD5: disabled STT forwards unchanged bytes with the exact voice MIME');
+      'disabled STT forwards unchanged bytes with the exact voice MIME');
     assert(a.env.attachment.mime === a.files[0].mime && a.env.attachment.filename === a.files[0].filename,
-      'DoD5: disabled-STT file and envelope metadata correlate exactly');
+      'disabled-STT file and envelope metadata correlate exactly');
 
     // Semantic kind is the source of truth. A normal audio attachment can also
     // be OGG, but must not opt into ours-mcp voice-message handling.

@@ -2,15 +2,11 @@
 // per-connection settings and the chat commands that drive them. Pure (no
 // network, no disk, no ADAPT) — see tests/receipts.test.mjs.
 //
-// WHERE THE RECEIPTS COME FROM. Core 0.7.0 owns the mechanism; the connector only
-// consumes it. `::a2a_messaging::receive_receipt` ingests a peer's confirmation and
-// fires the `on_receipt_received($sender_id, $kind, $wire_ids, $date)` hook
-// (mufl_code/core/a2a_messaging.mm:499-506), which actor.mu forwards to the daemon
-// as a `receipt_received` notify. Nothing here invents an ordering: the hook's
-// contract is MONOTONIC per (peer, wire_id) over unknown < sent < delivered <
-// read, and duplicates / out-of-order arrivals collapse to no-ops. RECEIPT_RANK +
-// isReceiptUpgrade below are exactly that rule, applied to the stored row so the
-// reaction we already put on the message is never walked backwards.
+// WHERE THE RECEIPTS COME FROM. The daemon owns receipt transport; the connector
+// consumes its receipt events and durable history. Receipt state is MONOTONIC per
+// (peer, wire_id) over unknown < sent < delivered < read, so duplicate and
+// out-of-order arrivals collapse to no-ops. RECEIPT_RANK + isReceiptUpgrade below
+// apply that rule to the stored row so a reaction is never walked backwards.
 //
 // WHY "read REPLACES delivered". A bot holds AT MOST ONE reaction per message
 // (setMessageReaction with a single-element list; multiple reactions are a premium
@@ -50,9 +46,7 @@ export function canonicalReaction(input: string): string | null {
   return ALLOWED_INDEX.get(normalizeEmoji(input)) ?? null;
 }
 
-// Defaults. Delivered is the spec's 👀.
-//
-// READ IS 👌, NOT THE SPEC'S ✅ — DELIBERATE. ✅ (U+2705) is not in Telegram's
+// Defaults. READ IS 👌, NOT ✅: U+2705 is not in Telegram's
 // bot-reaction list above, so setMessageReaction would refuse it on every single
 // read receipt: the owner would see no read marker and only a log line saying so.
 // 👌 ("got it") is in the list and carries the same meaning. Configurable either

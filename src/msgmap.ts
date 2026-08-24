@@ -1,6 +1,6 @@
 // The ours wire_id ⇄ Telegram message map, and the per-contact receipt settings
 // that ride alongside it. One file per route, so it survives a daemon restart
-// (the acceptance criterion) and disappears with the route.
+// and disappears with the route.
 //
 // TWO CONSUMERS, ONE TABLE:
 //   • reply threading — an inbound Telegram message is sent to the agent as
@@ -10,11 +10,9 @@
 //   • receipts — a delivered/read receipt for wire_id W is turned into a reaction
 //     on exactly the Telegram message that produced W.
 //
-// SHAPE. The spec asked for two SQL tables (tg_message_map, tg_connection_settings).
-// This repo has no database dependency and persists everything as per-route JSON
-// (connection.json, ../bots.json), so the same two relations are one JSON document
-// with the same columns. Nothing about the design needs a query engine: both
-// lookups are by primary key.
+// STORAGE SHAPE. This repo has no database dependency and persists route state as
+// JSON (connection.json, ../bots.json), so message rows and connection settings
+// share one JSON document. Both lookups are by primary key and need no query engine.
 //
 // RETENTION. Rows older than RETENTION_DAYS are dropped, and the table is capped
 // at MAX_ROWS (oldest first). Past that horizon an agent's reply arrives as a plain
@@ -34,7 +32,7 @@ import {
 } from './receipts';
 
 export const RETENTION_DAYS = 30;
-// Both directions are recorded (the spec's `direction` column), so the cap is set
+// Both directions are recorded, so the cap is set
 // to leave the inbound half — the one reply threading and receipts actually read —
 // the room it would have had on its own.
 export const MAX_ROWS = 4000;

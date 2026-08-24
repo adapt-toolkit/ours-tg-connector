@@ -484,8 +484,8 @@ export class TelegramClient {
   }
 
   // Deliver a file to a chat as a document — preserves the original filename and
-  // works for any media type (photos arrive uncompressed; see design D3/OQ4 for
-  // per-type rendering). Optionally into a forum topic. Multipart/form-data, so
+  // works for any media type; photos arrive uncompressed. Optionally sends into
+  // a forum topic. Multipart/form-data, so
   // we let fetch set the Content-Type boundary (do not set it ourselves).
   async sendDocument(
     chatId: number | string,
