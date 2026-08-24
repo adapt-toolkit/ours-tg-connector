@@ -210,7 +210,7 @@ console.log('\n=== telegram.ts wiring: message text arrives as Markdown ===');
 
 console.log('\n=== acceptance: Telegram → agent → Telegram round-trip ===');
 {
-  // Each cell is one formatting kind the spec names: it goes in as Telegram
+  // Each cell is one supported formatting kind: it goes in as Telegram
   // entities, is read by the agent as Markdown, and comes back out as the
   // MarkdownV2 that reproduces the SAME formatting. Nothing may be lost.
   const cells = [
@@ -230,8 +230,7 @@ console.log('\n=== acceptance: Telegram → agent → Telegram round-trip ===');
     eq(toMarkdownV2(asAgentSees), mdv2, `${name}: agent Markdown → Telegram MarkdownV2`);
   }
 
-  // The spec's other acceptance line: reserved punctuation and a non-BMP emoji
-  // survive the outbound leg intact.
+  // Reserved punctuation and a non-BMP emoji survive the outbound leg intact.
   const hairy = 'Ready. Step-1! 100% 🎉 (see notes)';
   const rendered = toMarkdownV2(hairy);
   eq(rendered, 'Ready\\. Step\\-1\\! 100% 🎉 \\(see notes\\)', 'dots, hyphens, bangs and parens escaped; emoji untouched');

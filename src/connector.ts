@@ -131,7 +131,7 @@ interface ConnectionFile {
   // This route's daemon lease token. PERSISTED ON PURPOSE: the token IS the
   // session, so regenerating it on every boot would make the daemon's lease table
   // see a brand-new client each time and the route would have to re-bind rather
-  // than resume. Absent in routes created before the SDK conversion — those get
+  // than resume. Legacy routes without this field get
   // one minted on first restore, which re-binds once and then stays stable.
   leaseToken?: string;
   createdAt: string;
@@ -200,8 +200,8 @@ function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bo
 // refuses an incoherent combination BEFORE reading a token or opening a socket —
 // selecting an endpoint while the state directory stays defaulted would otherwise
 // read the live ~/.ours token and send it wherever the endpoint points. That is a
-// reproduced credential-disclosure bug (ours-sdk 43ca743), and a second
-// implementation here is exactly how it would come back.
+// a local token and send it to an operator-selected endpoint. Keeping this
+// resolution in the SDK prevents divergent credential-handling implementations.
 let daemon: ResolvedDaemonConfig | null = null;
 // A one-shot view of the daemon's GLOBAL identity names. It is used only to
 // report the connector-owned subset at boot; chooseIdentity remains the
@@ -622,7 +622,7 @@ async function forwardToNode(conn: Connection, m: TelegramMessage): Promise<void
       }
     }
     // Omit `resolved` from the envelope when we are not announcing the audio, so
-    // no attachment block is emitted for a text-only transcript (SPEC §4.5).
+    // no attachment block is emitted for a text-only transcript.
     const body = cfg.payloadMode === 'plain'
       ? buildPlainPayload(m, resolved, fileWireId, transcription)
       : buildEnvelope(m, sendAudio ? resolved : undefined, fileWireId, transcription);
@@ -969,12 +969,12 @@ async function restoreConnection(name: string): Promise<void> {
   const cfg = readMeta(dir);
   const bot = bots.get(cfg.botName);
   if (!bot) throw new Error(`route "${name}" references unknown bot "${cfg.botName}"`);
-  // A route created before the SDK conversion has no lease token. Mint one and
-  // persist it: it re-binds once here and is stable from then on.
+  // A legacy route may have no lease token. Mint and persist one so it re-binds
+  // once here and remains stable on later starts.
   if (!cfg.leaseToken) {
     cfg.leaseToken = randomBytes(24).toString('hex');
     writeMeta(dir, cfg);
-    log(`[${name}] minted a lease token (route predates the daemon-attach conversion)`);
+    log(`[${name}] minted a lease token for a legacy route`);
   }
   const client = await clientFor(cfg);
   const conn = makeConnection(client, dir, cfg, bot);

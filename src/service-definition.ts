@@ -1,9 +1,8 @@
 // What gets BAKED into the connector's service definition.
 //
-// Lives here rather than inline in cli.ts for the same reason ours-mcp keeps
-// buildSystemdUnit in its own module: cli.ts runs `main()` on import, so nothing
-// inside it can be exercised by a test, and the baked environment is precisely
-// the part that decides which daemon this connector attaches to after a reboot.
+// This lives outside cli.ts because cli.ts runs `main()` on import and cannot be
+// safely imported by unit tests. The baked environment decides which daemon the
+// connector attaches to after a reboot and therefore needs direct coverage.
 //
 // THE RULE, and it is the whole reason this file exists: a value the operator has
 // NOT chosen must produce NO LINE AT ALL.
@@ -22,9 +21,7 @@
 // daemon selection: refusing would turn a silent misconfiguration into a hard
 // failure for deployments that currently work on the default selection by
 // accident. Omission gives the config file back its authority without breaking
-// anyone. (ours-cowork's serviceEnvironment already omits absent daemon fields
-// the same way, and @ours.network/cli declines to bake OURS_PORT for the same
-// reason: a baked value silently outranks a later edit.)
+// those deployments: a baked value would silently outrank a later config edit.
 
 import type { ConnectorConfig } from './config';
 

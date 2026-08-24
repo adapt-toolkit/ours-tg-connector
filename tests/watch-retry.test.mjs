@@ -2,9 +2,7 @@
 //
 // The notification watch must survive a transient daemon failure.
 //
-// This is the client-side half of the conversion's one real availability
-// regression: as a host, route events came from in-process packet callbacks,
-// which cannot stop. As a client they come from a long poll, and the SDK's
+// Route events arrive through a long poll, and the SDK's
 // `watchNotifications` throws out of `for await` on any fetch failure or
 // daemon-side error. A watch that gave up there would leave the route READING
 // Telegram (the bot poll has its own backoff) and never ANSWERING it.

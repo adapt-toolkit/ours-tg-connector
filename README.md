@@ -411,7 +411,8 @@ tokens, so do not expose the control port off-host.
 The connector used to be a **managed node**: it advertised an app manifest
 (`network.ours.telegram-connector`) and the ours messenger could bind to it over
 the a2a_control channel and edit the allowed chat id and denial message live.
-That is gone — messenger manageability was removed by ruling, and with it the
+That was removed when the connector moved to the shared-daemon client model,
+along with the
 `cp_invite` and `bind_proxy` commands, the `get_manifest` / `get_config` /
 `set_config` verbs, and the bind ceremony.
 

@@ -12,9 +12,8 @@ export interface ConnectorConfig {
   // WHICH OURS DAEMON TO ATTACH TO. Both are OPTIONAL and both are passed
   // straight to the SDK's resolveDaemonConfig, which owns precedence, source
   // tracking and the coherence refusal. Setting daemonUrl WITHOUT daemonStateDir
-  // is refused by that resolver before any credential is read — that is the
-  // reproduced credential-disclosure case (ours-sdk 43ca743), and it is refused
-  // there rather than here so there is exactly one implementation of the rule.
+  // is refused by that resolver before any credential is read. The SDK owns
+  // this check so daemon selection has one authoritative implementation.
   // SDK 2 also rejects legacy OURS_INSTANCE and ignores OURS_AUTOSTART/autoStart:
   // the connector always attaches and never starts or embeds a daemon.
   daemonUrl: string;      // '' => the SDK's default selection
@@ -28,7 +27,7 @@ export interface ConnectorConfig {
   tgConnectTimeoutMs: number;  // bound a stalled connect (fail fast, not ~30s)
   tgFetchRetries: number;      // transient-error retries for transactional calls
   tgFetchRetryBaseMs: number;  // base backoff between those retries (ms)
-  attachmentMaxBytes: number; // max media size forwarded inline (base64) before degrading to a metadata-only stub
+  attachmentMaxBytes: number; // max inbound media size sent through the file channel before metadata-only degradation
   outboundFileMaxBytes: number; // max size of a received file we will upload to Telegram (bot upload limit is 50 MB)
   // Speech-to-text for inbound voice notes (opt-in).
   //

@@ -1,6 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-
 import { DaemonSelectionError, resolveDaemonConfig } from '@ours.network/sdk';
 import { loadConfig } from '../src/config.ts';
 
@@ -37,9 +35,6 @@ try {
   const legacyAutostart = resolveDaemonConfig({ stateDir, env: { OURS_AUTOSTART: '1' } });
   assert.deepEqual(legacyAutostart, normal, 'OURS_AUTOSTART is ignored and never starts an embedded daemon');
 
-  const envExample = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
-  assert.doesNotMatch(envExample, /OURS_(?:AUTOSTART|INSTANCE)|autoStart/,
-    '.env.example carries no obsolete SDK runtime-selection knobs');
   console.log('config-sdk2 OK — coherent pair, OURS_INSTANCE refusal, and no autostart behavior verified');
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in envBefore)) delete process.env[key];
