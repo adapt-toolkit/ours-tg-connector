@@ -1028,7 +1028,7 @@ async function releaseRoute(conn: Connection, terminal = false): Promise<void> {
   try {
     const result = await conn.client.releaseLease();
     if (result.failed > 0) throw new Error('daemon lease cleanup incomplete');
-    if (terminal) {
+    if (terminal || daemonSelectionOptions().sessionMode === 'external') {
       // Only acknowledged terminal release permits a new owner on next boot.
       // An ack/write crash retains the retired ID and fails closed on restore.
       delete conn.cfg.leaseToken;
