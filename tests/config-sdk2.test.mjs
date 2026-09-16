@@ -10,7 +10,11 @@ try {
   process.env.OURS_TG_CONFIG = '/tmp/ours-tg-config-that-does-not-exist.json';
   process.env.OURS_TG_DAEMON_URL = endpoint;
   delete process.env.OURS_TG_DAEMON_STATE_DIR;
+  process.env.OURS_TG_DAEMON_ID = '12345678-1234-1234-1234-123456789abc';
+  process.env.OURS_TG_DAEMON_CREDENTIAL_PATH = '/tmp/ours-current-token';
   const half = loadConfig();
+  assert.equal(half.daemonInstanceId, process.env.OURS_TG_DAEMON_ID);
+  assert.equal(half.daemonCredentialPath, '/tmp/ours-current-token');
   assert.equal(half.daemonUrl, endpoint);
   assert.equal(half.daemonStateDir, '');
   assert.throws(

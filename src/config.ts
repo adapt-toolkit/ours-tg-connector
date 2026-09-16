@@ -9,15 +9,12 @@ import { homedir } from 'node:os';
 import { resolve, join, dirname } from 'node:path';
 
 export interface ConnectorConfig {
-  // WHICH OURS DAEMON TO ATTACH TO. Both are OPTIONAL and both are passed
-  // straight to the SDK's resolveDaemonConfig, which owns precedence, source
-  // tracking and the coherence refusal. Setting daemonUrl WITHOUT daemonStateDir
-  // is refused by that resolver before any credential is read. The SDK owns
-  // this check so daemon selection has one authoritative implementation.
-  // SDK 2 also rejects legacy OURS_INSTANCE and ignores OURS_AUTOSTART/autoStart:
-  // the connector always attaches and never starts or embeds a daemon.
-  daemonUrl: string;      // '' => the SDK's default selection
-  daemonStateDir: string; // '' => the SDK's default selection
+  // Explicit V1 selection uses URL + daemon UUID + protected current-token path.
+  // Without the V1 fields, the SDK retains its temporary legacy URL/state-dir selection.
+  daemonUrl: string;
+  daemonStateDir: string;
+  daemonInstanceId: string;
+  daemonCredentialPath: string;
   controlPort: number; // localhost JSON control API (add/list/remove connections)
   stateDir: string;    // this connector's OWN config dir (bots.json + one subdir per route)
   pollTimeoutSec: number; // Telegram long-poll timeout per getUpdates call
@@ -50,6 +47,8 @@ export interface ConnectorConfig {
 export const DEFAULT_CONFIG: ConnectorConfig = {
   daemonUrl: '',
   daemonStateDir: '',
+  daemonInstanceId: '',
+  daemonCredentialPath: '',
   controlPort: 3051,
   stateDir: resolve(homedir(), '.ours-telegram'),
   pollTimeoutSec: 30,
@@ -88,6 +87,8 @@ function readFileConfig(): Partial<ConnectorConfig> {
     return {};
   }
   const out: Partial<ConnectorConfig> = {};
+  if (typeof parsed.daemonInstanceId === 'string') out.daemonInstanceId = parsed.daemonInstanceId;
+  if (typeof parsed.daemonCredentialPath === 'string') out.daemonCredentialPath = parsed.daemonCredentialPath;
   if (typeof parsed.daemonUrl === 'string') out.daemonUrl = parsed.daemonUrl;
   if (typeof parsed.daemonStateDir === 'string') out.daemonStateDir = resolve(parsed.daemonStateDir);
   if (typeof parsed.controlPort === 'number' && Number.isFinite(parsed.controlPort)) out.controlPort = parsed.controlPort;
@@ -144,6 +145,8 @@ export function loadConfig(): ConnectorConfig {
     // rather than half-honoured.
     daemonUrl: process.env.OURS_TG_DAEMON_URL ?? file.daemonUrl ?? DEFAULT_CONFIG.daemonUrl,
     daemonStateDir: process.env.OURS_TG_DAEMON_STATE_DIR ?? file.daemonStateDir ?? DEFAULT_CONFIG.daemonStateDir,
+    daemonInstanceId: process.env.OURS_TG_DAEMON_ID ?? file.daemonInstanceId ?? DEFAULT_CONFIG.daemonInstanceId,
+    daemonCredentialPath: process.env.OURS_TG_DAEMON_CREDENTIAL_PATH ?? file.daemonCredentialPath ?? DEFAULT_CONFIG.daemonCredentialPath,
     controlPort: envInt('OURS_TG_CONTROL_PORT') ?? file.controlPort ?? DEFAULT_CONFIG.controlPort,
     stateDir: resolve(process.env.OURS_TG_STATE_DIR ?? file.stateDir ?? DEFAULT_CONFIG.stateDir),
     pollTimeoutSec: envInt('OURS_TG_POLL_TIMEOUT') ?? file.pollTimeoutSec ?? DEFAULT_CONFIG.pollTimeoutSec,

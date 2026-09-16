@@ -361,8 +361,8 @@ topic within that chat. `--bio` is the context the agent reads about this chat
 route for any chat the bot sees that no other route claims. Reuse the same `--bot`
 across routes to multiplex one bot over many chats/topics.
 
-`remove_connection` releases that route's daemon lease, then removes the daemon
-identity by its recorded route name and deletes the local route record. Because
+`remove_connection` stops and awaits that route’s active work, removes the daemon
+identity by its recorded route name, terminally releases its owner, and deletes the local route record. Because
 the ownership list is intentionally name-only, an operator who manually removes
 and recreates a same-name identity has deliberately replaced it; removing the
 route can remove that replacement too. Use the `ours` operator CLI to repair
@@ -376,7 +376,9 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | field          | env var                   | default                                         |
 |----------------|---------------------------|-------------------------------------------------|
 | daemon URL     | `OURS_TG_DAEMON_URL`   | `''` (the SDK's own default selection) |
-| daemon state dir | `OURS_TG_DAEMON_STATE_DIR` | `''` (the SDK's own default selection) |
+| daemon UUID (`daemonInstanceId`) | `OURS_TG_DAEMON_ID` | unset |
+| current credential file (`daemonCredentialPath`) | `OURS_TG_DAEMON_CREDENTIAL_PATH` | unset |
+| daemon state dir (temporary legacy) | `OURS_TG_DAEMON_STATE_DIR` | `''` (the SDK's own default selection) |
 | control port   | `OURS_TG_CONTROL_PORT` | `3051` (localhost only)                         |
 | state dir      | `OURS_TG_STATE_DIR`    | `~/.ours-telegram`                            |
 | poll timeout   | `OURS_TG_POLL_TIMEOUT` | `30` (seconds, Telegram long-poll)              |
@@ -396,12 +398,31 @@ Precedence per field: **env var > `config.json` > default**. The config file is
 | STT timeout    | `OURS_TG_STT_TIMEOUT_MS`  | `60000` (per-transcription abort deadline, ms) |
 | forward voice audio | `OURS_TG_FORWARD_VOICE_AUDIO` | `false` (also `send_file` the `.ogg` alongside a successful transcript) |
 
-`OURS_TG_DAEMON_URL` and `OURS_TG_DAEMON_STATE_DIR` are a coherent pair: set
-both or neither. SDK 2 refuses an explicitly selected endpoint without its state
-directory before reading a daemon token. Legacy `OURS_INSTANCE` is rejected, and
-`OURS_AUTOSTART`/`autoStart` are ignored. This connector never embeds or starts an
-ours daemon; operate the shared daemon separately with `ours daemon start` or
-`ours daemon install-service`.
+For V1, set `OURS_TG_DAEMON_URL` to the daemon’s HTTP origin,
+`OURS_TG_DAEMON_ID` to its configured lowercase UUID, and
+`OURS_TG_DAEMON_CREDENTIAL_PATH` to its protected absolute current-token file.
+Equivalent config fields are `daemonUrl`, `daemonInstanceId`, and
+`daemonCredentialPath`. The SDK verifies public daemon identity/capability metadata
+before reading the credential. HTTP identity selection is not cryptographic server
+proof. The SDK rereads the protected file for requests, so atomic token replacement
+does not require restarting the connector. Service installation carries these
+non-secret selection values and paths; do not put the token bytes in configuration.
+
+Each route uses its own persisted owner ID. Watch retries and daemon restart retain
+that ID and never terminally release ownership. SIGINT/SIGTERM stop and await bot
+polling, watches and route work before releasing each owner; permanent route
+identities and siblings remain. A successful terminal release clears the persisted
+owner ID, and the next normal connector start creates a fresh owner. Failed release
+retains the exact ID and reports failed shutdown. A crash between daemon release
+acknowledgement and metadata persistence can leave a retired ID on disk; restoration
+then refuses rather than taking over automatically. Repair that residual explicitly.
+
+Temporary legacy selection remains available without the V1 fields:
+`OURS_TG_DAEMON_URL` and `OURS_TG_DAEMON_STATE_DIR` must be set together or both
+omitted. Failed V1 selection/API requests never fall back to it. Legacy
+`OURS_INSTANCE` is rejected, and `OURS_AUTOSTART`/`autoStart` are ignored.
+This connector never embeds or starts an ours daemon; operate it separately with
+`ours daemon start` or `ours daemon install-service`.
 
 The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
 tokens, so do not expose the control port off-host.
@@ -459,3 +480,56 @@ The FSL permits any use **except a Competing Use** — broadly, offering a comme
 **Audit status.** The core has not yet had an independent security audit. We're raising funding to commission one from a recognized firm and prove these guarantees, and we'll open-source the full core once it passes. Until then it's source-available and documented, but not independently audited — run anything critical on it at your own risk.
 
 Copyright 2026 Adapt Framework Solutions Ltd.
+
+## Container lifecycle verification
+
+After building with the selected SDK/CLI artifacts installed, run
+`npm run test:v1-lifecycle` inside an isolated Docker container with external
+networking disabled. The existing test uses temporary daemon/connector state
+and blocks Telegram transport through its shipped test fixture. It checks
+lifecycle and token recovery, not real Telegram delivery; no working bot token
+or account is needed. Real bot/chat acceptance remains a separate check.
+
+## Optional startup provisioning
+
+Host and container installations can place a private `provision.json` in
+`OURS_TG_STATE_DIR` (the configured state directory). Without this file, startup
+retains the normal CLI/control-API workflow and needs no Docker installation.
+
+```json
+{
+  "bots": [{"name": "primary", "botToken": "<bot-token>"}],
+  "connections": [{"name": "alerts", "botName": "primary", "chatId": "<chat-id>", "payloadMode": "plain"}]
+}
+```
+
+Use mode `0600` and ownership matching the connector. Optional connection fields
+are `threadId`, `label`, `bio` and `payloadMode` (default `envelope`). Startup
+applies the document before readiness. Identical settings are a no-op; conflicting
+existing settings cause startup to fail without overwriting those entries. Bot
+tokens are compared in full. Newly created connection results, including invites,
+are retained privately in `provision-output.json`. Partial successful additions
+remain available for a subsequent retry; this is not a transactional batch.
+Change existing settings using the normal connector tools.
+
+### Build with selected SDK and CLI archives
+
+Run in the build container with Node 22+, npm and tar available:
+
+```sh
+node scripts/build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz --out-dir /artifacts/consumer
+```
+
+The recipe validates package names, installs and builds in disposable staging,
+then writes one complete portable npm archive. Stdout is a JSON object with its
+actual `filename`; build/npm logs go to stderr. Normal source manifests, locks
+and installed dependencies are preserved. The installer must install the same
+selected SDK and CLI archives alongside this package; its final dependency
+versions come from those archives. Existing bundling choices are unchanged.
+
+Focused build/install verification (two real builds, including changed bytes
+under identical input names and versions, plus a missing-vendor negative check):
+
+```sh
+node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz
+```

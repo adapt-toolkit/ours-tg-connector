@@ -47,7 +47,14 @@ export interface WatchRetryOptions {
   sleep?: Sleep;
 }
 
-const defaultSleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+    if (signal.aborted) done();
+  });
+}
 
 /**
  * Consume `open()` forever, re-opening it after a failure with capped
@@ -62,7 +69,7 @@ export async function watchWithRetry(
 ): Promise<void> {
   const baseMs = opts.baseMs ?? 1_000;
   const maxMs = opts.maxMs ?? 30_000;
-  const sleep = opts.sleep ?? defaultSleep;
+  const sleep = opts.sleep ?? ((ms: number) => defaultSleep(ms, opts.signal));
   let delay = baseMs;
   let attached = false;
 

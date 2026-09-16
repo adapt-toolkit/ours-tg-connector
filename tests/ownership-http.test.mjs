@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,6 +17,7 @@ const controlPort = await freePort();
 const fakeUrl = `http://127.0.0.1:${fakePort}`;
 const controlUrl = `http://127.0.0.1:${controlPort}`;
 const calls = [];
+const releaseFailure = process.argv.includes('--release-failure');
 
 const routeRecords = [
   ['RestoredRoute', '101', 'lease-restored'],
@@ -70,6 +71,9 @@ const fakeDaemon = createServer(async (req, res) => {
       return json(res, 400, { error: { code: 'BOUND_ELSEWHERE', message: 'identity is held by another live session' } });
     }
     return json(res, 200, { name: args.name, cid: route.padEnd(64, 'A').slice(0, 64), switchedFrom: null });
+  }
+  if (op === 'releaseLease' && releaseFailure && route === 'SnapshotMissing') {
+    return json(res, 403, { error: { code: 'UNAUTHORIZED', message: 'fixture release rejected' } });
   }
   if (op === 'releaseLease') return json(res, 200, { released: route ? [route] : [] });
   if (op === 'removeIdentity') {
@@ -144,6 +148,9 @@ try {
   }
   assert.equal(healthBody?.connections, 3, `expected three restored siblings:\n${output}`);
 
+  const listing=await (await fetch(`${controlUrl}/connections`)).json();
+  assert.deepEqual(listing.connections.map(c=>c.name).sort(),['RemoveFails','RestoredRoute','SnapshotMissing'], 'connection listing must await route descriptions');
+
   assert.equal(calls.filter((call) => call.op === 'globalIdentities').length, 1,
     'connector takes exactly one daemon-global GET /identities snapshot');
   assert.match(output, /daemon inventory includes connector routes:/);
@@ -172,8 +179,8 @@ try {
   const restoredResponse = await fetch(`${controlUrl}/connections/RestoredRoute`, { method: 'DELETE' });
   assert.equal(restoredResponse.status, 200, JSON.stringify(await restoredResponse.json()));
   const restoredOps = calls.filter((call) => call.route === 'RestoredRoute').map((call) => call.op);
-  assert.ok(restoredOps.lastIndexOf('releaseLease') < restoredOps.lastIndexOf('removeIdentity'),
-    'owned-name removal releases the exact route lease before removeIdentity');
+  assert.ok(restoredOps.lastIndexOf('removeIdentity') < restoredOps.lastIndexOf('releaseLease'),
+    'owned-name removal deletes identity before terminal owner retirement');
 
   const failedResponse = await fetch(`${controlUrl}/connections/RemoveFails`, { method: 'DELETE' });
   const failed = await failedResponse.json();
@@ -198,6 +205,8 @@ try {
   if (!exited) {
     connector.kill('SIGTERM');
     await Promise.race([exit, sleep(10_000)]);
+    assert.equal(exited?.code,releaseFailure ? 1 : 0,'SIGTERM reports acknowledged versus failed terminal cleanup');
+    assert.equal(JSON.parse(readFileSync(join(TG_STATE,'SnapshotMissing','connection.json'),'utf8')).leaseToken,releaseFailure ? 'lease-snapshot-missing' : undefined,'only acknowledged shutdown clears owner for next process lifetime');
   }
   await new Promise((resolveClose) => fakeDaemon.close(resolveClose));
   rmSync(TG_STATE, { recursive: true, force: true });

@@ -21,7 +21,8 @@
 // Config precedence per field: env var > config.json (OURS_TG_CONFIG, else
 // ~/.ours-telegram/config.json) > default:
 //   OURS_TG_DAEMON_URL       the ours daemon to attach to (default: the SDK's selection)
-//   OURS_TG_DAEMON_STATE_DIR its state directory — REQUIRED alongside a URL, see config.ts
+//   OURS_TG_DAEMON_ID configured daemon UUID; OURS_TG_DAEMON_CREDENTIAL_PATH protected token file
+//   OURS_TG_DAEMON_STATE_DIR temporary legacy state-path selection, see config.ts
 //   OURS_TG_CONTROL_PORT  localhost control API port (default 3051)
 //   OURS_TG_STATE_DIR     state + pid/log dir (default ~/.ours-telegram)
 //   OURS_TG_POLL_TIMEOUT  Telegram long-poll seconds (default 30)
@@ -614,7 +615,8 @@ function usage(): void {
   out('');
   out('Config precedence (per field): env var > config.json > default.');
   out('  config.json: OURS_TG_CONFIG, else ~/.ours-telegram/config.json');
-  out('  env: OURS_TG_DAEMON_URL + OURS_TG_DAEMON_STATE_DIR (both, or neither), OURS_TG_CONTROL_PORT (3051),');
+  out('  env: OURS_TG_DAEMON_URL + OURS_TG_DAEMON_ID + OURS_TG_DAEMON_CREDENTIAL_PATH (V1),');
+  out('       legacy: OURS_TG_DAEMON_URL + OURS_TG_DAEMON_STATE_DIR; OURS_TG_CONTROL_PORT (3051),');
   out('       OURS_TG_STATE_DIR, OURS_TG_POLL_TIMEOUT (30)');
 }
 
@@ -633,12 +635,6 @@ async function main(): Promise<void> {
         }
       };
       process.on('exit', cleanup);
-      for (const sig of ['SIGTERM', 'SIGINT'] as const) {
-        process.on(sig, () => {
-          cleanup();
-          process.exit(0);
-        });
-      }
       // Load the daemon from the sibling bundle at runtime (computed specifier
       // keeps esbuild from inlining the server into the CLI bundle).
       await import(pathToFileURL(join(dirname(SELF), 'connector.js')).href);

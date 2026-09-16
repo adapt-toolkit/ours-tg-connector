@@ -54,3 +54,12 @@ console.log('=== separate routes keep independent flights ===');
 }
 
 console.log('single-flight OK');
+
+{
+ const gate=deferred(); let passes=0, settled=false;
+ const drain=singleFlight(async()=>{passes++;await gate.promise;});
+ await drain.idle(); assert.equal(passes,0,'idle does not initiate a drain');
+ const work=drain(); const idle=drain.idle().then(()=>{settled=true;});
+ await Promise.resolve(); assert.equal(settled,false,'idle waits for active drain');
+ gate.resolve(); await Promise.all([work,idle]); assert.equal(passes,1);
+}
