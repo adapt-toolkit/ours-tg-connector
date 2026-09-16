@@ -1024,14 +1024,16 @@ async function quiesceRoute(conn: Connection): Promise<void> {
   conn.watchHandle = null;
 }
 
-async function releaseRoute(conn: Connection): Promise<void> {
+async function releaseRoute(conn: Connection, terminal = false): Promise<void> {
   try {
     const result = await conn.client.releaseLease();
     if (result.failed > 0) throw new Error('daemon lease cleanup incomplete');
-    // Only acknowledged terminal release permits a new owner on next boot.
-    // An ack/write crash retains the retired ID and fails closed on restore.
-    delete conn.cfg.leaseToken;
-    writeMeta(conn.dir, conn.cfg);
+    if (terminal) {
+      // Only acknowledged terminal release permits a new owner on next boot.
+      // An ack/write crash retains the retired ID and fails closed on restore.
+      delete conn.cfg.leaseToken;
+      writeMeta(conn.dir, conn.cfg);
+    }
   } finally { await conn.client.close(); }
 }
 
@@ -1083,7 +1085,7 @@ async function removeConnection(name: string): Promise<RemoveConnectionResult> {
   } else {
     removalError = `identity "${name}" was not in the connector-owned name list and was left behind`;
   }
-  try { await releaseRoute(conn); }
+  try { await releaseRoute(conn, true); }
   catch (err) {
     connections.delete(name);
     return {

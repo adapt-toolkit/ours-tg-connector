@@ -37,11 +37,11 @@
     "test:v1-lifecycle": "node tests/v1-lifecycle.integration.mjs cli"
   },
   "dependencies": {
-    "@ours.network/sdk": "file:vendor/ours.network-sdk.tgz",
+    "@ours.network/sdk": "3.8.0",
     "undici": "^7.28.0"
   },
   "devDependencies": {
-    "@ours.network/cli": "file:vendor/ours.network-cli.tgz",
+    "@ours.network/cli": "2.8.0",
     "@types/node": "^20.14.0",
     "esbuild": "^0.24.2",
     "tsx": "^4.19.0",
