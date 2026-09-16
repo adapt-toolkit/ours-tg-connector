@@ -533,3 +533,5 @@ under identical input names and versions, plus a missing-vendor negative check):
 ```sh
 node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz
 ```
+
+For development against the selected, unpublished SDK/CLI sources, see [selected-source development](docs/selected-source-development.md).
