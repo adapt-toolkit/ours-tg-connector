@@ -206,7 +206,7 @@ try {
     connector.kill('SIGTERM');
     await Promise.race([exit, sleep(10_000)]);
     assert.equal(exited?.code,releaseFailure ? 1 : 0,'SIGTERM reports acknowledged versus failed terminal cleanup');
-    assert.equal(JSON.parse(readFileSync(join(TG_STATE,'SnapshotMissing','connection.json'),'utf8')).leaseToken,releaseFailure ? 'lease-snapshot-missing' : undefined,'only acknowledged shutdown clears owner for next process lifetime');
+    assert.equal(JSON.parse(readFileSync(join(TG_STATE,'SnapshotMissing','connection.json'),'utf8')).leaseToken,'lease-snapshot-missing','local shutdown retains the stable route token; external retirement is covered by v1-lifecycle');
   }
   await new Promise((resolveClose) => fakeDaemon.close(resolveClose));
   rmSync(TG_STATE, { recursive: true, force: true });
