@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { applyProvision } from './provision.js';
 //
 // ours.network Telegram connector — daemon.
 //
@@ -55,9 +56,9 @@
 // Telegram bot tokens, its lease tokens, and the simple list of route names it
 // created. That list is application bookkeeping, not an authorization or
 // provenance boundary. `leaseToken` is what
-// makes a route's daemon session survive a connector restart: it IS the session,
-// so a route that regenerated one on every boot would look like a new client to
-// the daemon's lease table every time.
+// identifies one owner across transport failures and daemon restart. Successful
+// terminal release clears it; the next connector start mints a fresh owner.
+// Unknown release or an acknowledgement/write crash never triggers takeover.
 //
 // On boot the bot registry is loaded first (one TelegramClient per bot, no poll
 // yet), then the daemon is SELECTED AND PROVED (see attachToDaemon), then every
@@ -81,7 +82,7 @@ import {
   resolveDaemonConfig,
   describeDaemonConfig,
 } from '@ours.network/sdk';
-import type { OursClient, ResolvedDaemonConfig, ResolveDaemonConfigOptions } from '@ours.network/sdk';
+import type { OursClient, AttachOursClientOptions } from '@ours.network/sdk';
 import { TelegramClient } from './telegram';
 import type { TelegramMessage, AttachmentDescriptor } from './telegram';
 import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
@@ -100,7 +101,7 @@ import {
 } from './receipts';
 import { drainMessages as drainHistoryMessages, drainFiles as drainHistoryFiles } from './history-delivery';
 import { reconcileReceiptHistory } from './history-receipts';
-import { singleFlight } from './single-flight';
+import { singleFlight, type SingleFlight } from './single-flight';
 
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
@@ -128,11 +129,8 @@ interface ConnectionFile {
   payloadMode: PayloadMode; // envelope preserves Telegram metadata; plain forwards DM text directly
   deniedMessage: string; // reply sent to a non-routed chat when the bot serves exactly one route
   peerCid: string; // the proxy agent's container id once it accepts the invite ('' until then)
-  // This route's daemon lease token. PERSISTED ON PURPOSE: the token IS the
-  // session, so regenerating it on every boot would make the daemon's lease table
-  // see a brand-new client each time and the route would have to re-bind rather
-  // than resume. Legacy routes without this field get
-  // one minted on first restore, which re-binds once and then stays stable.
+  // Persisted owner ID: stable across reconnect/restart until terminal release.
+  // Cleared only after acknowledged release; absent legacy records mint on restore.
   leaseToken?: string;
   createdAt: string;
 }
@@ -168,9 +166,11 @@ interface Connection {
   bot: Bot;
   lastChat: { chatId: string; threadId: string } | null; // most recent inbound origin (reverse-delivery target for non-topic-pinned routes)
   map: MessageMap;
-  drainMessages: () => Promise<void>;
-  drainFiles: () => Promise<void>;
-  syncReceipts: () => Promise<void>;
+  drainMessages: SingleFlight;
+  drainFiles: SingleFlight;
+  syncReceipts: SingleFlight;
+  inbound: Promise<void> | null;
+  watchHandle: Promise<void> | null;
   /** Stops this route's notification watch on removal / shutdown. */
   watch: AbortController | null;
 }
@@ -188,6 +188,8 @@ function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bo
     drainFiles: singleFlight(() => forwardFilesToTelegram(conn)),
     syncReceipts: singleFlight(() => syncReceiptHistory(conn)),
     watch: null,
+    watchHandle: null,
+    inbound: null,
   };
   return conn;
 }
@@ -202,7 +204,7 @@ function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bo
 // read the live ~/.ours token and send it wherever the endpoint points. That is a
 // a local token and send it to an operator-selected endpoint. Keeping this
 // resolution in the SDK prevents divergent credential-handling implementations.
-let daemon: ResolvedDaemonConfig | null = null;
+let daemon: { endpoint: string } | null = null;
 // A one-shot view of the daemon's GLOBAL identity names. It is used only to
 // report the connector-owned subset at boot; chooseIdentity remains the
 // authoritative per-route check and is never gated by this snapshot.
@@ -213,37 +215,40 @@ let daemonIdentityNames = new Set<string>();
 // deliberately a simple name set, not provenance or an authorization boundary.
 const ownedIdentityNames = new Set<string>();
 
-function daemonSelectionOptions(): ResolveDaemonConfigOptions {
+function daemonSelectionOptions(): AttachOursClientOptions {
+  if (CONFIG.daemonInstanceId || CONFIG.daemonCredentialPath) {
+    if (!CONFIG.daemonUrl || !CONFIG.daemonInstanceId || !CONFIG.daemonCredentialPath) {
+      throw new Error('V1 daemon selection requires daemonUrl, daemonInstanceId and daemonCredentialPath');
+    }
+    return {
+      endpoint: CONFIG.daemonUrl, expectedInstanceId: CONFIG.daemonInstanceId,
+      credentialPath: CONFIG.daemonCredentialPath, sessionMode: 'external',
+    };
+  }
   return {
     ...(CONFIG.daemonUrl ? { endpoint: CONFIG.daemonUrl } : {}),
     ...(CONFIG.daemonStateDir ? { stateDir: CONFIG.daemonStateDir } : {}),
   };
 }
 
-async function attachToDaemon(): Promise<ResolvedDaemonConfig> {
+async function attachToDaemon(): Promise<{ endpoint: string }> {
   const options = daemonSelectionOptions();
-  const cfg = resolveDaemonConfig(options);
-  // SDK 2's supported application boundary resolves the coherent selection,
-  // proves /state-dir, and only then constructs a credential-bearing client.
-  // This boot probe deliberately remains unbound; each route attaches below
-  // with its own stable lease because one lease has one current identity.
-  const client = await attachOursClient(options);
-  daemonIdentityNames = new Set((await client.identities()).map((row) => row.name));
-  log(`attached to daemon ${JSON.stringify(describeDaemonConfig(cfg))}`);
-  return cfg;
+  // Identity selection must not read legacy state/config/token fallbacks.
+  const legacy = options.expectedInstanceId ? null : resolveDaemonConfig(options);
+  const client = await attachOursClient({ ...options, leaseToken: randomBytes(24).toString('hex') });
+  try {
+    daemonIdentityNames = new Set((await client.identities()).map(row => row.name));
+    log(`attached to daemon ${JSON.stringify(legacy ? describeDaemonConfig(legacy) : {
+      endpoint: CONFIG.daemonUrl, instanceId: CONFIG.daemonInstanceId,
+    })}`);
+    return { endpoint: legacy?.baseUrl.value ?? CONFIG.daemonUrl };
+  } finally { await client.close(); }
 }
 
-/**
- * This route's session with the daemon. The lease token is persisted per route
- * (see ConnectionFile.leaseToken) so a restart RESUMES the session rather than
- * arriving as a new client.
- */
+/** One persisted owner per route until acknowledged terminal release. */
 async function clientFor(cfg: ConnectionFile): Promise<OursClient> {
   if (!daemon) throw new Error('not attached to a daemon yet');
-  return attachOursClient({
-    ...daemonSelectionOptions(),
-    leaseToken: cfg.leaseToken!,
-  });
+  return attachOursClient({ ...daemonSelectionOptions(), leaseToken: cfg.leaseToken! });
 }
 const connections = new Map<string, Connection>(); // route name -> route
 const bots = new Map<string, Bot>(); // bot name -> bot
@@ -477,7 +482,7 @@ function watchRoute(conn: Connection): void {
   const ctrl = new AbortController();
   conn.watch = ctrl;
   const { cfg, client } = conn;
-  void watchWithRetry(
+  conn.watchHandle = watchWithRetry(
     // `since: 'tip'` skips the backlog: anything already in the log was handled
     // before this restart, and get_messages is the source of truth regardless —
     // a replayed event would at worst cause one redundant, empty poll.
@@ -842,6 +847,7 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
   }
 
   const conn = resolveRoute(bot.exact, bot.catchAll, m.chat_id, m.thread_id);
+  const work = (async () => {
   if (conn) conn.lastChat = { chatId: String(m.chat_id), threadId: m.thread_id ? String(m.thread_id) : '' };
   if (await handleConnectorCommand(bot, conn, m)) return;
   if (!conn) {
@@ -858,6 +864,9 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
     return;
   }
   await forwardToNode(conn, m);
+  })();
+  if (conn) conn.inbound = work;
+  try { await work; } finally { if (conn?.inbound === work) conn.inbound = null; }
 }
 
 
@@ -985,9 +994,10 @@ async function restoreConnection(name: string): Promise<void> {
   try {
     await client.chooseIdentity({ name, force: false });
   } catch (err) {
+    await client.close();
     if (err instanceof OursError && err.code === 'NO_SUCH_IDENTITY') {
       throw new Error(
-        `route "${name}" has no identity in the daemon at ${daemon?.baseUrl.value}. ` +
+        `route "${name}" has no identity in the daemon at ${daemon?.endpoint}. ` +
         'Either this is the wrong daemon, or the identity was removed — the route is NOT being ' +
         'recreated, because that would mint a new container id and silently break every contact.',
       );
@@ -1003,6 +1013,28 @@ async function restoreConnection(name: string): Promise<void> {
   // one drain now rather than waiting for the next notification.
   await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
   log(`[${name}] route restored (bot ${botLabel(bot)})`);
+}
+
+async function quiesceRoute(conn: Connection): Promise<void> {
+  unregisterRoute(conn);
+  conn.watch?.abort();
+  await Promise.all([conn.watchHandle, conn.inbound,
+    conn.drainMessages.idle(), conn.drainFiles.idle(), conn.syncReceipts.idle()]);
+  conn.watch = null;
+  conn.watchHandle = null;
+}
+
+async function releaseRoute(conn: Connection, terminal = false): Promise<void> {
+  try {
+    const result = await conn.client.releaseLease();
+    if (result.failed > 0) throw new Error('daemon lease cleanup incomplete');
+    if (terminal || daemonSelectionOptions().sessionMode === 'external') {
+      // Only acknowledged terminal release permits a new owner on next boot.
+      // An ack/write crash retains the retired ID and fails closed on restore.
+      delete conn.cfg.leaseToken;
+      writeMeta(conn.dir, conn.cfg);
+    }
+  } finally { await conn.client.close(); }
 }
 
 interface RemoveConnectionResult {
@@ -1039,33 +1071,29 @@ async function removeConnection(name: string): Promise<RemoveConnectionResult> {
     };
   }
 
-  let releaseError = '';
-  try {
-    await conn.client.releaseLease();
-  } catch (err) {
-    releaseError = `releasing the daemon lease for identity "${name}" failed: ${String(err)}`;
-  }
-
+  await quiesceRoute(conn);
   let identityRemoved = false;
-  let removalError = releaseError;
-  if (!releaseError && ownedIdentityNames.has(name)) {
+  let removalError = '';
+  if (ownedIdentityNames.has(name)) {
     try {
-      // Name-only deletion is deliberately organizational bookkeeping, not an
-      // authorization boundary. If an operator removed and externally recreated
-      // this same name, removal can delete that replacement; the approved model
-      // accepts that outcome and adds no CID/provenance machinery around it.
+      // Delete the recorded identity while this exact owner is still active.
       await conn.client.removeIdentity({ name });
       identityRemoved = true;
     } catch (err) {
       removalError = `route "${name}" was removed locally, but daemon identity "${name}" was left behind: ${String(err)}`;
     }
-  } else if (!releaseError) {
-    removalError = `route "${name}" was removed locally, but identity "${name}" was not in the connector-owned name list and was left behind`;
+  } else {
+    removalError = `identity "${name}" was not in the connector-owned name list and was left behind`;
+  }
+  try { await releaseRoute(conn, true); }
+  catch (err) {
+    connections.delete(name);
+    return {
+      found: true, localRemoved: false, identityRemoved, identityLeftBehind: !identityRemoved,
+      error: `${removalError} releasing the daemon lease for identity "${name}" failed; local owner record retained: ${String(err)}`,
+    };
   }
 
-  unregisterRoute(conn);
-  conn.watch?.abort();
-  conn.watch = null;
   connections.delete(name);
   try {
     fs.rmSync(conn.dir, { recursive: true, force: true });
@@ -1165,7 +1193,7 @@ function startControlServer(): void {
       }
 
       if (req.method === 'GET' && url.pathname === '/connections') {
-        return sendJson(res, 200, { ok: true, connections: [...connections.values()].map(describeConnection) });
+        return sendJson(res, 200, { ok: true, connections: await Promise.all([...connections.values()].map(describeConnection)) });
       }
 
       if (req.method === 'POST' && url.pathname === '/connections') {
@@ -1260,22 +1288,25 @@ function startControlServer(): void {
     log(`control API on http://127.0.0.1:${CONFIG.controlPort} (POST/GET/DELETE /connections)`);
   });
 
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     log('shutting down…');
-    for (const bot of bots.values()) {
-      try {
-        bot.tg.stop();
-      } catch {
-        /* best effort */
-      }
-    }
-    // NOTHING TO SAVE. The daemon owns packet state; this process holds only
-    // config, which is written on change. What DOES need doing on the way out is
-    // stopping the notification watches so the daemon's long-polls close cleanly
-    // rather than waiting out their deadline.
-    for (const conn of connections.values()) conn.watch?.abort();
-    server.close();
-    process.exit(0);
+    void (async () => {
+      const controlClosed = new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+      for (const bot of bots.values()) bot.tg.stop();
+      for (const conn of connections.values()) conn.watch?.abort();
+      await controlClosed;
+      await Promise.all([...bots.values()].map(bot => bot.pollHandle));
+      const results = await Promise.allSettled([...connections.values()].map(async conn => {
+        await quiesceRoute(conn);
+        await releaseRoute(conn);
+      }));
+      const failed = results.filter(result => result.status === 'rejected');
+      for (const result of failed) if (result.status === 'rejected') log('terminal route cleanup failed:', String(result.reason));
+      process.exit(failed.length ? 1 : 0);
+    })().catch(err => { log('shutdown failed:', String(err)); process.exit(1); });
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
@@ -1317,6 +1348,26 @@ async function main(): Promise<void> {
       }
     }
   }
+
+  // Optional input is applied before the control API reports readiness.
+  // Persisted routes that failed to restore must not be recreated implicitly.
+  const requestedRoutes = new Map([...connections].map(([name, connection]) => [name, connection.cfg]));
+  await applyProvision(STATE_DIR, {
+    bots, connections: requestedRoutes,
+    addBot: async (name, token) => {
+      const bad = routeNameError(name);
+      if (bad) throw new Error(bad);
+      return addBot(name, token);
+    },
+    createConnection: async route => {
+      if (names.includes(route.name)) throw new Error(`Provisioned route "${route.name}" failed to restore; repair it before retrying`);
+      const bad = routeNameError(route.name);
+      if (bad) throw new Error(bad);
+      const result = await createConnection(route);
+      requestedRoutes.set(route.name, connections.get(route.name)!.cfg);
+      return result;
+    },
+  });
 
   // 3. One poll loop per REGISTERED bot — even with zero routes — so the built-in
   // /id probe answers in any chat the bot is in (you use it to discover the chat

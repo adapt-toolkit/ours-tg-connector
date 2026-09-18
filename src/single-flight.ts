@@ -1,11 +1,13 @@
 // Coalesce overlapping wake-ups into one ordered drain per route. A wake that
 // lands while the task is running requests one more pass after the current pass;
 // it never starts a second consumer beside it.
-export function singleFlight(task: () => Promise<void>): () => Promise<void> {
+export type SingleFlight = (() => Promise<void>) & { idle(): Promise<void> };
+
+export function singleFlight(task: () => Promise<void>): SingleFlight {
   let requested = false;
   let active: Promise<void> | null = null;
 
-  return () => {
+  const run = () => {
     requested = true;
     if (!active) {
       active = (async () => {
@@ -21,4 +23,5 @@ export function singleFlight(task: () => Promise<void>): () => Promise<void> {
     }
     return active;
   };
+  return Object.assign(run, { idle: () => active ?? Promise.resolve() });
 }

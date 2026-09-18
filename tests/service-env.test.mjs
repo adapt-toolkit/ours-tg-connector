@@ -65,3 +65,8 @@ const ok = (c, m) => { assert.ok(c, m); pass++; console.log('  ✓', m); };
 }
 
 console.log(`\n${pass} assertions passed`);
+
+const external = serviceEnvironment({...DEFAULT_CONFIG, daemonInstanceId:'12345678-1234-1234-1234-123456789abc', daemonCredentialPath:'/run/ours/token'}, '/s');
+assert.equal(external.OURS_TG_DAEMON_ID, '12345678-1234-1234-1234-123456789abc');
+assert.equal(external.OURS_TG_DAEMON_CREDENTIAL_PATH, '/run/ours/token');
+assert.equal('OURS_TG_DAEMON_ID' in serviceEnvironment(DEFAULT_CONFIG,'/s'),false);

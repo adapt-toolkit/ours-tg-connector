@@ -41,6 +41,8 @@ export function serviceEnvironment(config: ConnectorConfig, stateDir: string): R
   // The daemon selection: baked only when there IS one.
   if (config.daemonUrl) env.OURS_TG_DAEMON_URL = config.daemonUrl;
   if (config.daemonStateDir) env.OURS_TG_DAEMON_STATE_DIR = config.daemonStateDir;
+  if (config.daemonInstanceId) env.OURS_TG_DAEMON_ID = config.daemonInstanceId;
+  if (config.daemonCredentialPath) env.OURS_TG_DAEMON_CREDENTIAL_PATH = config.daemonCredentialPath;
   return env;
 }
 
