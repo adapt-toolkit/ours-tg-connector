@@ -37,7 +37,7 @@
     "test:v1-lifecycle": "node tests/v1-lifecycle.integration.mjs cli"
   },
   "dependencies": {
-    "@ours.network/sdk": "3.8.1-nightly.3",
+    "@ours.network/sdk": "3.8.1-nightly.4",
     "undici": "^7.28.0"
   },
   "devDependencies": {
