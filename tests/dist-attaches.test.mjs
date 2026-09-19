@@ -73,7 +73,7 @@ try {
 
   const exited = new Promise((r) => child.on('exit', (code, signal) => r({ code, signal })));
   const ready = new Promise((r) => {
-    const t = setInterval(() => { if (out.includes('ready (bots=')) { clearInterval(t); r('ready'); } }, 100);
+    const t = setInterval(() => { if (out.includes('ready (bots=') && out.includes(`control API on http://127.0.0.1:${CTL_PORT}`)) { clearInterval(t); r('ready'); } }, 100);
     setTimeout(() => { clearInterval(t); r('timeout'); }, 60_000);
   });
 
@@ -90,6 +90,10 @@ try {
     'the state dir was explicitly chosen too — the coherence rule was satisfied, not bypassed');
   ok(out.includes(`control API on http://127.0.0.1:${CTL_PORT}`),
     'the control API came up on loopback');
+
+  const health = await fetch(`http://127.0.0.1:${CTL_PORT}/health`, { signal: AbortSignal.timeout(5000) });
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).stateDir, TG_STATE);
 
   // The engine belongs only to the separately spawned operator daemon.
   ok(!out.includes('wrapper: packet ready') && !out.includes('wrapper ready (identities='),
