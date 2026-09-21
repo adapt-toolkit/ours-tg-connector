@@ -88,6 +88,7 @@ async function main() {
   const agent = await attachOursClient({
     endpoint: URL_, stateDir: DAEMON_STATE, leaseToken: 'voice-agent-tok',
   });
+  await connector.createRootIdentity({ name: 'Voice Human', bio: '', exposeLocal: false });
   await connector.createIdentity({ name: 'Connector', bio: '', exposeLocal: false, localAutoAccept: true });
   await agent.createIdentity({ name: 'Agent', bio: '', exposeLocal: false, localAutoAccept: true });
 

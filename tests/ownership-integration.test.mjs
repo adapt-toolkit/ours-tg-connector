@@ -99,6 +99,7 @@ const observer = await attachOursClient({
   stateDir: DAEMON_STATE,
   leaseToken: 'unrelated-observer-lease',
 });
+await observer.createRootIdentity({ name: 'Ownership Human', bio: '', exposeLocal: false });
 const unrelated = await observer.createIdentity({
   name: 'UnrelatedGlobal', bio: 'must survive connector cleanup',
   exposeLocal: false, localAutoAccept: true,
