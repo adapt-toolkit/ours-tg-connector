@@ -293,7 +293,7 @@ npm install
 npm run build
 ```
 
-Requires Node ≥ 20, and **an ours daemon already running on this box** — the
+Requires Node ≥ 22, and **an ours daemon already running on this box** — the
 connector attaches to it over `/api/v1` and drives it through
 [`@ours.network/sdk`](https://www.npmjs.com/package/@ours.network/sdk). It runs
 no engine of its own: there is no native ADAPT SDK and no MUFL packet here, so
@@ -422,7 +422,7 @@ Temporary legacy selection remains available without the V1 fields:
 omitted. Failed V1 selection/API requests never fall back to it. Legacy
 `OURS_INSTANCE` is rejected, and `OURS_AUTOSTART`/`autoStart` are ignored.
 This connector never embeds or starts an ours daemon; operate it separately with
-`ours daemon start` or `ours daemon install-service`.
+`ours-daemon start` or `ours-daemon install-service`.
 
 The control API is bound to `127.0.0.1` and unauthenticated — it manages bot
 tokens, so do not expose the control port off-host.
