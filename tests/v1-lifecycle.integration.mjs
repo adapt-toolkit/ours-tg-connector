@@ -18,7 +18,7 @@ const hmac = process.argv.includes('--hmac');
 async function port() { const server=createServer();server.listen(0,'127.0.0.1');await once(server,'listening');const n=server.address().port;await new Promise(done=>server.close(done));return n; }
 const daemonPort = await port(), controlPort = await port();
 const endpoint = `http://127.0.0.1:${daemonPort}`, controlUrl = `http://127.0.0.1:${controlPort}`;
-const cli = resolve('node_modules/@ours.network/cli/dist/cli.js');
+const cli = resolve('node_modules/@ours.network/daemon/dist/cli.js');
 const env = Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('OURS_')));
 const daemonEnv = { ...env, OURS_CONFIG:daemonConfig, OURS_STATE_DIR:daemonState, OURS_PORT:String(daemonPort),
   OURS_DAEMON_ID:instanceId, OURS_API_VISIBILITY:'owner', OURS_BROKER_URL:'wss://invalid.local/none' };
