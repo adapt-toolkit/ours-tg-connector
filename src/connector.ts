@@ -1284,8 +1284,8 @@ function startControlServer(): void {
   });
 
   // Bind to loopback only — the control API has no auth and manages bot tokens.
-  server.listen(CONFIG.controlPort, '127.0.0.1', () => {
-    log(`control API on http://127.0.0.1:${CONFIG.controlPort} (POST/GET/DELETE /connections)`);
+  server.listen(CONFIG.controlPort, CONFIG.controlHost, () => {
+    log(`control API on http://${CONFIG.controlHost}:${CONFIG.controlPort} (POST/GET/DELETE /connections)`);
   });
 
   let shuttingDown = false;

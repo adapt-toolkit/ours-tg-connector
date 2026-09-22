@@ -15,7 +15,8 @@ export interface ConnectorConfig {
   daemonStateDir: string;
   daemonInstanceId: string;
   daemonCredentialPath: string;
-  controlPort: number; // localhost JSON control API (add/list/remove connections)
+  controlPort: number; // JSON control API (add/list/remove connections)
+  controlHost: '127.0.0.1' | '0.0.0.0'; // non-loopback is for an isolated authenticated gateway only
   stateDir: string;    // this connector's OWN config dir (bots.json + one subdir per route)
   pollTimeoutSec: number; // Telegram long-poll timeout per getUpdates call
   // Telegram network path hardening (see src/telegram.ts). Default is the robust
@@ -50,6 +51,7 @@ export const DEFAULT_CONFIG: ConnectorConfig = {
   daemonInstanceId: '',
   daemonCredentialPath: '',
   controlPort: 3051,
+  controlHost: '127.0.0.1',
   stateDir: resolve(homedir(), '.ours-telegram'),
   pollTimeoutSec: 30,
   tgForceIpv4: true,
@@ -139,6 +141,8 @@ function envBool(name: string): boolean | undefined {
 
 export function loadConfig(): ConnectorConfig {
   const file = readFileConfig();
+  const controlHost = process.env.OURS_TG_CONTROL_HOST ?? '127.0.0.1';
+  if (controlHost !== '127.0.0.1' && controlHost !== '0.0.0.0') throw new Error('OURS_TG_CONTROL_HOST must be 127.0.0.1 or 0.0.0.0');
   return {
     // NOTE: no OURS_TG_BROKER_URL any more. The connector does not talk to a
     // broker — the daemon does. A stale one in a config file is now ignored
@@ -147,6 +151,7 @@ export function loadConfig(): ConnectorConfig {
     daemonStateDir: process.env.OURS_TG_DAEMON_STATE_DIR ?? file.daemonStateDir ?? DEFAULT_CONFIG.daemonStateDir,
     daemonInstanceId: process.env.OURS_TG_DAEMON_ID ?? file.daemonInstanceId ?? DEFAULT_CONFIG.daemonInstanceId,
     daemonCredentialPath: process.env.OURS_TG_DAEMON_CREDENTIAL_PATH ?? file.daemonCredentialPath ?? DEFAULT_CONFIG.daemonCredentialPath,
+    controlHost,
     controlPort: envInt('OURS_TG_CONTROL_PORT') ?? file.controlPort ?? DEFAULT_CONFIG.controlPort,
     stateDir: resolve(process.env.OURS_TG_STATE_DIR ?? file.stateDir ?? DEFAULT_CONFIG.stateDir),
     pollTimeoutSec: envInt('OURS_TG_POLL_TIMEOUT') ?? file.pollTimeoutSec ?? DEFAULT_CONFIG.pollTimeoutSec,

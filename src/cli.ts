@@ -623,6 +623,9 @@ function usage(): void {
 async function main(): Promise<void> {
   const cmd = process.argv[2] ?? 'help';
   switch (cmd) {
+    case 'capabilities':
+      out(JSON.stringify({ capabilities: ['telegram.gateway-listener-v1'] }));
+      return;
     case 'serve':
     case 'run': {
       fs.mkdirSync(STATE_DIR, { recursive: true });

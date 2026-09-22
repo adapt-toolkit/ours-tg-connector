@@ -535,3 +535,7 @@ node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tg
 ```
 
 For development against the selected, unpublished SDK/CLI sources, see [selected-source development](docs/selected-source-development.md).
+
+### Private Docker gateway listener
+
+`OURS_TG_CONTROL_HOST=0.0.0.0` allows the installer nginx gateway to reach the control API over its private Docker network. The default remains `127.0.0.1`. This API has operator authority and no application authentication: never publish its container port or use this setting on an unprotected host. The supported installer gateway authenticates requests using the issued server credential before forwarding them. All containers on that network share the same trust boundary. `ours-tg-connector capabilities` advertises `telegram.gateway-listener-v1` for installer compatibility checks.
