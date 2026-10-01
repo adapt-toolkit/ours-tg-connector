@@ -28,6 +28,7 @@ export async function startExternalDaemon({ stateDir, port = undefined }) {
   const url = `http://127.0.0.1:${selectedPort}`;
   const child = spawn(process.execPath, [
     OURS_CLI, 'daemon', 'serve',
+    '--config', join(stateDir, 'fixture-daemon.json'),
     '--port', String(selectedPort),
     '--state-dir', stateDir,
   ], {
