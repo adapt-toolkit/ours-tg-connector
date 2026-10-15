@@ -91,11 +91,28 @@ if ! grep -qE "^\\s*\"version\"\\s*:\\s*\"${new}\"" "$PKG"; then
   exit 1
 fi
 
+# `npm ci` requires package.json and package-lock.json to agree. Keep the lock's
+# root version in the same release commit as the manifest.
+LOCK="$(dirname "$PKG")/package-lock.json"
+if [[ -f "$LOCK" ]]; then
+  node - "$LOCK" "$new" <<'NODE'
+const fs = require('node:fs');
+const [path, version] = process.argv.slice(2);
+const lock = JSON.parse(fs.readFileSync(path, 'utf8'));
+if (!lock.packages || !lock.packages['']) throw new Error(`${path} has no root package entry`);
+lock.version = version;
+lock.packages[''].version = version;
+fs.writeFileSync(path, `${JSON.stringify(lock, null, 2)}\n`);
+NODE
+  log "$LOCK: root version -> $new"
+fi
+
 # ----- commit + push ---------------------------------------------------------
 
 git config user.name  "ours-ci-version-bump[bot]"
 git config user.email "ours-ci-version-bump[bot]@users.noreply.github.com"
 git add "$PKG"
+if [[ -f "$LOCK" ]]; then git add "$LOCK"; fi
 
 if git diff --cached --quiet; then
   no_bump "no changes after patch (already at target version)"

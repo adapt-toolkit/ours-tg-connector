@@ -212,6 +212,16 @@ console.log('=== notification watch retry ===');
     'the handler error was reported, not swallowed');
 }
 
+{
+ const ctrl=new AbortController(); let attempts=0;
+ const watch=watchWithRetry(async function*(){attempts++;throw new Error('down');}, {
+  signal:ctrl.signal,baseMs:30000,onEvent:()=>{},onError:()=>setTimeout(()=>ctrl.abort(),10),
+ });
+ const done=await Promise.race([watch.then(()=>true),new Promise(r=>setTimeout(()=>r(false),100))]);
+ assert(done,'aborting a backoff settles the watch promptly');
+ assert(attempts===1,'aborted backoff does not reopen the stream');
+}
+
 if (failures) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);
