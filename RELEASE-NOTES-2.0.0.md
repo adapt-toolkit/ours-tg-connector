@@ -23,9 +23,9 @@ versions below, `package-lock.json` regenerated, and CI rerun on the new head:
 
 | dependency | prerelease pin | stable target |
 |---|---|---|
-| `@ours.network/sdk` (dependencies) | 3.8.1-nightly.18 | 4.0.0 |
-| `@ours.network/cli` (devDependencies) | 2.8.1-nightly.16 | 3.0.0 |
-| `@ours.network/daemon` (devDependencies) | 3.8.1-nightly.10 | 4.0.0 |
+| `@ours.network/sdk` (dependencies) | 3.8.1-nightly.18 | 4.1.0 |
+| `@ours.network/cli` (devDependencies) | 2.8.1-nightly.16 | 3.1.0 |
+| `@ours.network/daemon` (devDependencies) | 3.8.1-nightly.10 | 4.1.0 |
 
 None of these stable versions is published at the time of writing; they are the
 versions the upstream `main` bump jobs are expected to produce.
