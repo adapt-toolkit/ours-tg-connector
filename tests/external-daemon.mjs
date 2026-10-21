@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const OURS_CLI = join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
+const OURS_CLI = join(ROOT, 'node_modules', '@ours.network', 'daemon', 'dist', 'cli.js');
 
 export const freePort = () => new Promise((resolvePort, reject) => {
   const server = createServer();
@@ -28,6 +28,7 @@ export async function startExternalDaemon({ stateDir, port = undefined }) {
   const url = `http://127.0.0.1:${selectedPort}`;
   const child = spawn(process.execPath, [
     OURS_CLI, 'daemon', 'serve',
+    '--config', join(stateDir, 'fixture-daemon.json'),
     '--port', String(selectedPort),
     '--state-dir', stateDir,
   ], {

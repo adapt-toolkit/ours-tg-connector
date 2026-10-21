@@ -88,6 +88,15 @@ console.log('=== fetchWithRetry (bounded backoff on transient errors) ===');
   assert(threw3 && calls3 === 1, 'non-retriable error is not retried');
 }
 
+console.log('=== stop waits for current handler and skips remaining fetched updates ===');
+{
+ const updates=[1,2].map(id=>({update_id:id,message:{message_id:id,chat:{id:42,type:'private'},text:'fixture',date:0}}));
+ const c=new TelegramClient('1:fixture',1,()=>{},DEFAULT_NET_OPTIONS,async()=>jsonResponse({ok:true,result:updates}));
+ let handled=0;
+ await c.poll(async()=>{handled++;c.stop();await Promise.resolve();});
+ assert(handled===1,'stop prevents the next buffered message from starting');
+}
+
 console.log('=== dispatcher applied to every TelegramClient call ===');
 {
   const seen = [];

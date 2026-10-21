@@ -579,6 +579,7 @@ export class TelegramClient {
           continue;
         }
         for (const u of body.result) {
+          if (this.stopped) break;
           this.offset = Math.max(this.offset, u.update_id + 1);
           const m = u.message;
           if (!m) continue;

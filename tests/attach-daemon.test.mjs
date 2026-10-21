@@ -52,6 +52,7 @@ const routeToken = 'route-lease-tok';
 const route = await attachOursClient({ endpoint: URL_, stateDir: DAEMON_STATE, leaseToken: routeToken });
 
 // ----- create a route identity and mint its invite ---------------------------
+await route.createRootIdentity({ name: 'Attach Human', bio: '', exposeLocal: false });
 const made = await route.createIdentity({ name: 'TgRoute', bio: 'the group chat', exposeLocal: false, localAutoAccept: true });
 ok(made.info.name === 'TgRoute' && made.info.cid.length > 0, 'the route identity was created IN THE DAEMON');
 const invite = await route.generateInvite({});
