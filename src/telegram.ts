@@ -120,7 +120,7 @@ export async function fetchWithRetry(
       if (attempt >= opts.retries || !isRetriableFetchError(err)) throw err;
       const delay = opts.retryBaseMs * 2 ** attempt + Math.floor(Math.random() * opts.retryBaseMs);
       attempt += 1;
-      log?.(`${sanitizeUrl(input)} failed (${(err as Error).message}); retry ${attempt}/${opts.retries} in ${delay}ms`);
+      log?.(`${sanitizeUrl(input)} failed (${telegramErrorText((err as Error).message)}); retry ${attempt}/${opts.retries} in ${delay}ms`);
       await sleep(delay);
     }
   }
@@ -291,14 +291,17 @@ export type WidgetEditOutcome =
   | { status: 'rejected'; code: number; description: string }
   | { status: 'unknown'; description: string };
 
-// An error text that is safe to hand to an agent: bounded, one line, and with
-// anything shaped like a bot token or a token-bearing URL redacted.
+// An error text that is safe to hand to an agent or a log: token-shaped text
+// redacted, then cut at the first character outside a plain-description set,
+// so a description that echoes the request (HTML, JSON state) is not repeated.
+// Telegram's own texts ("Bad Request: INPUT_MEDIA_WIDGET_TOO_LARGE") survive.
 export function telegramErrorText(s: unknown): string {
-  return String(s)
+  const redacted = String(s)
     .replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot***')
     .replace(/\b\d{5,}:[A-Za-z0-9_-]{20,}/g, '***')
-    .replace(/\s+/g, ' ')
-    .slice(0, 200);
+    .replace(/\s+/g, ' ');
+  const safe = /^[A-Za-z0-9 _:.,()/*'-]*/.exec(redacted)![0].trimEnd();
+  return (safe.length < redacted.length ? `${safe} […]` : safe).slice(0, 160);
 }
 
 export interface SendWidgetParams {
@@ -584,8 +587,9 @@ export class TelegramClient {
     } catch (err) {
       return { status: 'unknown', description: telegramErrorText(`transport error: ${(err as Error)?.message ?? String(err)}`) };
     }
-    const body = (await resp.json().catch(() => null)) as { ok?: boolean; error_code?: number; description?: string } | null;
-    if (resp.ok && body?.ok === true) return { status: 'ok' };
+    const body = (await resp.json().catch(() => null)) as { ok?: boolean; result?: unknown; error_code?: number; description?: string } | null;
+    // Both methods return exactly `true` on success; anything else is not proof.
+    if (resp.ok && body?.ok === true && body.result === true) return { status: 'ok' };
     if (resp.status >= 400 && resp.status < 500 && body && body.ok === false) {
       return { status: 'rejected', code: body.error_code ?? resp.status, description: telegramErrorText(body.description ?? `HTTP ${resp.status}`) };
     }
@@ -692,11 +696,19 @@ export class TelegramClient {
   // `onWidgetQuery`, when given, for every widget_query) until stop() is
   // called. Network errors are logged and retried with a short backoff so a
   // transient outage never kills the bridge.
+  //
+  // Messages are handled one at a time, in order, on a queue the poll does not
+  // wait for, so a slow message (a download, speech-to-text) never holds back
+  // the next getUpdates. Widget queries are handled as soon as they arrive,
+  // concurrently: each must be answered within Telegram's 15 s. stop() lets
+  // the running handlers finish and starts no queued message.
   async poll(
     onMessage: (m: TelegramMessage) => Promise<void> | void,
     onWidgetQuery?: (q: TelegramWidgetQuery) => Promise<void> | void,
   ): Promise<void> {
     this.stopped = false;
+    let messages: Promise<void> = Promise.resolve();
+    const queries = new Set<Promise<void>>();
     while (!this.stopped) {
       this.aborter = new AbortController();
       const timer = setTimeout(() => this.aborter?.abort(), (this.pollTimeoutSec + 10) * 1000);
@@ -729,11 +741,15 @@ export class TelegramClient {
           if (u.widget_query && onWidgetQuery) {
             const q = parseWidgetQuery(u.update_id, u.widget_query);
             if (!q) continue;
-            try {
-              await onWidgetQuery(q);
-            } catch (err) {
-              this.log(`onWidgetQuery handler failed: ${String(err)}`);
-            }
+            const run = (async () => {
+              try {
+                await onWidgetQuery(q);
+              } catch (err) {
+                this.log(`onWidgetQuery handler failed: ${String(err)}`);
+              }
+            })();
+            queries.add(run);
+            void run.finally(() => queries.delete(run));
             continue;
           }
           const m = u.message;
@@ -742,29 +758,35 @@ export class TelegramClient {
           // Forward a message with text, a caption, OR media — drop only the
           // truly empty (service messages, edits we did not subscribe to).
           if (typeof m.text !== 'string' && typeof m.caption !== 'string' && !attachment) continue;
-          try {
-            await onMessage({
-              update_id: u.update_id,
-              message_id: m.message_id ?? 0,
-              chat_id: m.chat.id,
-              chat_type: m.chat.type,
-              chat_username: m.chat.username,
-              thread_id: m.is_topic_message ? m.message_thread_id : undefined,
-              is_topic: m.is_topic_message === true,
-              chat_title: m.chat.title,
-              from: senderLabel(m),
-              from_id: m.from?.id,
-              from_username: m.from?.username,
-              text: messageMarkdown(m),
-              date: m.date,
-              reply_to: parseReply(m),
-              forwarded_from: parseForwardOrigin(m),
-              attachment,
-            });
-          } catch (err) {
-            this.log(`onMessage handler failed: ${String(err)}`);
-          }
+          const message: TelegramMessage = {
+            update_id: u.update_id,
+            message_id: m.message_id ?? 0,
+            chat_id: m.chat.id,
+            chat_type: m.chat.type,
+            chat_username: m.chat.username,
+            thread_id: m.is_topic_message ? m.message_thread_id : undefined,
+            is_topic: m.is_topic_message === true,
+            chat_title: m.chat.title,
+            from: senderLabel(m),
+            from_id: m.from?.id,
+            from_username: m.from?.username,
+            text: messageMarkdown(m),
+            date: m.date,
+            reply_to: parseReply(m),
+            forwarded_from: parseForwardOrigin(m),
+            attachment,
+          };
+          messages = messages.then(async () => {
+            if (this.stopped) return;
+            try {
+              await onMessage(message);
+            } catch (err) {
+              this.log(`onMessage handler failed: ${String(err)}`);
+            }
+          });
         }
+        // Without widget queries, keep the old pacing: one batch at a time.
+        if (!onWidgetQuery) await messages;
       } catch (err) {
         clearTimeout(timer);
         if (this.stopped) break;
@@ -778,6 +800,8 @@ export class TelegramClient {
         this.aborter = null;
       }
     }
+    await messages;
+    await Promise.all(queries);
   }
 
   stop(): void {

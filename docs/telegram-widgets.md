@@ -18,8 +18,9 @@ Sources: Bot API 10.4, dated 9 November 2026, checked 10 November 2026:
   sending. Only the bot can write its state: `chat_data` (this message) and
   `public_data`.
 - **Production:** widgets work only in the bot's private chat with a user, and are
-  automatically protected (no forwarding). Groups, inline mode, forwards and
-  shared widgets are test-server only. This connector does not use them.
+  automatically protected (no forwarding). Groups, inline mode and forwards are
+  test-server only. Shared widgets (`is_shared`) are a separate feature that this
+  connector does not use yet.
 - **Sandbox:** the widget runs in QuickJS with no network, no external resources
   and no keyboard input. Its one way out is `TelegramWidget.request(data)`.
 - `request(data)` sends 1–64 UTF-8 bytes. The bot receives it as a `widget_query`
@@ -84,6 +85,15 @@ The `result.status` is one of:
 | `sent` | posted; includes `widget_ref` and `message_id` |
 | `rejected` | not posted. `code` is `invalid_html`, `invalid_state`, `invalid_arguments`, `not_authorized`, `unsupported_route`, `ledger_full`, `ledger_unavailable`, `state_unwritable`, `request_id_conflict`, or `telegram_refused` (with `telegram_error_code` and a short, token-free `description`) |
 | `unknown` | the request may have been posted (transport error, 5xx, unreadable reply, or a connector restart mid-send). It is **never re-sent**. |
+
+If the connector cannot save the outcome after Telegram answers, the result still
+reports what Telegram said. It also carries `ledger_saved: false` and a `warning`:
+after a connector restart that widget becomes `unknown` and stops accepting
+requests and updates.
+
+Error descriptions come from Telegram. Bot tokens are redacted, and the text is
+cut at the first character outside a plain-text set, so a description that echoes
+the HTML or state is not passed on.
 
 `request_id` is the idempotency key. Repeating it with the same arguments returns
 the stored outcome with `duplicate: true` and does not send again. Repeating it
@@ -173,16 +183,26 @@ and no state.
   consumes the row, and the ours SDK runs the handler and returns its result. The
   daemon marks a command read before its handler runs, so a command is never
   replayed after a restart.
+- A query id is saved before the query is acknowledged. If it cannot be saved,
+  the query is answered `{"ok":false}` and not forwarded, so a restart can never
+  deliver it twice.
 - One `getUpdates` poller per bot serves both messages and `widget_query`
-  (`allowed_updates: ["message", "widget_query"]`).
+  (`allowed_updates: ["message", "widget_query"]`). Messages are still handled
+  one at a time, in order, but on a queue the poller does not wait for. Each
+  widget query is handled as soon as it arrives. This way a slow message (a
+  media download or speech-to-text) or a slow forward to one agent cannot push
+  another widget's acknowledgement past 15 s. Forwarded query events can
+  therefore arrive in a different order than the taps; use your own state (for
+  example a revision number in `chat_data`) if order matters.
 
 ## Not included
 
 These are not used by this connector:
 
-- groups, forum topics, inline mode, forwards and shared widgets (`is_shared`,
-  `sendSharedWidget`, `editSharedWidgetData`, `shared_widget_query`), which are
-  not available in production;
+- groups, forum topics, inline mode and forwards, which are not available in
+  production;
+- shared widgets (`is_shared`, `sendSharedWidget`, `editSharedWidgetData`,
+  `shared_widget_query`), which this connector does not use yet;
 - agent-authored query answers, since the connector answers at once to meet the
   15 s deadline;
 - captions with formatting;

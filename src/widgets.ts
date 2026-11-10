@@ -249,7 +249,9 @@ export class WidgetStore {
     return rec;
   }
 
-  settle(rec: WidgetRecord, outcome: WidgetSendOutcome): void {
+  // Apply the send outcome. Returns false if it could not be saved: the file
+  // then still says `sending`, which a restart turns into `unknown`.
+  settle(rec: WidgetRecord, outcome: WidgetSendOutcome): boolean {
     if (outcome.status === 'sent') {
       rec.status = 'sent';
       rec.messageId = outcome.messageId;
@@ -257,20 +259,36 @@ export class WidgetStore {
       rec.status = outcome.status;
       rec.detail = outcome.description;
     }
-    try { this.persist(); } catch (err) { this.log(`widget record write failed: ${String(err)}`); }
+    try {
+      this.persist();
+      return true;
+    } catch (err) {
+      this.log(`widget record write failed: ${String(err)}`);
+      return false;
+    }
   }
 
-  // Record a query id. Returns false when it was already seen (a duplicate
-  // update), so each query is answered and forwarded at most once.
-  claimQuery(id: string): boolean {
-    if (this.queryIds.has(id)) return false;
+  // Durably record a query id before it is acted on, so each query is
+  // answered and forwarded at most once, across restarts too. `unsaved` means
+  // the id could not be written: the caller must not act on the query.
+  claimQuery(id: string): 'claimed' | 'duplicate' | 'unsaved' {
+    if (this.queryIds.has(id)) return 'duplicate';
+    const before = this.queries.slice();
     this.queries.push(id);
     this.queryIds.add(id);
-    if (this.queries.length > MAX_QUERY_IDS) {
-      for (const old of this.queries.splice(0, this.queries.length - MAX_QUERY_IDS)) this.queryIds.delete(old);
+    const evicted = this.queries.length > MAX_QUERY_IDS
+      ? this.queries.splice(0, this.queries.length - MAX_QUERY_IDS)
+      : [];
+    try {
+      this.persist();
+    } catch (err) {
+      this.queries = before;
+      this.queryIds.delete(id);
+      this.log(`widget query record write failed: ${String(err)}`);
+      return 'unsaved';
     }
-    try { this.persist(); } catch (err) { this.log(`widget query record write failed: ${String(err)}`); }
-    return true;
+    for (const old of evicted) this.queryIds.delete(old);
+    return 'claimed';
   }
 }
 
@@ -435,8 +453,17 @@ export async function sendWidgetCommand(deps: WidgetDeps, args: JsonValue, ctx: 
     ...(chatData !== undefined ? { chat_data: chatData } : {}),
     ...(caption !== undefined ? { caption } : {}),
   });
-  deps.store.settle(rec, outcome);
+  const saved = deps.store.settle(rec, outcome);
   deps.log(`[${route.name}] widget ${rec.ref} send ${outcome.status}${outcome.status === 'sent' ? ` as message ${outcome.messageId}` : ''}`);
+  if (!saved) {
+    // Telegram's answer is reported truthfully, but the record on disk still
+    // says `sending`: after a restart this widget is `unknown` and its
+    // requests and updates are refused.
+    return recordResult(rec, {
+      ledger_saved: false,
+      warning: 'the outcome could not be saved; after a connector restart this widget becomes unknown and stops accepting requests and updates',
+    });
+  }
   if (outcome.status === 'rejected') {
     return recordResult(rec, {
       code: 'telegram_refused',
@@ -546,10 +573,12 @@ export async function handleWidgetQuery(
   if (!view.peerCid || rec.owner !== view.peerCid) return refuseQuery('the widget\'s agent is no longer this route\'s agent');
   // Only a query bound to one of our widgets enters the dedupe ring, so
   // unrelated ids cannot push live ones out.
-  if (!route.store.claimQuery(q.id)) {
+  const claim = route.store.claimQuery(q.id);
+  if (claim === 'duplicate') {
     log(`widget query ${q.id} is a duplicate update — ignored`);
     return 'duplicate';
   }
+  if (claim === 'unsaved') return refuseQuery('its id could not be recorded, so it cannot be deduplicated');
 
   // Answer first: Telegram refuses an answer after 15 s ("query is too old"),
   // which is how a query left queued across a restart is recognized as stale.

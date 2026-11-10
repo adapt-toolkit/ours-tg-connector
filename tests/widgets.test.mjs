@@ -7,7 +7,7 @@
 // Run: node_modules/.bin/tsx tests/widgets.test.mjs
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -43,10 +43,15 @@ function mockTelegram(script = {}) {
     const body = init.body ? JSON.parse(init.body) : {};
     calls.push({ method, body });
     const q = script[method];
-    const next = typeof q === 'function' ? q(body) : Array.isArray(q) && q.length ? q.shift() : null;
+    let next = typeof q === 'function' ? q(body) : Array.isArray(q) && q.length ? q.shift() : null;
+    if (typeof next === 'function') next = next(body);
     if (next instanceof Error) throw next;
     if (next) return next;
     if (method === 'sendWidget') return json({ ok: true, result: { message_id: 500 + calls.length, chat: { id: body.chat_id } } });
+    if (method === 'getUpdates') { // an idle long poll: wait a little, like the real one
+      await new Promise((r) => setTimeout(r, 5));
+      return json({ ok: true, result: [] });
+    }
     return json({ ok: true, result: true });
   };
   const tg = new TelegramClient(TOKEN, 1, () => {}, { retries: 1, retryBaseMs: 1 }, fetchImpl);
@@ -138,10 +143,13 @@ try {
     assert.ok(!r.description.includes(TOKEN.split(':')[1]), 'token redacted');
     assert.ok(!JSON.stringify(r).includes('<script'), 'HTML never echoed');
   });
-  await test('telegramErrorText bounds and redacts', () => {
+  await test('telegramErrorText bounds, redacts tokens and never repeats echoed payloads', () => {
     const s = telegramErrorText(`x ${TOKEN} ${'y'.repeat(500)}`);
-    assert.ok(s.length <= 200);
+    assert.ok(s.length <= 160);
     assert.ok(!s.includes('FAKE-token'));
+    assert.equal(telegramErrorText('Bad Request: INPUT_MEDIA_WIDGET_TOO_LARGE'), 'Bad Request: INPUT_MEDIA_WIDGET_TOO_LARGE');
+    const echoed = telegramErrorText('Bad Request: can\'t parse <script>secret()</script> {"pin":"1234"}');
+    assert.equal(echoed, "Bad Request: can't parse […]");
   });
   await test('editMessageWidgetData: not-modified is updated/unchanged; 5xx/transport is unknown; 4xx rejected', async () => {
     const t = mockTelegram({ editMessageWidgetData: [
@@ -153,6 +161,16 @@ try {
     assert.equal((await t.tg.editMessageWidgetData(1, 2, { chat_data: 'x' })).status, 'unknown');
     assert.equal((await t.tg.editMessageWidgetData(1, 2, { chat_data: 'x' })).status, 'rejected');
     assert.deepEqual(t.of('editMessageWidgetData')[0].body, { chat_id: 1, message_id: 2, chat_data: 'x' });
+  });
+
+  await test('answer/edit need result:true — ok:true with result:false is not success (C3)', async () => {
+    const t = mockTelegram({
+      answerWidgetQuery: [json({ ok: true, result: false })],
+      editMessageWidgetData: [json({ ok: true, result: false }), json({ ok: true })],
+    });
+    await assert.rejects(() => t.tg.answerWidgetQuery('q', 'x'), /answerWidgetQuery unknown/);
+    assert.equal((await t.tg.editMessageWidgetData(1, 2, { chat_data: 'x' })).status, 'unknown');
+    assert.equal((await t.tg.editMessageWidgetData(1, 2, { chat_data: 'x' })).status, 'unknown');
   });
 
   console.log('=== command authorization and validation ===');
@@ -241,6 +259,27 @@ try {
     assert.equal((await updateWidgetCommand(deps, { widget_ref: widgets[0].ref, chat_data: '1' }, ctx(AGENT_A))).status, 'updated');
     assert.equal(t.of('sendWidget').length, 0);
   });
+  await test('a send whose outcome cannot be saved says so, and is unknown after restart (C1)', async () => {
+    const dir = tmp();
+    const t = mockTelegram({ sendWidget: [() => {
+      mkdirSync(join(dir, 'widgets.json.tmp')); // the next ledger write fails
+      return json({ ok: true, result: { message_id: 88 } });
+    }] });
+    const { deps } = routeDeps({ tg: t.tg, dir });
+    const r = await sendWidgetCommand(deps, { request_id: 'r', html: HTML }, ctx(AGENT_A));
+    assert.equal(r.status, 'sent');
+    assert.equal(r.message_id, 88);
+    assert.equal(r.ledger_saved, false);
+    assert.match(r.warning, /after a connector restart/);
+    rmSync(join(dir, 'widgets.json.tmp'), { recursive: true });
+    const reborn = routeDeps({ tg: t.tg, dir });
+    assert.equal(reborn.deps.store.byRef(r.widget_ref).status, 'unknown');
+    assert.equal((await updateWidgetCommand(reborn.deps, { widget_ref: r.widget_ref, chat_data: '1' }, ctx(AGENT_A))).code, 'unknown_widget');
+    const q = await handleWidgetQuery(query({ message_id: 88 }), reborn.deps, t.tg, async () => assert.fail('forwarded'), () => {});
+    assert.equal(q, 'refused');
+    assert.equal((await sendWidgetCommand(reborn.deps, { request_id: 'r', html: HTML }, ctx(AGENT_A))).status, 'unknown', 'never re-sent');
+    assert.equal(t.of('sendWidget').length, 1);
+  });
   await test('an unwritable ledger means nothing is sent', async () => {
     const t = mockTelegram();
     const dir = tmp();
@@ -310,6 +349,23 @@ try {
     assert.equal(forwards, 1);
     assert.equal(t.of('answerWidgetQuery').length, 1);
   });
+  await test('a query whose id cannot be saved is refused, not forwarded — before and after restart (C1)', async () => {
+    const { t, deps, dir, sent } = await sentWidget();
+    mkdirSync(join(dir, 'widgets.json.tmp'));
+    const q = query({ message_id: sent.message_id });
+    let forwards = 0;
+    assert.equal(await handleWidgetQuery(q, deps, t.tg, async () => { forwards += 1; }, () => {}), 'refused');
+    const reborn = routeDeps({ tg: t.tg, dir });
+    assert.equal(reborn.deps.store.broken, null, 'the ledger itself is still readable');
+    assert.equal(await handleWidgetQuery(q, reborn.deps, t.tg, async () => { forwards += 1; }, () => {}), 'refused');
+    assert.equal(forwards, 0);
+    assert.ok(t.of('answerWidgetQuery').every((c) => c.body.data === REFUSED_ANSWER));
+  });
+  await test('ok:true/result:false on the acknowledgement is treated as stale (C3)', async () => {
+    const { t, deps, sent } = await sentWidget({ script: { answerWidgetQuery: [json({ ok: true, result: false })] } });
+    const out = await handleWidgetQuery(query({ message_id: sent.message_id }), deps, t.tg, async () => assert.fail('forwarded'), () => {});
+    assert.equal(out, 'stale');
+  });
   await test('a stale query ("query is too old") is never forwarded', async () => {
     const { t, deps, sent } = await sentWidget({ script: { answerWidgetQuery: [json({ ok: false, error_code: 400, description: 'Bad Request: query is too old and response timeout expired or query ID is invalid' }, 400)] } });
     const out = await handleWidgetQuery(query({ message_id: sent.message_id }), deps, t.tg, async () => assert.fail('forwarded'), () => {});
@@ -373,7 +429,8 @@ try {
     tg = t.tg;
     const messages = [];
     const queries = [];
-    await tg.poll((m) => { messages.push(m); }, (q) => { queries.push(q); tg.stop(); });
+    const both = () => { if (messages.length && queries.length) tg.stop(); };
+    await tg.poll((m) => { messages.push(m); both(); }, (q) => { queries.push(q); both(); });
     assert.deepEqual(t.of('getUpdates')[0].body.allowed_updates, ['message', 'widget_query']);
     assert.equal(messages.length, 1);
     assert.equal(messages[0].text, 'hello');
@@ -381,6 +438,55 @@ try {
       update_id: 11, id: 'q1', from_id: 1111, from: 'Alice', chat_id: 1111, chat_type: 'private', message_id: 5,
       inline: false, shared: false, queryType: 'data', data: 'inc',
     });
+  });
+  await test('a widget query is answered while a slow message is still being handled (C2)', async () => {
+    const order = [];
+    let releaseMessage;
+    let tg;
+    const t = mockTelegram({ getUpdates: [
+      json({ ok: true, result: [
+        { update_id: 20, message: { message_id: 1, date: 1, chat: { id: 1111, type: 'private' }, text: 'slow voice note' } },
+        { update_id: 21, widget_query: { id: 'q-fast', from: { id: 1111 }, chat: { id: 1111, type: 'private' }, message_id: 5, type: { type: 'data' }, data: 'inc' } },
+      ] }),
+      json({ ok: true, result: [
+        { update_id: 22, widget_query: { id: 'q-later', from: { id: 1111 }, chat: { id: 1111, type: 'private' }, message_id: 5, type: { type: 'data' }, data: 'inc' } },
+      ] }),
+    ] });
+    tg = t.tg;
+    const done = tg.poll(
+      async (m) => { order.push(`message start ${m.text}`); await new Promise((r) => { releaseMessage = r; }); order.push('message end'); },
+      async (q) => {
+        order.push(`query ${q.id}`);
+        if (q.id === 'q-later') { releaseMessage(); tg.stop(); }
+      },
+    );
+    await done;
+    assert.equal(order.at(-1), 'message end', 'the slow message finished last');
+    assert.deepEqual(order.slice(0, -1).sort(), ['message start slow voice note', 'query q-fast', 'query q-later']);
+    assert.ok(t.of('getUpdates').length >= 2, 'the poll kept fetching while the message was in progress');
+  });
+  await test('a slow forward to one agent does not delay the acknowledgement of the next query (C2)', async () => {
+    const { t, deps, sent } = await sentWidget();
+    let releaseForward;
+    const forwards = [];
+    const handler = (q) => handleWidgetQuery(q, deps, t.tg, async (owner, text) => {
+      forwards.push(JSON.parse(text).data);
+      if (forwards.length === 1) await new Promise((r) => { releaseForward = r; });
+    }, () => {});
+    const raw = (id, data) => ({ id, from: { id: 1111, first_name: 'Alice' }, chat: { id: 1111, type: 'private' }, message_id: sent.message_id, type: { type: 'data' }, data });
+    const t2 = mockTelegram({ getUpdates: [json({ ok: true, result: [
+      { update_id: 30, widget_query: raw('q1', 'pick:0') },
+      { update_id: 31, widget_query: raw('q2', 'pick:1') },
+    ] })] });
+    const poller = t2.tg;
+    const done = poller.poll(() => {}, handler);
+    // Wait until both acknowledgements went out while q1's forward is still pending.
+    for (let i = 0; i < 200 && t.of('answerWidgetQuery').length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(t.of('answerWidgetQuery').length, 2);
+    assert.deepEqual(forwards, ['pick:0', 'pick:1']);
+    poller.stop();
+    releaseForward();
+    await done;
   });
   await test('without a widget handler the allowlist is unchanged', async () => {
     let tg;
