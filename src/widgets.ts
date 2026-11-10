@@ -312,10 +312,19 @@ export interface WidgetTelegram {
 }
 
 export interface WidgetDeps {
-  route: () => WidgetRouteView; // live view: peerCid can change when the agent connects
+  route: () => WidgetRouteView; // live view: peerCid is set once, when the route binds its agent
   tg: WidgetTelegram;
   store: WidgetStore;
   log: (msg: string) => void;
+  // Re-evaluate an unbound route's proxy agent from the authenticated contact
+  // list (src/proxy-binding.ts) before authorizing; never binds from the command.
+  ensureBound?: (reason: string) => Promise<unknown>;
+}
+
+// The binding a command is authorized against: unbound routes are re-evaluated first.
+async function routeForCommand(deps: WidgetDeps): Promise<WidgetRouteView> {
+  if (!deps.route().peerCid && deps.ensureBound) await deps.ensureBound('command');
+  return deps.route();
 }
 
 const stateSchema = { type: 'string', maxLength: WIDGET_STATE_MAX_BYTES };
@@ -388,7 +397,7 @@ function recordResult(rec: WidgetRecord, extra: Result = {}): Result {
 }
 
 export async function sendWidgetCommand(deps: WidgetDeps, args: JsonValue, ctx: Readonly<CommandContext>): Promise<Result> {
-  const route = deps.route();
+  const route = await routeForCommand(deps);
   const denied = authorize(route, ctx);
   if (denied) return denied;
   const o = asObject(args);
@@ -475,7 +484,7 @@ export async function sendWidgetCommand(deps: WidgetDeps, args: JsonValue, ctx: 
 }
 
 export async function updateWidgetCommand(deps: WidgetDeps, args: JsonValue, ctx: Readonly<CommandContext>): Promise<Result> {
-  const route = deps.route();
+  const route = await routeForCommand(deps);
   const denied = authorize(route, ctx);
   if (denied) return denied;
   const o = asObject(args);
