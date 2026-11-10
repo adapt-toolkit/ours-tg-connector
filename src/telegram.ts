@@ -708,6 +708,7 @@ export class TelegramClient {
   ): Promise<void> {
     this.stopped = false;
     let messages: Promise<void> = Promise.resolve();
+    let queued = 0; // messages waiting or running on the queue
     const queries = new Set<Promise<void>>();
     while (!this.stopped) {
       this.aborter = new AbortController();
@@ -776,17 +777,24 @@ export class TelegramClient {
             forwarded_from: parseForwardOrigin(m),
             attachment,
           };
+          queued += 1;
           messages = messages.then(async () => {
-            if (this.stopped) return;
             try {
-              await onMessage(message);
+              if (!this.stopped) await onMessage(message);
             } catch (err) {
               this.log(`onMessage handler failed: ${String(err)}`);
+            } finally {
+              queued -= 1;
             }
           });
         }
         // Without widget queries, keep the old pacing: one batch at a time.
+        // With them, the queue is bounded: past MAX_QUEUED_MESSAGES (or
+        // MAX_INFLIGHT_QUERIES) the poll waits before fetching more.
         if (!onWidgetQuery) await messages;
+        while (!this.stopped && (queued > MAX_QUEUED_MESSAGES || queries.size > MAX_INFLIGHT_QUERIES)) {
+          await Promise.race([messages, ...queries]);
+        }
       } catch (err) {
         clearTimeout(timer);
         if (this.stopped) break;
@@ -858,5 +866,10 @@ export function splitForMarkdownV2(text: string, limit = TELEGRAM_TEXT_LIMIT): s
   if (rest) out.push(rest);
   return out;
 }
+
+// Backpressure for poll(): how far message handling may fall behind, and how
+// many widget queries may be in flight, before the poll stops fetching.
+const MAX_QUEUED_MESSAGES = 200;
+const MAX_INFLIGHT_QUERIES = 64;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

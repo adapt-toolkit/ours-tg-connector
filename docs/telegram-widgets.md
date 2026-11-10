@@ -194,6 +194,8 @@ and no state.
   another widget's acknowledgement past 15 s. Forwarded query events can
   therefore arrive in a different order than the taps; use your own state (for
   example a revision number in `chat_data`) if order matters.
+  The queue is bounded: with more than 200 messages waiting, or 64 queries in
+  flight, the poller pauses fetching until handling catches up.
 
 ## Not included
 

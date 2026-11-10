@@ -488,6 +488,20 @@ try {
     releaseForward();
     await done;
   });
+  await test('the message queue is bounded: past 200 waiting messages the poll stops fetching', async () => {
+    const batch = Array.from({ length: 205 }, (_, i) => ({ update_id: 100 + i, message: { message_id: i + 1, date: 1, chat: { id: 1111, type: 'private' }, text: `m${i}` } }));
+    const t = mockTelegram({ getUpdates: [json({ ok: true, result: batch })] });
+    const tg = t.tg;
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let handled = 0;
+    const done = tg.poll(async () => { await gate; handled += 1; if (handled === 205) tg.stop(); }, () => {});
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(t.of('getUpdates').length, 1, 'no second fetch while 205 messages wait');
+    release();
+    await done;
+    assert.equal(handled, 205, 'every queued message is still handled, in order');
+  });
   await test('without a widget handler the allowlist is unchanged', async () => {
     let tg;
     const t = mockTelegram({ getUpdates: [json({ ok: true, result: [
