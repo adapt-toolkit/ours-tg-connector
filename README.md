@@ -219,7 +219,9 @@ that agent as a `telegram_widget_query` JSON message (untrusted data). Discover
 the commands with `list_contact_commands`. Ordinary agent text is never turned
 into a widget. Typed command rows are never posted to Telegram; the drain
 consumes them and the SDK returns each command's result. Production Telegram
-supports widgets in private chats only. See
+supports widgets in private chats only. Widget commands are accepted only from
+the route's recorded agent, which the route takes from its contact list when it
+has exactly one contact. See
 [docs/telegram-widgets.md](docs/telegram-widgets.md) and
 [examples/widget-choice.html](examples/widget-choice.html).
 

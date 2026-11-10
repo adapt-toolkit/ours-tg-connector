@@ -50,9 +50,18 @@ A route offers widgets only when it is pinned to **one private chat**: a positiv
 chat id with no topic. Catch-all, group and topic routes advertise no widget
 commands, so `send_command` reports `unsupported_peer`.
 
-Only the route's connected agent can use them. That is the first contact that
-accepted the invite (`peerCid`), as authenticated by ours, never by a name or an
-argument.
+Only the route's connected agent can use them. That is the route's recorded
+proxy agent (`peerCid`), and the command's sender must be that agent as
+authenticated by ours, never by a name or an argument.
+
+A route records its agent once, from the daemon's authenticated contact list, and
+only when the route has **exactly one** contact. It checks when the route starts,
+when a contact is added, and when a widget command arrives while no agent is
+recorded. This also covers routes created before the binding was recorded. A
+recorded agent is never replaced by later contacts. If the route has no contact or
+several, or the contact list cannot be read, or the binding cannot be saved, no
+agent is recorded and widget commands answer `not_authorized`; ordinary messages
+are unaffected. The connector log names the reason (`proxy agent not bound ...`).
 
 ## Agent usage
 

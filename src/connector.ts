@@ -103,6 +103,7 @@ import {
 import { drainMessages as drainHistoryMessages, drainFiles as drainHistoryFiles } from './history-delivery';
 import { reconcileReceiptHistory } from './history-receipts';
 import { singleFlight, type SingleFlight } from './single-flight';
+import { makeProxyBinder, type BindOutcome } from './proxy-binding';
 
 const CONFIG = loadConfig();
 const STATE_DIR = CONFIG.stateDir;
@@ -175,6 +176,7 @@ interface Connection {
   watchHandle: Promise<void> | null;
   /** Stops this route's notification watch on removal / shutdown. */
   watch: AbortController | null;
+  bindProxy: (reason: string) => Promise<BindOutcome>; // see src/proxy-binding.ts
 }
 
 function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bot: Bot): Connection {
@@ -189,11 +191,19 @@ function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bo
     drainMessages: singleFlight(() => forwardToTelegram(conn)),
     drainFiles: singleFlight(() => forwardFilesToTelegram(conn)),
     syncReceipts: singleFlight(() => syncReceiptHistory(conn)),
+    bindProxy: makeProxyBinder({
+      current: () => cfg.peerCid,
+      listContacts: async () => (await client.listContacts()).contacts,
+      persist: (peerCid) => writeMeta(dir, { ...cfg, peerCid }),
+      commit: (peerCid) => { cfg.peerCid = peerCid; },
+      log: (m) => log(`[${cfg.name}] ${m}`),
+    }),
     widgets: {
       route: () => ({ name: cfg.name, chatId: cfg.chatId, threadId: cfg.threadId, peerCid: cfg.peerCid }),
       tg: bot.tg,
       store: new WidgetStore(dir, (m) => log(`[${cfg.name}] ${m}`)),
       log: (m) => log(m),
+      ensureBound: (reason) => conn.bindProxy(reason),
     },
     watch: null,
     watchHandle: null,
@@ -549,18 +559,13 @@ function watchRoute(conn: Connection): void {
           } else if (event === 'sync_required') {
             await Promise.all([conn.drainMessages(), conn.drainFiles(), conn.syncReceipts()]);
           } else if (event === 'contact_accepted' || event === 'sibling_contact_added' || event === 'local_contact_added') {
-            // The FIRST accepted contact is the proxy agent (telegram traffic routes
-            // there). Later contacts must NOT clobber it, so only set peerCid while
-            // it is still empty.
+            // The event only triggers a re-evaluation: the binding comes from the
+            // authenticated contact list (exactly one contact), never from this
+            // payload, and an existing binding is never replaced.
             const name = String(ev.from ?? ev.name ?? '');
             const cid = String(ev.container_id ?? ev.cid ?? '');
-            if (cid && !cfg.peerCid) {
-              cfg.peerCid = cid;
-              writeMeta(conn.dir, cfg);
-              log(`[${cfg.name}] proxy agent connected: "${name}" (${cid})`);
-            } else {
-              log(`[${cfg.name}] contact added: "${name}" (${cid})`);
-            }
+            log(`[${cfg.name}] contact added: "${name}" (${cid})`);
+            await conn.bindProxy(event);
           } else if (event === 'contact_restored') {
             log(`[${cfg.name}] contact "${String(ev.from ?? '')}" restored (re-keyed)`);
           }
@@ -1048,6 +1053,9 @@ async function restoreConnection(name: string): Promise<void> {
   connections.set(name, conn);
   const conflict = registerRoute(conn);
   if (conflict) throw new Error(conflict);
+  // A legacy route may predate the recorded binding (or have missed its contact
+  // event); bind its sole contact before commands and the first drain.
+  await conn.bindProxy('restore');
   await registerWidgetCommands(conn);
   watchRoute(conn);
   // Anything that arrived while this process was down is already in the daemon;

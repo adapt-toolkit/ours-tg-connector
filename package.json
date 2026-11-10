@@ -47,6 +47,6 @@
     "esbuild": "^0.24.2",
     "tsx": "^4.19.0",
     "typescript": "^5.5.4",
-    "@ours.network/daemon": "5.0.1"
+    "@ours.network/daemon": "5.2.0"
   }
 }
