@@ -20,7 +20,8 @@
   "files": [
     "dist",
     "README.md",
-    "docs"
+    "docs",
+    "examples"
   ],
   "engines": {
     "node": ">=22"

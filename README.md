@@ -208,6 +208,21 @@ item stays unread and may be delivered again after restart. The connector favors
 recoverability over silently losing content and does not depend on removed
 defer/requeue or conversation-policy APIs.
 
+### Interactive widgets (Bot API 10.4)
+
+A route pinned to one private chat (positive chat id, no topic) advertises two
+typed ours commands to its connected agent: `telegram_widget_send` posts a
+self-contained HTML widget (≤32768 bytes, ≤4096 compressed) and
+`telegram_widget_update` changes its `chat_data` / `public_data`. When the user
+interacts, the connector answers the widget at once and forwards the request to
+that agent as a `telegram_widget_query` JSON message (untrusted data). Discover
+the commands with `list_contact_commands`. Ordinary agent text is never turned
+into a widget. Typed command rows are never posted to Telegram; the drain
+consumes them and the SDK returns each command's result. Production Telegram
+supports widgets in private chats only. See
+[docs/telegram-widgets.md](docs/telegram-widgets.md) and
+[examples/widget-choice.html](examples/widget-choice.html).
+
 ### Voice transcription (speech-to-text)
 
 A Telegram **voice note** carries no caption, so a bridged agent (a text LLM)

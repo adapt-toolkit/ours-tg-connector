@@ -245,6 +245,70 @@ interface RawMessage {
 interface RawUpdate {
   update_id: number;
   message?: RawMessage;
+  widget_query?: RawWidgetQuery;
+}
+
+// A Bot API 10.4 widget_query (https://core.telegram.org/bots/api#widgetquery).
+// Only the fields the connector reads; `type` carries the query kind.
+interface RawWidgetQuery {
+  id?: string;
+  from?: RawUser & { is_bot?: boolean };
+  chat?: RawChat;
+  message_id?: number;
+  inline_message_id?: string;
+  widget_id?: string;
+  type?: { type?: string };
+  data?: string;
+}
+
+// One inbound widget query, distilled. Telegram authenticates `from`, `chat` and
+// `message_id`; `data` is whatever the widget's own code chose to send and is
+// untrusted. `queryType` is 'data' for plain requests (wallet kinds are other values).
+export interface TelegramWidgetQuery {
+  update_id: number;
+  id: string;
+  from_id: number;
+  from: string;
+  chat_id?: number;
+  chat_type?: string;
+  message_id?: number;
+  inline: boolean;
+  shared: boolean;
+  queryType: string;
+  data: string;
+}
+
+// The outcome of a sendWidget call. `unknown` means the request may or may not
+// have produced a message (transport failure, 5xx, unreadable reply): it is
+// never retried, because a retry could post the widget twice.
+export type WidgetSendOutcome =
+  | { status: 'sent'; messageId: number }
+  | { status: 'rejected'; code: number; description: string; retryAfter?: number }
+  | { status: 'unknown'; description: string };
+
+export type WidgetEditOutcome =
+  | { status: 'updated'; changed: boolean }
+  | { status: 'rejected'; code: number; description: string }
+  | { status: 'unknown'; description: string };
+
+// An error text that is safe to hand to an agent: bounded, one line, and with
+// anything shaped like a bot token or a token-bearing URL redacted.
+export function telegramErrorText(s: unknown): string {
+  return String(s)
+    .replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot***')
+    .replace(/\b\d{5,}:[A-Za-z0-9_-]{20,}/g, '***')
+    .replace(/\s+/g, ' ')
+    .slice(0, 200);
+}
+
+export interface SendWidgetParams {
+  chat_id: number | string;
+  html: string;
+  width?: number;
+  height?: number;
+  public_data?: string;
+  chat_data?: string;
+  caption?: string;
 }
 
 function userLabel(u?: RawUser): string | undefined {
@@ -451,6 +515,83 @@ export class TelegramClient {
     return parsed?.result?.message_id ?? 0;
   }
 
+  // Send a static widget with queries allowed (Bot API 10.4 sendWidget). The
+  // request is made exactly once — no transport retry — and the reply is
+  // classified so the caller can tell "not sent" from "maybe sent".
+  async sendWidget(p: SendWidgetParams): Promise<WidgetSendOutcome> {
+    let resp: Response;
+    try {
+      resp = await this.tgFetch(this.url('sendWidget'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...p, allow_queries: true }),
+      }, false);
+    } catch (err) {
+      return { status: 'unknown', description: telegramErrorText(`transport error: ${(err as Error)?.message ?? String(err)}`) };
+    }
+    const body = (await resp.json().catch(() => null)) as {
+      ok?: boolean; result?: { message_id?: number }; error_code?: number; description?: string;
+      parameters?: { retry_after?: number };
+    } | null;
+    if (resp.ok && body?.ok === true && Number.isSafeInteger(body.result?.message_id) && body.result!.message_id! > 0) {
+      return { status: 'sent', messageId: body.result!.message_id! };
+    }
+    // A 4xx with Telegram's own error object is a definite refusal: nothing was posted.
+    if (resp.status >= 400 && resp.status < 500 && body && body.ok === false) {
+      return {
+        status: 'rejected',
+        code: body.error_code ?? resp.status,
+        description: telegramErrorText(body.description ?? `HTTP ${resp.status}`),
+        ...(body.parameters?.retry_after !== undefined ? { retryAfter: body.parameters.retry_after } : {}),
+      };
+    }
+    return { status: 'unknown', description: telegramErrorText(`HTTP ${resp.status}${body?.description ? `: ${body.description}` : ''}`) };
+  }
+
+  // Answer a widget query (Bot API 10.4 answerWidgetQuery). Must happen within
+  // 15 s of the tap; throws on any refusal (e.g. "query is too old").
+  async answerWidgetQuery(queryId: string, data?: string): Promise<void> {
+    const r = await this.callWidgetMethod('answerWidgetQuery', { widget_query_id: queryId, ...(data !== undefined ? { data } : {}) });
+    if (r.status !== 'ok') throw new Error(`answerWidgetQuery ${r.status}: ${r.description}`);
+  }
+
+  // Replace a widget's chat and/or public state (Bot API 10.4
+  // editMessageWidgetData). Setting state is idempotent, so transport errors
+  // are retried; what is still ambiguous afterwards is reported as `unknown`.
+  async editMessageWidgetData(
+    chatId: number | string,
+    messageId: number,
+    state: { chat_data?: string; public_data?: string },
+  ): Promise<WidgetEditOutcome> {
+    const r = await this.callWidgetMethod('editMessageWidgetData', { chat_id: chatId, message_id: messageId, ...state });
+    if (r.status === 'ok') return { status: 'updated', changed: true };
+    if (r.status === 'rejected' && /message is not modified/i.test(r.description)) return { status: 'updated', changed: false };
+    return r;
+  }
+
+  private async callWidgetMethod(method: string, payload: Record<string, unknown>): Promise<
+    | { status: 'ok' }
+    | { status: 'rejected'; code: number; description: string }
+    | { status: 'unknown'; description: string }
+  > {
+    let resp: Response;
+    try {
+      resp = await this.tgFetch(this.url(method), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      return { status: 'unknown', description: telegramErrorText(`transport error: ${(err as Error)?.message ?? String(err)}`) };
+    }
+    const body = (await resp.json().catch(() => null)) as { ok?: boolean; error_code?: number; description?: string } | null;
+    if (resp.ok && body?.ok === true) return { status: 'ok' };
+    if (resp.status >= 400 && resp.status < 500 && body && body.ok === false) {
+      return { status: 'rejected', code: body.error_code ?? resp.status, description: telegramErrorText(body.description ?? `HTTP ${resp.status}`) };
+    }
+    return { status: 'unknown', description: telegramErrorText(`HTTP ${resp.status}${body?.description ? `: ${body.description}` : ''}`) };
+  }
+
   async setMyCommands(commands: { command: string; description: string }[]): Promise<void> {
     const resp = await this.tgFetch(this.url('setMyCommands'), {
       method: 'POST',
@@ -547,10 +688,14 @@ export class TelegramClient {
     return Buffer.from(await resp.arrayBuffer());
   }
 
-  // Long-poll loop. Calls `onMessage` for every inbound text message until
-  // stop() is called. Network errors are logged and retried with a short
-  // backoff so a transient outage never kills the bridge.
-  async poll(onMessage: (m: TelegramMessage) => Promise<void> | void): Promise<void> {
+  // Long-poll loop. Calls `onMessage` for every inbound text message (and
+  // `onWidgetQuery`, when given, for every widget_query) until stop() is
+  // called. Network errors are logged and retried with a short backoff so a
+  // transient outage never kills the bridge.
+  async poll(
+    onMessage: (m: TelegramMessage) => Promise<void> | void,
+    onWidgetQuery?: (q: TelegramWidgetQuery) => Promise<void> | void,
+  ): Promise<void> {
     this.stopped = false;
     while (!this.stopped) {
       this.aborter = new AbortController();
@@ -562,7 +707,7 @@ export class TelegramClient {
           body: JSON.stringify({
             offset: this.offset,
             timeout: this.pollTimeoutSec,
-            allowed_updates: ['message'],
+            allowed_updates: onWidgetQuery ? ['message', 'widget_query'] : ['message'],
           }),
           signal: this.aborter.signal,
         }, false);
@@ -581,6 +726,16 @@ export class TelegramClient {
         for (const u of body.result) {
           if (this.stopped) break;
           this.offset = Math.max(this.offset, u.update_id + 1);
+          if (u.widget_query && onWidgetQuery) {
+            const q = parseWidgetQuery(u.update_id, u.widget_query);
+            if (!q) continue;
+            try {
+              await onWidgetQuery(q);
+            } catch (err) {
+              this.log(`onWidgetQuery handler failed: ${String(err)}`);
+            }
+            continue;
+          }
           const m = u.message;
           if (!m) continue;
           const attachment = pickAttachment(m);
@@ -629,6 +784,23 @@ export class TelegramClient {
     this.stopped = true;
     this.aborter?.abort();
   }
+}
+
+export function parseWidgetQuery(updateId: number, q: RawWidgetQuery): TelegramWidgetQuery | null {
+  if (typeof q.id !== 'string' || !q.id || typeof q.from?.id !== 'number' || typeof q.data !== 'string') return null;
+  return {
+    update_id: updateId,
+    id: q.id,
+    from_id: q.from.id,
+    from: userLabel(q.from) ?? 'telegram',
+    chat_id: typeof q.chat?.id === 'number' ? q.chat.id : undefined,
+    chat_type: q.chat?.type,
+    message_id: typeof q.message_id === 'number' ? q.message_id : undefined,
+    inline: typeof q.inline_message_id === 'string',
+    shared: typeof q.widget_id === 'string',
+    queryType: String(q.type?.type ?? ''),
+    data: q.data,
+  };
 }
 
 function chunkText(text: string, size: number): string[] {

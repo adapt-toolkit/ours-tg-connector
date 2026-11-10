@@ -84,7 +84,8 @@ import {
 } from '@ours.network/sdk';
 import type { OursClient, AttachOursClientOptions } from '@ours.network/sdk';
 import { TelegramClient } from './telegram';
-import type { TelegramMessage, AttachmentDescriptor } from './telegram';
+import type { TelegramMessage, TelegramWidgetQuery, AttachmentDescriptor } from './telegram';
+import { WidgetStore, widgetCommands, widgetEligible, handleWidgetQuery, type WidgetDeps } from './widgets';
 import { buildEnvelope, buildPlainPayload, attachmentMeta } from './envelope';
 import type { PayloadMode, ResolvedAttachment, TranscriptionResult } from './envelope';
 import { transcribe } from './stt';
@@ -170,6 +171,7 @@ interface Connection {
   drainFiles: SingleFlight;
   syncReceipts: SingleFlight;
   inbound: Promise<void> | null;
+  widgets: WidgetDeps; // Telegram widget commands + records (see src/widgets.ts)
   watchHandle: Promise<void> | null;
   /** Stops this route's notification watch on removal / shutdown. */
   watch: AbortController | null;
@@ -187,6 +189,12 @@ function makeConnection(client: OursClient, dir: string, cfg: ConnectionFile, bo
     drainMessages: singleFlight(() => forwardToTelegram(conn)),
     drainFiles: singleFlight(() => forwardFilesToTelegram(conn)),
     syncReceipts: singleFlight(() => syncReceiptHistory(conn)),
+    widgets: {
+      route: () => ({ name: cfg.name, chatId: cfg.chatId, threadId: cfg.threadId, peerCid: cfg.peerCid }),
+      tg: bot.tg,
+      store: new WidgetStore(dir, (m) => log(`[${cfg.name}] ${m}`)),
+      log: (m) => log(m),
+    },
     watch: null,
     watchHandle: null,
     inbound: null,
@@ -450,6 +458,37 @@ async function resolveAttachment(conn: Connection, d: AttachmentDescriptor): Pro
 // "groq"). Cosmetic only — recorded in the envelope's transcription block.
 function sttEngineLabel(baseUrl: string): string {
   try { return new URL(baseUrl).hostname.replace(/^api\./, '').split('.')[0]; } catch { return 'stt'; }
+}
+
+// Advertise the widget commands on a route pinned to one private chat, and
+// install their handlers on this route's client. Must run before the first
+// drain, so a queued command finds its handler. Other routes advertise nothing.
+async function registerWidgetCommands(conn: Connection): Promise<void> {
+  const { cfg } = conn;
+  if (!widgetEligible(cfg.chatId, cfg.threadId)) return;
+  try {
+    await conn.client.registerCommands(widgetCommands(conn.widgets));
+  } catch (err) {
+    log(`[${cfg.name}] registering widget commands failed (widgets unavailable on this route):`, String(err));
+  }
+}
+
+// Telegram → agent for a widget request. Resolved by the exact chat only —
+// never a catch-all — and bound to the widget's sender in src/widgets.ts.
+async function onBotWidgetQuery(bot: Bot, q: TelegramWidgetQuery): Promise<void> {
+  const conn = q.chat_id !== undefined ? bot.exact.get(chatKey(q.chat_id)) ?? null : null;
+  const tag = conn ? `[${conn.cfg.name}]` : `[bot ${botLabel(bot)}]`;
+  const outcome = await handleWidgetQuery(
+    q,
+    conn?.widgets ?? null,
+    bot.tg,
+    async (owner, text) => {
+      const sent = await conn!.client.sendMessage({ contact: owner, text });
+      if (sent.kind !== 'sent' && sent.kind !== 'e2e') log(`${tag} widget query event to ${owner}: ${sent.kind}`);
+    },
+    (m) => log(`${tag} ${m}`),
+  );
+  if (outcome === 'forwarded') log(`${tag} widget query forwarded to the agent`);
 }
 
 // ----- the bridge -------------------------------------------------------------
@@ -875,7 +914,7 @@ async function onBotMessage(bot: Bot, m: TelegramMessage): Promise<void> {
 // by this one loop via onBotMessage.
 function activateBot(bot: Bot): void {
   if (bot.pollHandle) return;
-  bot.pollHandle = bot.tg.poll((m) => onBotMessage(bot, m));
+  bot.pollHandle = bot.tg.poll((m) => onBotMessage(bot, m), (q) => onBotWidgetQuery(bot, q));
   void publishBotCommands(bot);
 }
 
@@ -944,6 +983,7 @@ async function createConnection(args: {
     ownedIdentityNames.add(args.name);
     daemonIdentityNames.add(args.name);
     writeMeta(dir, cfg);
+    await registerWidgetCommands(conn);
     watchRoute(conn);
     activateBot(bot); // idempotent — the bot already polls from add_bot
 
@@ -1008,6 +1048,7 @@ async function restoreConnection(name: string): Promise<void> {
   connections.set(name, conn);
   const conflict = registerRoute(conn);
   if (conflict) throw new Error(conflict);
+  await registerWidgetCommands(conn);
   watchRoute(conn);
   // Anything that arrived while this process was down is already in the daemon;
   // one drain now rather than waiting for the next notification.
