@@ -53,7 +53,8 @@ const connectorEnv = {
 };
 
 function startConnector() {
-  const child = spawn(process.execPath, ['--import', 'tsx', 'src/connector.ts'], {
+  // No request leaves the machine: the preload answers the Telegram API locally.
+  const child = spawn(process.execPath, ['--import', 'tsx', '--import', './tests/fixtures/no-external-fetch.mjs', 'src/connector.ts'], {
     cwd: ROOT,
     env: connectorEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -173,6 +174,8 @@ async function widgetVerdict(agent, route) {
   });
 }
 
+const evidence = [];
+const keep = (run) => evidence.push(...run.output.split('\n').filter((l) => /proxy agent|contact added|route restored|NO_EXTERNAL_FETCH/.test(l)));
 let connector = startConnector();
 try {
   await waitForConnector(connector, 0, 'connector control API');
@@ -199,7 +202,7 @@ try {
 
   // 2. Offline: make owner-dm legacy (binding cleared), give shared-dm a second
   //    contact (ambiguous), and keep invites for later contacts.
-  await connector.stop();
+  keep(connector); await connector.stop();
   clearBinding('owner-dm');
   await connectWith(other, shared.cid, await extraInvite('shared-dm'));
   const lateSharedInvite = await extraInvite('shared-dm');
@@ -217,7 +220,7 @@ try {
     assert.equal(await widgetVerdict(pa, owner), 'not_authorized', 'authorization stays closed after a failed write');
     assert.match(connector.output, /\[owner-dm\] proxy agent not bound \(command\): saving the binding failed/);
     assert.deepEqual(readFileSync(metaPath('owner-dm')), ownerBytes, 'still unchanged after the command retry');
-    await connector.stop();
+    keep(connector); await connector.stop();
     chmodSync(join(TG_STATE, 'owner-dm'), 0o700);
   } else {
     console.log('# skipped unwritable-metadata check (running as root)');
@@ -252,7 +255,7 @@ try {
   assert.equal(await widgetVerdict(other, owner), 'not_authorized', 'another contact of the bound route is refused');
 
   // 6. The binding survives restart.
-  await connector.stop();
+  keep(connector); await connector.stop();
   connector = startConnector();
   await waitForConnector(connector, 2, 'final restart');
   await waitFor('owner-dm restored again', () => connector.output.includes('[owner-dm] route restored') ? true : undefined);
@@ -260,9 +263,16 @@ try {
   assert.equal(readMeta('owner-dm').peerCid, pa.cid);
   assert.equal(await widgetVerdict(pa, owner), 'unknown_widget');
 
+  keep(connector);
+  const blocked = evidence.filter((l) => l.includes('NO_EXTERNAL_FETCH'));
+  assert.ok(blocked.length > 0, 'the Telegram API was answered locally');
+  assert.ok(blocked.every((l) => /blocked api\.telegram\.org\/bot<token>\/(getMe|getUpdates|setMyCommands|deleteWebhook)$/.test(l)),
+    `only read/setup Bot API methods were attempted:\n${[...new Set(blocked)].join('\n')}`);
+  assert.ok(!blocked.some((l) => /sendWidget|editMessageWidgetData|answerWidgetQuery|sendMessage/.test(l)), 'no widget or message mutation reached the Bot API');
+  console.log([...new Set(evidence)].map((l) => `# ${l}`).join('\n'));
   console.log('proxy-binding-integration OK — restore + command wiring, legacy, ambiguous, failed write, isolation');
 } finally {
-  await connector.stop();
+  keep(connector); await connector.stop();
   try { chmodSync(join(TG_STATE, 'owner-dm'), 0o700); } catch {}
   await daemon.close();
   rmSync(TG_STATE, { recursive: true, force: true });
