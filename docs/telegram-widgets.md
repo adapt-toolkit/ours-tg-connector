@@ -196,6 +196,12 @@ and no state.
   example a revision number in `chat_data`) if order matters.
   The queue is bounded: with more than 200 messages waiting, or 64 queries in
   flight, the poller pauses fetching until handling catches up.
+- The `offset` the poller sends to Telegram (which confirms every earlier update)
+  never moves past the oldest message that has not finished. A message still
+  queued or running at a stop or crash is therefore delivered again after the
+  restart, as before widgets. While such a message runs, later updates come back
+  on each poll; they are recognized by `update_id` and skipped, and the poller
+  waits about a second between those polls instead of spinning.
 
 ## Not included
 

@@ -488,6 +488,39 @@ try {
     releaseForward();
     await done;
   });
+  await test('a message is never confirmed to Telegram before it is handled; stop leaves the rest for redelivery (C4)', async () => {
+    const msg = (id) => ({ update_id: id, message: { message_id: id, date: 1, chat: { id: 1111, type: 'private' }, text: `m${id}` } });
+    const q = (id, qid) => ({ update_id: id, widget_query: { id: qid, from: { id: 1111 }, chat: { id: 1111, type: 'private' }, message_id: 5, type: { type: 'data' }, data: 'x' } });
+    // Telegram as a fake: it returns every update at or above the requested offset.
+    const store = [msg(101), msg(102), q(103, 'qa')];
+    const offsets = [];
+    const t = mockTelegram({ getUpdates: (body) => {
+      offsets.push(body.offset);
+      const pending = store.filter((u) => u.update_id >= body.offset);
+      return new Promise((r) => setTimeout(() => r(json({ ok: true, result: pending })), 5));
+    } });
+    const tg = t.tg;
+    let release101;
+    const handled = [];
+    const queriesSeen = [];
+    const done = tg.poll(async (m) => {
+      if (m.update_id === 101) await new Promise((r) => { release101 = r; });
+      handled.push(m.update_id);
+    }, (qq) => { queriesSeen.push(qq.id); });
+    while (!release101 || offsets.length < 3) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(offsets.slice(1).every((o) => o === 101), `never confirms past the running message (offsets ${offsets})`);
+    assert.deepEqual(queriesSeen, ['qa'], 'the widget query was handled once while 101 ran, despite repeats');
+    tg.stop();
+    release101();
+    await done;
+    assert.deepEqual(handled, [101], '102 was not started after stop');
+    // "Restart": a new poll on the same client resumes at 102, so Telegram redelivers it.
+    const offsetsBefore = offsets.length;
+    const again = tg.poll(async (m) => { handled.push(m.update_id); if (m.update_id === 102) tg.stop(); }, () => {});
+    await again;
+    assert.equal(offsets[offsetsBefore], 102);
+    assert.deepEqual(handled, [101, 102]);
+  });
   await test('the message queue is bounded: past 200 waiting messages the poll stops fetching', async () => {
     const batch = Array.from({ length: 205 }, (_, i) => ({ update_id: 100 + i, message: { message_id: i + 1, date: 1, chat: { id: 1111, type: 'private' }, text: `m${i}` } }));
     const t = mockTelegram({ getUpdates: [json({ ok: true, result: batch })] });

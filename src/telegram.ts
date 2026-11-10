@@ -697,28 +697,39 @@ export class TelegramClient {
   // called. Network errors are logged and retried with a short backoff so a
   // transient outage never kills the bridge.
   //
-  // Messages are handled one at a time, in order, on a queue the poll does not
-  // wait for, so a slow message (a download, speech-to-text) never holds back
-  // the next getUpdates. Widget queries are handled as soon as they arrive,
-  // concurrently: each must be answered within Telegram's 15 s. stop() lets
-  // the running handlers finish and starts no queued message.
+  // With a widget handler, messages are handled one at a time, in order, on a
+  // queue the poll does not wait for, so a slow message (a download,
+  // speech-to-text) never holds back a widget query, which must be answered
+  // within Telegram's 15 s; queries run concurrently as they arrive.
+  //
+  // Telegram treats every update below the getUpdates `offset` as confirmed
+  // and never sends it again, so the offset sent is never past the oldest
+  // message that has not finished: an unfinished message is redelivered after
+  // a stop or a crash, exactly as before. Updates that come back again in the
+  // meantime are recognized by update_id and skipped; while a message is
+  // still running, the poll paces itself (about once a second) instead of
+  // spinning on those repeats. stop() lets the running handlers finish and
+  // starts no queued message (those stay unconfirmed).
   async poll(
     onMessage: (m: TelegramMessage) => Promise<void> | void,
     onWidgetQuery?: (q: TelegramWidgetQuery) => Promise<void> | void,
   ): Promise<void> {
     this.stopped = false;
     let messages: Promise<void> = Promise.resolve();
-    let queued = 0; // messages waiting or running on the queue
+    const unfinished = new Set<number>(); // update_ids of queued or running messages
+    const dispatched = new Set<number>(); // update_ids handed out at or above the confirmed offset
     const queries = new Set<Promise<void>>();
     while (!this.stopped) {
       this.aborter = new AbortController();
       const timer = setTimeout(() => this.aborter?.abort(), (this.pollTimeoutSec + 10) * 1000);
+      const confirm = unfinished.size ? Math.min(...unfinished) : this.offset;
+      for (const id of dispatched) if (id < confirm) dispatched.delete(id);
       try {
         const resp = await this.tgFetch(this.url('getUpdates'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            offset: this.offset,
+            offset: confirm,
             timeout: this.pollTimeoutSec,
             allowed_updates: onWidgetQuery ? ['message', 'widget_query'] : ['message'],
           }),
@@ -736,9 +747,13 @@ export class TelegramClient {
           await sleep(3000);
           continue;
         }
+        let fresh = 0;
         for (const u of body.result) {
           if (this.stopped) break;
           this.offset = Math.max(this.offset, u.update_id + 1);
+          if (dispatched.has(u.update_id)) continue; // a repeat while an older message runs
+          dispatched.add(u.update_id);
+          fresh += 1;
           if (u.widget_query && onWidgetQuery) {
             const q = parseWidgetQuery(u.update_id, u.widget_query);
             if (!q) continue;
@@ -777,23 +792,27 @@ export class TelegramClient {
             forwarded_from: parseForwardOrigin(m),
             attachment,
           };
-          queued += 1;
+          unfinished.add(u.update_id);
           messages = messages.then(async () => {
+            if (this.stopped) return; // stays unconfirmed: Telegram redelivers it
             try {
-              if (!this.stopped) await onMessage(message);
+              await onMessage(message);
             } catch (err) {
               this.log(`onMessage handler failed: ${String(err)}`);
-            } finally {
-              queued -= 1;
             }
+            unfinished.delete(message.update_id);
           });
         }
         // Without widget queries, keep the old pacing: one batch at a time.
-        // With them, the queue is bounded: past MAX_QUEUED_MESSAGES (or
-        // MAX_INFLIGHT_QUERIES) the poll waits before fetching more.
         if (!onWidgetQuery) await messages;
-        while (!this.stopped && (queued > MAX_QUEUED_MESSAGES || queries.size > MAX_INFLIGHT_QUERIES)) {
+        // Bounded: past MAX_QUEUED_MESSAGES unfinished messages or
+        // MAX_INFLIGHT_QUERIES queries the poll waits before fetching more.
+        while (!this.stopped && (unfinished.size > MAX_QUEUED_MESSAGES || queries.size > MAX_INFLIGHT_QUERIES)) {
           await Promise.race([messages, ...queries]);
+        }
+        // Only repeats came back because a message is still running: pace.
+        if (!this.stopped && fresh === 0 && unfinished.size > 0) {
+          await Promise.race([messages, sleep(REPEAT_PACE_MS)]);
         }
       } catch (err) {
         clearTimeout(timer);
@@ -810,6 +829,8 @@ export class TelegramClient {
     }
     await messages;
     await Promise.all(queries);
+    // A later poll() must not confirm what this one left unhandled.
+    if (unfinished.size) this.offset = Math.min(...unfinished);
   }
 
   stop(): void {
@@ -871,5 +892,6 @@ export function splitForMarkdownV2(text: string, limit = TELEGRAM_TEXT_LIMIT): s
 // many widget queries may be in flight, before the poll stops fetching.
 const MAX_QUEUED_MESSAGES = 200;
 const MAX_INFLIGHT_QUERIES = 64;
+const REPEAT_PACE_MS = 1000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
