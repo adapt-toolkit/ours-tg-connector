@@ -120,7 +120,7 @@ export async function fetchWithRetry(
       if (attempt >= opts.retries || !isRetriableFetchError(err)) throw err;
       const delay = opts.retryBaseMs * 2 ** attempt + Math.floor(Math.random() * opts.retryBaseMs);
       attempt += 1;
-      log?.(`${sanitizeUrl(input)} failed (${(err as Error).message}); retry ${attempt}/${opts.retries} in ${delay}ms`);
+      log?.(`${sanitizeUrl(input)} failed (${telegramErrorText((err as Error).message)}); retry ${attempt}/${opts.retries} in ${delay}ms`);
       await sleep(delay);
     }
   }
@@ -245,6 +245,73 @@ interface RawMessage {
 interface RawUpdate {
   update_id: number;
   message?: RawMessage;
+  widget_query?: RawWidgetQuery;
+}
+
+// A Bot API 10.4 widget_query (https://core.telegram.org/bots/api#widgetquery).
+// Only the fields the connector reads; `type` carries the query kind.
+interface RawWidgetQuery {
+  id?: string;
+  from?: RawUser & { is_bot?: boolean };
+  chat?: RawChat;
+  message_id?: number;
+  inline_message_id?: string;
+  widget_id?: string;
+  type?: { type?: string };
+  data?: string;
+}
+
+// One inbound widget query, distilled. Telegram authenticates `from`, `chat` and
+// `message_id`; `data` is whatever the widget's own code chose to send and is
+// untrusted. `queryType` is 'data' for plain requests (wallet kinds are other values).
+export interface TelegramWidgetQuery {
+  update_id: number;
+  id: string;
+  from_id: number;
+  from: string;
+  chat_id?: number;
+  chat_type?: string;
+  message_id?: number;
+  inline: boolean;
+  shared: boolean;
+  queryType: string;
+  data: string;
+}
+
+// The outcome of a sendWidget call. `unknown` means the request may or may not
+// have produced a message (transport failure, 5xx, unreadable reply): it is
+// never retried, because a retry could post the widget twice.
+export type WidgetSendOutcome =
+  | { status: 'sent'; messageId: number }
+  | { status: 'rejected'; code: number; description: string; retryAfter?: number }
+  | { status: 'unknown'; description: string };
+
+export type WidgetEditOutcome =
+  | { status: 'updated'; changed: boolean }
+  | { status: 'rejected'; code: number; description: string }
+  | { status: 'unknown'; description: string };
+
+// An error text that is safe to hand to an agent or a log: token-shaped text
+// redacted, then cut at the first character outside a plain-description set,
+// so a description that echoes the request (HTML, JSON state) is not repeated.
+// Telegram's own texts ("Bad Request: INPUT_MEDIA_WIDGET_TOO_LARGE") survive.
+export function telegramErrorText(s: unknown): string {
+  const redacted = String(s)
+    .replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot***')
+    .replace(/\b\d{5,}:[A-Za-z0-9_-]{20,}/g, '***')
+    .replace(/\s+/g, ' ');
+  const safe = /^[A-Za-z0-9 _:.,()/*'-]*/.exec(redacted)![0].trimEnd();
+  return (safe.length < redacted.length ? `${safe} […]` : safe).slice(0, 160);
+}
+
+export interface SendWidgetParams {
+  chat_id: number | string;
+  html: string;
+  width?: number;
+  height?: number;
+  public_data?: string;
+  chat_data?: string;
+  caption?: string;
 }
 
 function userLabel(u?: RawUser): string | undefined {
@@ -352,6 +419,7 @@ export class TelegramClient {
   private offset = 0;
   private aborter: AbortController | null = null;
   private stopped = false;
+  private wakeOnStop: (() => void) | null = null;
   private readonly net: TelegramNetOptions;
   private readonly dispatcher: Agent;
   private readonly fetchImpl: FetchLike;
@@ -451,6 +519,84 @@ export class TelegramClient {
     return parsed?.result?.message_id ?? 0;
   }
 
+  // Send a static widget with queries allowed (Bot API 10.4 sendWidget). The
+  // request is made exactly once — no transport retry — and the reply is
+  // classified so the caller can tell "not sent" from "maybe sent".
+  async sendWidget(p: SendWidgetParams): Promise<WidgetSendOutcome> {
+    let resp: Response;
+    try {
+      resp = await this.tgFetch(this.url('sendWidget'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...p, allow_queries: true }),
+      }, false);
+    } catch (err) {
+      return { status: 'unknown', description: telegramErrorText(`transport error: ${(err as Error)?.message ?? String(err)}`) };
+    }
+    const body = (await resp.json().catch(() => null)) as {
+      ok?: boolean; result?: { message_id?: number }; error_code?: number; description?: string;
+      parameters?: { retry_after?: number };
+    } | null;
+    if (resp.ok && body?.ok === true && Number.isSafeInteger(body.result?.message_id) && body.result!.message_id! > 0) {
+      return { status: 'sent', messageId: body.result!.message_id! };
+    }
+    // A 4xx with Telegram's own error object is a definite refusal: nothing was posted.
+    if (resp.status >= 400 && resp.status < 500 && body && body.ok === false) {
+      return {
+        status: 'rejected',
+        code: body.error_code ?? resp.status,
+        description: telegramErrorText(body.description ?? `HTTP ${resp.status}`),
+        ...(body.parameters?.retry_after !== undefined ? { retryAfter: body.parameters.retry_after } : {}),
+      };
+    }
+    return { status: 'unknown', description: telegramErrorText(`HTTP ${resp.status}${body?.description ? `: ${body.description}` : ''}`) };
+  }
+
+  // Answer a widget query (Bot API 10.4 answerWidgetQuery). Must happen within
+  // 15 s of the tap; throws on any refusal (e.g. "query is too old").
+  async answerWidgetQuery(queryId: string, data?: string): Promise<void> {
+    const r = await this.callWidgetMethod('answerWidgetQuery', { widget_query_id: queryId, ...(data !== undefined ? { data } : {}) });
+    if (r.status !== 'ok') throw new Error(`answerWidgetQuery ${r.status}: ${r.description}`);
+  }
+
+  // Replace a widget's chat and/or public state (Bot API 10.4
+  // editMessageWidgetData). Setting state is idempotent, so transport errors
+  // are retried; what is still ambiguous afterwards is reported as `unknown`.
+  async editMessageWidgetData(
+    chatId: number | string,
+    messageId: number,
+    state: { chat_data?: string; public_data?: string },
+  ): Promise<WidgetEditOutcome> {
+    const r = await this.callWidgetMethod('editMessageWidgetData', { chat_id: chatId, message_id: messageId, ...state });
+    if (r.status === 'ok') return { status: 'updated', changed: true };
+    if (r.status === 'rejected' && /message is not modified/i.test(r.description)) return { status: 'updated', changed: false };
+    return r;
+  }
+
+  private async callWidgetMethod(method: string, payload: Record<string, unknown>): Promise<
+    | { status: 'ok' }
+    | { status: 'rejected'; code: number; description: string }
+    | { status: 'unknown'; description: string }
+  > {
+    let resp: Response;
+    try {
+      resp = await this.tgFetch(this.url(method), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      return { status: 'unknown', description: telegramErrorText(`transport error: ${(err as Error)?.message ?? String(err)}`) };
+    }
+    const body = (await resp.json().catch(() => null)) as { ok?: boolean; result?: unknown; error_code?: number; description?: string } | null;
+    // Both methods return exactly `true` on success; anything else is not proof.
+    if (resp.ok && body?.ok === true && body.result === true) return { status: 'ok' };
+    if (resp.status >= 400 && resp.status < 500 && body && body.ok === false) {
+      return { status: 'rejected', code: body.error_code ?? resp.status, description: telegramErrorText(body.description ?? `HTTP ${resp.status}`) };
+    }
+    return { status: 'unknown', description: telegramErrorText(`HTTP ${resp.status}${body?.description ? `: ${body.description}` : ''}`) };
+  }
+
   async setMyCommands(commands: { command: string; description: string }[]): Promise<void> {
     const resp = await this.tgFetch(this.url('setMyCommands'), {
       method: 'POST',
@@ -547,22 +693,51 @@ export class TelegramClient {
     return Buffer.from(await resp.arrayBuffer());
   }
 
-  // Long-poll loop. Calls `onMessage` for every inbound text message until
-  // stop() is called. Network errors are logged and retried with a short
-  // backoff so a transient outage never kills the bridge.
-  async poll(onMessage: (m: TelegramMessage) => Promise<void> | void): Promise<void> {
+  // Long-poll loop. Calls `onMessage` for every inbound text message (and
+  // `onWidgetQuery`, when given, for every widget_query) until stop() is
+  // called. Network errors are logged and retried with a short backoff so a
+  // transient outage never kills the bridge.
+  //
+  // With a widget handler, messages are handled one at a time, in order, on a
+  // queue the poll does not wait for, so a slow message (a download,
+  // speech-to-text) does not hold back the widget queries fetched meanwhile,
+  // which must be answered within Telegram's 15 s; queries run concurrently.
+  // This is prompt, not guaranteed: see the 100-update window below.
+  //
+  // Telegram treats every update below the getUpdates `offset` as confirmed
+  // and never sends it again, so the offset sent is never past the oldest
+  // message that has not finished: an unfinished message is redelivered after
+  // a stop or a crash, exactly as before. Updates that come back again in the
+  // meantime are recognized by update_id and skipped; while a message is
+  // still running, the poll paces itself (about once a second) instead of
+  // spinning on those repeats. getUpdates returns at most 100 updates, so
+  // while a message runs only the 99 after it are seen; a query further back
+  // waits and may miss its deadline (it is then dropped, never forwarded).
+  // stop() lets the running handlers finish and starts no queued message
+  // (those stay unconfirmed).
+  async poll(
+    onMessage: (m: TelegramMessage) => Promise<void> | void,
+    onWidgetQuery?: (q: TelegramWidgetQuery) => Promise<void> | void,
+  ): Promise<void> {
     this.stopped = false;
+    let messages: Promise<void> = Promise.resolve();
+    const unfinished = new Set<number>(); // update_ids of queued or running messages
+    const dispatched = new Set<number>(); // update_ids handed out at or above the confirmed offset
+    const queries = new Set<Promise<void>>();
+    const stopping = new Promise<void>((resolve) => { this.wakeOnStop = resolve; });
     while (!this.stopped) {
       this.aborter = new AbortController();
       const timer = setTimeout(() => this.aborter?.abort(), (this.pollTimeoutSec + 10) * 1000);
+      const confirm = unfinished.size ? Math.min(...unfinished) : this.offset;
+      for (const id of dispatched) if (id < confirm) dispatched.delete(id);
       try {
         const resp = await this.tgFetch(this.url('getUpdates'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            offset: this.offset,
+            offset: confirm,
             timeout: this.pollTimeoutSec,
-            allowed_updates: ['message'],
+            allowed_updates: onWidgetQuery ? ['message', 'widget_query'] : ['message'],
           }),
           signal: this.aborter.signal,
         }, false);
@@ -578,37 +753,80 @@ export class TelegramClient {
           await sleep(3000);
           continue;
         }
+        let fresh = 0;
         for (const u of body.result) {
           if (this.stopped) break;
           this.offset = Math.max(this.offset, u.update_id + 1);
+          if (dispatched.has(u.update_id)) continue; // a repeat while an older message runs
+          dispatched.add(u.update_id);
+          fresh += 1;
+          if (u.widget_query && onWidgetQuery) {
+            const q = parseWidgetQuery(u.update_id, u.widget_query);
+            if (!q) continue;
+            let run!: Promise<void>;
+            run = (async () => {
+              await null; // let `run` be registered before the handler starts
+              try {
+                await onWidgetQuery(q);
+              } catch (err) {
+                this.log(`onWidgetQuery handler failed: ${String(err)}`);
+              } finally {
+                queries.delete(run);
+              }
+            })();
+            queries.add(run);
+            continue;
+          }
           const m = u.message;
           if (!m) continue;
           const attachment = pickAttachment(m);
           // Forward a message with text, a caption, OR media — drop only the
           // truly empty (service messages, edits we did not subscribe to).
           if (typeof m.text !== 'string' && typeof m.caption !== 'string' && !attachment) continue;
-          try {
-            await onMessage({
-              update_id: u.update_id,
-              message_id: m.message_id ?? 0,
-              chat_id: m.chat.id,
-              chat_type: m.chat.type,
-              chat_username: m.chat.username,
-              thread_id: m.is_topic_message ? m.message_thread_id : undefined,
-              is_topic: m.is_topic_message === true,
-              chat_title: m.chat.title,
-              from: senderLabel(m),
-              from_id: m.from?.id,
-              from_username: m.from?.username,
-              text: messageMarkdown(m),
-              date: m.date,
-              reply_to: parseReply(m),
-              forwarded_from: parseForwardOrigin(m),
-              attachment,
-            });
-          } catch (err) {
-            this.log(`onMessage handler failed: ${String(err)}`);
-          }
+          const message: TelegramMessage = {
+            update_id: u.update_id,
+            message_id: m.message_id ?? 0,
+            chat_id: m.chat.id,
+            chat_type: m.chat.type,
+            chat_username: m.chat.username,
+            thread_id: m.is_topic_message ? m.message_thread_id : undefined,
+            is_topic: m.is_topic_message === true,
+            chat_title: m.chat.title,
+            from: senderLabel(m),
+            from_id: m.from?.id,
+            from_username: m.from?.username,
+            text: messageMarkdown(m),
+            date: m.date,
+            reply_to: parseReply(m),
+            forwarded_from: parseForwardOrigin(m),
+            attachment,
+          };
+          unfinished.add(u.update_id);
+          messages = messages.then(async () => {
+            if (this.stopped) return; // stays unconfirmed: Telegram redelivers it
+            try {
+              await onMessage(message);
+            } catch (err) {
+              this.log(`onMessage handler failed: ${String(err)}`);
+            }
+            unfinished.delete(message.update_id);
+          });
+        }
+        // Without widget queries, keep the old pacing: one batch at a time.
+        if (!onWidgetQuery) await messages;
+        // Bounded: past MAX_QUEUED_MESSAGES unfinished messages or
+        // MAX_INFLIGHT_QUERIES queries the poll waits before fetching more.
+        // Wait only on work that is actually pending (a settled promise in the
+        // race would spin without ever yielding to timers or I/O), or on stop().
+        while (!this.stopped && (unfinished.size > MAX_QUEUED_MESSAGES || queries.size > MAX_INFLIGHT_QUERIES)) {
+          const pending: Promise<unknown>[] = [stopping];
+          if (unfinished.size > MAX_QUEUED_MESSAGES) pending.push(messages);
+          if (queries.size > MAX_INFLIGHT_QUERIES) pending.push(...queries);
+          await Promise.race(pending);
+        }
+        // Only repeats came back because a message is still running: pace.
+        if (!this.stopped && fresh === 0 && unfinished.size > 0) {
+          await Promise.race([messages, stopping, sleep(REPEAT_PACE_MS)]);
         }
       } catch (err) {
         clearTimeout(timer);
@@ -623,12 +841,35 @@ export class TelegramClient {
         this.aborter = null;
       }
     }
+    this.wakeOnStop = null;
+    await messages;
+    await Promise.all(queries);
+    // A later poll() must not confirm what this one left unhandled.
+    if (unfinished.size) this.offset = Math.min(...unfinished);
   }
 
   stop(): void {
     this.stopped = true;
     this.aborter?.abort();
+    this.wakeOnStop?.();
   }
+}
+
+export function parseWidgetQuery(updateId: number, q: RawWidgetQuery): TelegramWidgetQuery | null {
+  if (typeof q.id !== 'string' || !q.id || typeof q.from?.id !== 'number' || typeof q.data !== 'string') return null;
+  return {
+    update_id: updateId,
+    id: q.id,
+    from_id: q.from.id,
+    from: userLabel(q.from) ?? 'telegram',
+    chat_id: typeof q.chat?.id === 'number' ? q.chat.id : undefined,
+    chat_type: q.chat?.type,
+    message_id: typeof q.message_id === 'number' ? q.message_id : undefined,
+    inline: typeof q.inline_message_id === 'string',
+    shared: typeof q.widget_id === 'string',
+    queryType: String(q.type?.type ?? ''),
+    data: q.data,
+  };
 }
 
 function chunkText(text: string, size: number): string[] {
@@ -662,5 +903,11 @@ export function splitForMarkdownV2(text: string, limit = TELEGRAM_TEXT_LIMIT): s
   if (rest) out.push(rest);
   return out;
 }
+
+// Backpressure for poll(): how far message handling may fall behind, and how
+// many widget queries may be in flight, before the poll stops fetching.
+const MAX_QUEUED_MESSAGES = 200;
+const MAX_INFLIGHT_QUERIES = 64;
+const REPEAT_PACE_MS = 1000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

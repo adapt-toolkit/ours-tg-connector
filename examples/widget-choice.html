@@ -1,0 +1,55 @@
+<!-- A tiny agent-driven Telegram widget: a question with choices and a counter.
+     Everything it shows comes from chat_data, which only the agent writes
+     (telegram_widget_update). A tap sends "pick:<n>" or "inc" to the agent and
+     shows "sent…" until the agent's new state arrives. See docs/telegram-widgets.md.
+     chat_data: {"q":"Ship it?","opts":["Yes","Later"],"pick":null,"n":0,"note":""} -->
+<style>
+.opts{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.opts button.on{outline:2px solid var(--tg-theme-accent-text-color)}
+.meta{color:var(--tg-theme-hint-color);font-size:.9em}
+</style>
+<h3 id="q">…</h3>
+<div class="opts" id="opts"></div>
+<p><button id="inc">+1</button> <span id="n"></span></p>
+<p class="meta" id="note"></p>
+<script>
+const W = window.TelegramWidget;
+const $ = (id) => document.getElementById(id);
+let pending = false;
+function state() {
+  try { return JSON.parse(W.chatData) || {}; } catch (e) { return {}; }
+}
+function ask(data) {
+  if (pending) return;
+  pending = true;
+  render();
+  W.request(data).then(
+    (a) => {
+      if (a.result === '{"ok":false}') { pending = false; render(); $('note').textContent = 'refused'; }
+      else if (pending) $('note').textContent = 'sent — waiting for the agent';
+    },
+    (e) => { pending = false; render(); $('note').textContent = 'not sent (' + e.code + ')'; },
+  );
+}
+function render() {
+  const s = state();
+  $('q').textContent = s.q || 'Waiting for the agent…';
+  const box = $('opts');
+  box.textContent = '';
+  (Array.isArray(s.opts) ? s.opts : []).slice(0, 6).forEach((label, i) => {
+    const b = document.createElement('button');
+    b.textContent = String(label);
+    if (s.pick === i) b.className = 'on';
+    b.disabled = pending;
+    b.addEventListener('click', () => ask('pick:' + i));
+    box.appendChild(b);
+  });
+  $('inc').disabled = pending;
+  $('n').textContent = 'count: ' + (Number(s.n) || 0);
+  $('note').textContent = s.note || '';
+}
+$('inc').addEventListener('click', () => ask('inc'));
+W.onEvent('chatDataChanged', () => { pending = false; render(); });
+render();
+W.ready();
+</script>

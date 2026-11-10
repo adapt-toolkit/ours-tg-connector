@@ -4,9 +4,17 @@
 // state, Telegram gets the item, and only then does the matching consume call
 // commit the read transition. There is deliberately no defer/requeue fallback:
 // a failed external delivery leaves the oldest row unread for the next pass.
+//
+// Typed ours commands share the message inbox. A `command` row is never posted
+// to Telegram: consuming it through getMessages makes the SDK run the
+// registered handler and send its command_result back. A stray
+// `command_result` row is consumed and dropped.
+
+export type MessageKind = 'text' | 'command' | 'command_result';
 
 export interface IncomingMessageRef {
   wire_id: string;
+  message_kind?: MessageKind; // absent on older daemons: text
 }
 
 export interface HistoryMessageItem extends IncomingMessageRef {
@@ -33,6 +41,8 @@ export interface HistoryDeliveryClient {
   getHistoryItem(a: { wire_id: string }): Promise<HistoryMessageItem | null>;
   getMessages(a: { limit: number }): Promise<{
     messages: HistoryMessageItem[];
+    command_results?: Array<{ wire_id: string }>;
+    commands_handled?: number;
     remaining: number;
   }>;
   listIncomingFiles(): Promise<IncomingFileItem[]>;
@@ -52,6 +62,10 @@ export async function drainMessages(
     const pending = await client.listIncomingMessages();
     if (pending.length === 0) return delivered;
     for (const ref of pending) {
+      if (ref.message_kind === 'command' || ref.message_kind === 'command_result') {
+        await consumeTyped(client, ref);
+        continue;
+      }
       const item = await client.getHistoryItem({ wire_id: ref.wire_id });
       if (!item || item.direction !== 'in' || item.inbox_state !== 'unread') {
         throw new Error(`history lookup for unread message ${ref.wire_id} did not return that unread inbound row`);
@@ -64,6 +78,24 @@ export async function drainMessages(
       }
       delivered += 1;
     }
+  }
+}
+
+// Consume exactly the oldest unread row, which must be this command (the SDK
+// dispatches it) or command result. Nothing reaches Telegram.
+async function consumeTyped(
+  client: Pick<HistoryDeliveryClient, 'getMessages'>,
+  ref: IncomingMessageRef,
+): Promise<void> {
+  const ack = await client.getMessages({ limit: 1 });
+  const results = ack.command_results ?? [];
+  const ok = ref.message_kind === 'command'
+    ? ack.messages.length === 0 && results.length === 0 && ack.commands_handled === 1
+    : ack.messages.length === 0 && results.length === 1 && results[0].wire_id === ref.wire_id && !ack.commands_handled;
+  if (!ok) {
+    const got = [...ack.messages.map((m) => m.wire_id), ...results.map((r) => r.wire_id)].join(', ') ||
+      `${ack.commands_handled ?? 0} command(s)`;
+    throw new Error(`oldest-first ${ref.message_kind} ack mismatch: expected ${ref.wire_id}, got ${got}`);
   }
 }
 
