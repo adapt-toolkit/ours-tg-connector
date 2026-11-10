@@ -188,20 +188,29 @@ and no state.
   deliver it twice.
 - One `getUpdates` poller per bot serves both messages and `widget_query`
   (`allowed_updates: ["message", "widget_query"]`). Messages are still handled
-  one at a time, in order, but on a queue the poller does not wait for. Each
-  widget query is handled as soon as it arrives. This way a slow message (a
-  media download or speech-to-text) or a slow forward to one agent cannot push
-  another widget's acknowledgement past 15 s. Forwarded query events can
-  therefore arrive in a different order than the taps; use your own state (for
+  one at a time and in order, but on a queue the poller does not wait for. Each
+  widget query is handled as soon as it is fetched, concurrently with other
+  queries. A slow message (a media download or speech-to-text) or a slow forward
+  to one agent therefore does not hold back other queries. Forwarded query
+  events can arrive in a different order than the taps; use your own state (for
   example a revision number in `chat_data`) if order matters.
-  The queue is bounded: with more than 200 messages waiting, or 64 queries in
-  flight, the poller pauses fetching until handling catches up.
-- The `offset` the poller sends to Telegram (which confirms every earlier update)
+- The `offset` the poller sends to Telegram, which confirms every earlier update,
   never moves past the oldest message that has not finished. A message still
-  queued or running at a stop or crash is therefore delivered again after the
-  restart, as before widgets. While such a message runs, later updates come back
-  on each poll; they are recognized by `update_id` and skipped, and the poller
-  waits about a second between those polls instead of spinning.
+  queued or running at a stop or crash is delivered again after the restart, as
+  it was before widgets. While such a message runs, later updates come back on
+  each poll and are skipped by `update_id`. During that time the poller polls
+  about once a second.
+
+**Limit: acknowledgements are prompt, not guaranteed.** `getUpdates` returns at
+most 100 updates per call. This window is per bot, across all its routes. While
+an ordinary message is still being handled, the poller only sees the 99 updates
+after it. The poller also pauses fetching when more than 200 messages are
+unfinished or 64 queries are in flight. A widget query beyond the window, or one
+that arrives during such a pause, waits until handling catches up. If that takes
+longer than Telegram's 15 s, the widget's `request()` fails with `TIMEOUT`, the
+connector's late answer is refused as stale, and **nothing is forwarded to the
+agent**. Ordinary messages are not lost in either case. Removing this limit
+would need a durable on-disk message queue, which is deferred.
 
 ## Not included
 
@@ -213,6 +222,8 @@ These are not used by this connector:
   `shared_widget_query`), which this connector does not use yet;
 - agent-authored query answers, since the connector answers at once to meet the
   15 s deadline;
+- a durable on-disk queue for ordinary messages, which would remove the
+  100-update window limit described above;
 - captions with formatting;
 - reply keyboards under a widget;
 - wallet and payment requests.

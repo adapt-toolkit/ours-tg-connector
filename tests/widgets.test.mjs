@@ -535,6 +535,41 @@ try {
     await done;
     assert.equal(handled, 205, 'every queued message is still handled, in order');
   });
+  await test('more than 64 in-flight queries and no messages: timers still run and stop() ends the poll (C5)', async () => {
+    const qs = Array.from({ length: 70 }, (_, i) => ({ update_id: 300 + i, widget_query: { id: `bp${i}`, from: { id: 1111 }, chat: { id: 1111, type: 'private' }, message_id: 5, type: { type: 'data' }, data: 'x' } }));
+    const t = mockTelegram({ getUpdates: [json({ ok: true, result: qs })] });
+    const tg = t.tg;
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let started = 0;
+    const done = tg.poll(() => {}, async () => { started += 1; await gate; });
+    const t0 = Date.now();
+    let timerRan = false;
+    await new Promise((r) => setTimeout(() => { timerRan = true; r(); }, 30));
+    assert.ok(timerRan && Date.now() - t0 < 1000, 'the event loop is not starved');
+    assert.equal(started, 70);
+    assert.equal(t.of('getUpdates').length, 1, 'no further fetch while 70 queries are in flight');
+    tg.stop();
+    release();
+    await done;
+  });
+  await test('stop() also ends a poll that is waiting on stuck queries', async () => {
+    const qs = Array.from({ length: 65 }, (_, i) => ({ update_id: 400 + i, widget_query: { id: `st${i}`, from: { id: 1111 }, chat: { id: 1111, type: 'private' }, message_id: 5, type: { type: 'data' }, data: 'x' } }));
+    const t = mockTelegram({ getUpdates: [json({ ok: true, result: qs })] });
+    const tg = t.tg;
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const done = tg.poll(() => {}, async () => { await gate; });
+    await new Promise((r) => setTimeout(r, 20));
+    tg.stop();
+    let ended = false;
+    void done.then(() => { ended = true; });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(ended, false, 'stop waits for the running handlers…');
+    release();
+    await done;
+    assert.equal(t.of('getUpdates').length, 1, '…and fetches nothing more');
+  });
   await test('without a widget handler the allowlist is unchanged', async () => {
     let tg;
     const t = mockTelegram({ getUpdates: [json({ ok: true, result: [
